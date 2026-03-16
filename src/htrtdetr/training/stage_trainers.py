@@ -20,6 +20,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+try:
+    from tqdm import tqdm
+    _TQDM_AVAILABLE = True
+except ImportError:
+    _TQDM_AVAILABLE = False
+
 from ..config.config import HTRTDETRConfig
 from ..utils.misc import AverageMeter, save_checkpoint, load_checkpoint
 from .losses import DetectionLoss, ActionLoss, IDLoss, CombinedLoss
@@ -106,20 +112,51 @@ class BaseTrainer:
         if self.use_amp and self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.grad_clip)
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.optimizer.grad_clip_norm)
             self.scaler.step(optimizer)
             self.scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.grad_clip)
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.optimizer.grad_clip_norm)
             optimizer.step()
 
-    def _log_epoch(self, epoch: int, metrics: Dict[str, float], lr: float) -> None:
-        parts = [f"Epoch {epoch:3d}"]
+    def _log_epoch(
+        self,
+        epoch: int,
+        num_epochs: int,
+        metrics: Dict[str, float],
+        lr: float,
+        elapsed: float,
+        eta: float,
+    ) -> None:
+        train_parts = []
+        val_parts = []
         for k, v in metrics.items():
-            parts.append(f"{k}={v:.4f}")
-        parts.append(f"lr={lr:.2e}")
-        print("  ".join(parts))
+            if k.startswith("val_"):
+                val_parts.append(f"{k[4:]}={v:.4f}")
+            else:
+                train_parts.append(f"{k}={v:.4f}")
+
+        mem_str = ""
+        if torch.cuda.is_available():
+            mb = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
+            mem_str = f"  GPU={mb:.0f}MB"
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+        elapsed_str = _fmt_time(elapsed)
+        eta_str = _fmt_time(eta)
+
+        print(
+            f"\n[Epoch {epoch:3d}/{num_epochs}]"
+            f"  lr={lr:.2e}"
+            f"  time={elapsed_str}  ETA={eta_str}"
+            f"{mem_str}"
+        )
+        if train_parts:
+            print(f"  Train: " + "  ".join(train_parts))
+        if val_parts:
+            print(f"  Val  : " + "  ".join(val_parts))
+        print()
 
     def _save(self, epoch: int, metric: float, tag: str = "last") -> None:
         state = {
@@ -127,20 +164,20 @@ class BaseTrainer:
             "best_metric": self.best_metric,
         }
         save_checkpoint(
+            str(self.output_dir / f"checkpoint_{tag}.pth"),
             self.model,
-            self.output_dir / f"checkpoint_{tag}.pth",
             epoch=epoch,
             extra=state,
         )
         if metric < self.best_metric:
             self.best_metric = metric
             save_checkpoint(
+                str(self.output_dir / "checkpoint_best.pth"),
                 self.model,
-                self.output_dir / "checkpoint_best.pth",
                 epoch=epoch,
                 extra=state,
             )
-            print(f"  → New best: {metric:.4f}")
+            print(f"  ★ New best: {metric:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -173,33 +210,51 @@ class Stage1Trainer(BaseTrainer):
         optimizer = self._make_optimizer()
         scheduler = self._make_scheduler(optimizer, num_epochs)
 
+        print(f"\n{'='*60}")
+        print(f"  Stage 1 Training  ({num_epochs} epochs)")
+        print(f"  Train batches: {len(train_loader)}"
+              + (f"  Val batches: {len(val_loader)}" if val_loader else ""))
+        print(f"{'='*60}\n")
+
+        epoch_times = []
         for epoch in range(self.start_epoch + 1, num_epochs + 1):
-            train_metrics = self._train_epoch(train_loader, optimizer, epoch)
+            t0 = time.time()
+            train_metrics = self._train_epoch(train_loader, optimizer, epoch, num_epochs)
 
             val_metrics = {}
             if val_loader is not None:
-                val_metrics = self._val_epoch(val_loader)
+                val_metrics = self._val_epoch(val_loader, epoch, num_epochs)
 
             if scheduler is not None:
                 scheduler.step()
 
+            elapsed = time.time() - t0
+            epoch_times.append(elapsed)
+            avg_epoch_time = sum(epoch_times[-10:]) / len(epoch_times[-10:])
+            remaining = num_epochs - epoch
+            eta = avg_epoch_time * remaining
+
             metrics = {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}}
-            self._log_epoch(epoch, metrics, optimizer.param_groups[0]["lr"])
+            self._log_epoch(epoch, num_epochs, metrics, optimizer.param_groups[0]["lr"],
+                            elapsed, eta)
 
             loss_for_save = val_metrics.get("loss_detection", train_metrics.get("loss_detection", 0.0))
             self._save(epoch, loss_for_save, tag="last")
 
     def _train_epoch(
-        self, loader: DataLoader, optimizer: torch.optim.Optimizer, epoch: int
+        self, loader: DataLoader, optimizer: torch.optim.Optimizer,
+        epoch: int, num_epochs: int,
     ) -> Dict[str, float]:
         self.model.train()
         meters: Dict[str, AverageMeter] = {}
+        total = len(loader)
 
-        for batch in loader:
+        pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [train]", total=total)
+        for step, batch in enumerate(pbar, 1):
             images = batch["images"].to(self.device)       # (B, 3, H, W)
             targets = _move_targets_to_device(batch["targets"], self.device)
 
-            ctx = autocast() if self.use_amp else _null_ctx()
+            ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
                 out = self.model.forward_single_frame(images)
                 losses = self.loss_fn(out.pred_logits, out.pred_boxes, targets)
@@ -212,18 +267,27 @@ class Stage1Trainer(BaseTrainer):
                     meters[k] = AverageMeter()
                 meters[k].update(v.item(), images.shape[0])
 
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix({k: f"{m.avg:.4f}" for k, m in meters.items()},
+                                 refresh=False)
+            elif step % max(1, total // 10) == 0:
+                loss_str = "  ".join(f"{k}={m.avg:.4f}" for k, m in meters.items())
+                print(f"  step {step:4d}/{total}  {loss_str}")
+
         return {k: m.avg for k, m in meters.items()}
 
     @torch.no_grad()
-    def _val_epoch(self, loader: DataLoader) -> Dict[str, float]:
+    def _val_epoch(self, loader: DataLoader,
+                   epoch: int = 0, num_epochs: int = 0) -> Dict[str, float]:
         self.model.eval()
         meters: Dict[str, AverageMeter] = {}
 
-        for batch in loader:
+        pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [val  ]", total=len(loader))
+        for batch in pbar:
             images = batch["images"].to(self.device)
             targets = _move_targets_to_device(batch["targets"], self.device)
 
-            ctx = autocast() if self.use_amp else _null_ctx()
+            ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
                 out = self.model.forward_single_frame(images)
                 losses = self.loss_fn(out.pred_logits, out.pred_boxes, targets)
@@ -232,6 +296,10 @@ class Stage1Trainer(BaseTrainer):
                 if k not in meters:
                     meters[k] = AverageMeter()
                 meters[k].update(v.item(), images.shape[0])
+
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix({k: f"{m.avg:.4f}" for k, m in meters.items()},
+                                 refresh=False)
 
         return {k: m.avg for k, m in meters.items()}
 
@@ -263,42 +331,57 @@ class Stage2Trainer(BaseTrainer):
     ) -> None:
         self.resume(resume)
         self.model.set_stage(2)
-        # detector は freeze 済み。temporal + action_head のみ更新
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         optimizer = self._make_optimizer(trainable)
         scheduler = self._make_scheduler(optimizer, num_epochs)
 
+        print(f"\n{'='*60}")
+        print(f"  Stage 2 Training  ({num_epochs} epochs)")
+        print(f"  Train batches: {len(train_loader)}"
+              + (f"  Val batches: {len(val_loader)}" if val_loader else ""))
+        print(f"{'='*60}\n")
+
+        epoch_times = []
         for epoch in range(self.start_epoch + 1, num_epochs + 1):
-            train_metrics = self._train_epoch(train_loader, optimizer, epoch)
+            t0 = time.time()
+            train_metrics = self._train_epoch(train_loader, optimizer, epoch, num_epochs)
 
             val_metrics = {}
             if val_loader is not None:
-                val_metrics = self._val_epoch(val_loader)
+                val_metrics = self._val_epoch(val_loader, epoch, num_epochs)
 
             if scheduler is not None:
                 scheduler.step()
 
+            elapsed = time.time() - t0
+            epoch_times.append(elapsed)
+            eta = sum(epoch_times[-10:]) / len(epoch_times[-10:]) * (num_epochs - epoch)
+
             metrics = {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}}
-            self._log_epoch(epoch, metrics, optimizer.param_groups[0]["lr"])
+            self._log_epoch(epoch, num_epochs, metrics, optimizer.param_groups[0]["lr"],
+                            elapsed, eta)
 
             loss_for_save = val_metrics.get("loss", train_metrics.get("loss", 0.0))
             self._save(epoch, loss_for_save, tag="last")
 
     def _train_epoch(
-        self, loader: DataLoader, optimizer: torch.optim.Optimizer, epoch: int
+        self, loader: DataLoader, optimizer: torch.optim.Optimizer,
+        epoch: int, num_epochs: int,
     ) -> Dict[str, float]:
         self.model.train()
         meter_loss = AverageMeter()
         meter_acc = AverageMeter()
+        total = len(loader)
 
-        for batch in loader:
-            geo = batch["geo_features"].to(self.device)       # (B, T, 10)
-            gt_action = batch["action_ids"].to(self.device)    # (B,)
+        pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [train]", total=total)
+        for step, batch in enumerate(pbar, 1):
+            geo = batch["geo_features"].to(self.device)
+            gt_action = batch["action_ids"].to(self.device)
 
-            ctx = autocast() if self.use_amp else _null_ctx()
+            ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
                 out = self.model.forward_geo_sequence(geo)
-                action_logits = out["action_logits"]           # (B, num_actions)
+                action_logits = out["action_logits"]
                 loss = self.loss_fn(action_logits, gt_action)
 
             self._step(loss, optimizer)
@@ -309,19 +392,27 @@ class Stage2Trainer(BaseTrainer):
                 acc = _accuracy(action_logits, gt_action)
             meter_acc.update(acc, B)
 
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix(loss=f"{meter_loss.avg:.4f}", acc=f"{meter_acc.avg:.4f}",
+                                 refresh=False)
+            elif step % max(1, total // 10) == 0:
+                print(f"  step {step:4d}/{total}  loss={meter_loss.avg:.4f}  acc={meter_acc.avg:.4f}")
+
         return {"loss": meter_loss.avg, "acc": meter_acc.avg}
 
     @torch.no_grad()
-    def _val_epoch(self, loader: DataLoader) -> Dict[str, float]:
+    def _val_epoch(self, loader: DataLoader,
+                   epoch: int = 0, num_epochs: int = 0) -> Dict[str, float]:
         self.model.eval()
         meter_loss = AverageMeter()
         meter_acc = AverageMeter()
 
-        for batch in loader:
+        pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [val  ]", total=len(loader))
+        for batch in pbar:
             geo = batch["geo_features"].to(self.device)
             gt_action = batch["action_labels"].to(self.device)
 
-            ctx = autocast() if self.use_amp else _null_ctx()
+            ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
                 out = self.model.forward_geo_sequence(geo)
                 loss = self.loss_fn(out["action_logits"], gt_action)
@@ -329,6 +420,10 @@ class Stage2Trainer(BaseTrainer):
             B = geo.shape[0]
             meter_loss.update(loss.item(), B)
             meter_acc.update(_accuracy(out["action_logits"], gt_action), B)
+
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix(loss=f"{meter_loss.avg:.4f}", acc=f"{meter_acc.avg:.4f}",
+                                 refresh=False)
 
         return {"loss": meter_loss.avg, "acc": meter_acc.avg}
 
@@ -362,37 +457,53 @@ class Stage3Trainer(BaseTrainer):
         optimizer = self._make_optimizer(trainable)
         scheduler = self._make_scheduler(optimizer, num_epochs)
 
+        print(f"\n{'='*60}")
+        print(f"  Stage 3 Training  ({num_epochs} epochs)")
+        print(f"  Train batches: {len(train_loader)}"
+              + (f"  Val batches: {len(val_loader)}" if val_loader else ""))
+        print(f"{'='*60}\n")
+
+        epoch_times = []
         for epoch in range(self.start_epoch + 1, num_epochs + 1):
-            train_metrics = self._train_epoch(train_loader, optimizer, epoch)
+            t0 = time.time()
+            train_metrics = self._train_epoch(train_loader, optimizer, epoch, num_epochs)
 
             val_metrics = {}
             if val_loader is not None:
-                val_metrics = self._val_epoch(val_loader)
+                val_metrics = self._val_epoch(val_loader, epoch, num_epochs)
 
             if scheduler is not None:
                 scheduler.step()
 
+            elapsed = time.time() - t0
+            epoch_times.append(elapsed)
+            eta = sum(epoch_times[-10:]) / len(epoch_times[-10:]) * (num_epochs - epoch)
+
             metrics = {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}}
-            self._log_epoch(epoch, metrics, optimizer.param_groups[0]["lr"])
+            self._log_epoch(epoch, num_epochs, metrics, optimizer.param_groups[0]["lr"],
+                            elapsed, eta)
 
             loss_for_save = val_metrics.get("loss_id", train_metrics.get("loss_id", 0.0))
             self._save(epoch, loss_for_save, tag="last")
 
     def _train_epoch(
-        self, loader: DataLoader, optimizer: torch.optim.Optimizer, epoch: int
+        self, loader: DataLoader, optimizer: torch.optim.Optimizer,
+        epoch: int, num_epochs: int,
     ) -> Dict[str, float]:
         self.model.train()
         meters: Dict[str, AverageMeter] = {}
+        total = len(loader)
 
-        for batch in loader:
-            geo = batch["geo_features"].to(self.device)          # (B, T, 10)
-            gt_ids = batch["local_track_ids"].to(self.device)    # (B,)
+        pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [train]", total=total)
+        for step, batch in enumerate(pbar, 1):
+            geo = batch["geo_features"].to(self.device)
+            gt_ids = batch["local_track_ids"].to(self.device)
 
-            ctx = autocast() if self.use_amp else _null_ctx()
+            ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
                 out = self.model.forward_geo_sequence(geo)
-                id_logits = out["id_logits"]         # (B, max_ids+1)
-                id_emb = out["id_embeddings"]        # (B, emb_dim)
+                id_logits = out["id_logits"]
+                id_emb = out["id_embeddings"]
                 losses = self.loss_fn(id_logits, gt_ids, id_emb)
                 loss = losses["loss_id"]
 
@@ -404,18 +515,27 @@ class Stage3Trainer(BaseTrainer):
                     meters[k] = AverageMeter()
                 meters[k].update(v.item(), B)
 
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix({k: f"{m.avg:.4f}" for k, m in meters.items()},
+                                 refresh=False)
+            elif step % max(1, total // 10) == 0:
+                loss_str = "  ".join(f"{k}={m.avg:.4f}" for k, m in meters.items())
+                print(f"  step {step:4d}/{total}  {loss_str}")
+
         return {k: m.avg for k, m in meters.items()}
 
     @torch.no_grad()
-    def _val_epoch(self, loader: DataLoader) -> Dict[str, float]:
+    def _val_epoch(self, loader: DataLoader,
+                   epoch: int = 0, num_epochs: int = 0) -> Dict[str, float]:
         self.model.eval()
         meters: Dict[str, AverageMeter] = {}
 
-        for batch in loader:
+        pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [val  ]", total=len(loader))
+        for batch in pbar:
             geo = batch["geo_features"].to(self.device)
             gt_ids = batch["local_track_ids"].to(self.device)
 
-            ctx = autocast() if self.use_amp else _null_ctx()
+            ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
                 out = self.model.forward_geo_sequence(geo)
                 losses = self.loss_fn(out["id_logits"], gt_ids, out["id_embeddings"])
@@ -425,6 +545,10 @@ class Stage3Trainer(BaseTrainer):
                 if k not in meters:
                     meters[k] = AverageMeter()
                 meters[k].update(v.item(), B)
+
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix({k: f"{m.avg:.4f}" for k, m in meters.items()},
+                                 refresh=False)
 
         return {k: m.avg for k, m in meters.items()}
 
@@ -479,35 +603,51 @@ class Stage4Trainer(BaseTrainer):
         optimizer = self._make_optimizer()
         scheduler = self._make_scheduler(optimizer, num_epochs)
 
+        print(f"\n{'='*60}")
+        print(f"  Stage 4 Training  ({num_epochs} epochs)")
+        print(f"  Train batches: {len(train_loader)}"
+              + (f"  Val batches: {len(val_loader)}" if val_loader else ""))
+        print(f"{'='*60}\n")
+
+        epoch_times = []
         for epoch in range(self.start_epoch + 1, num_epochs + 1):
-            train_metrics = self._train_epoch(train_loader, optimizer, epoch)
+            t0 = time.time()
+            train_metrics = self._train_epoch(train_loader, optimizer, epoch, num_epochs)
 
             val_metrics = {}
             if val_loader is not None:
-                val_metrics = self._val_epoch(val_loader)
+                val_metrics = self._val_epoch(val_loader, epoch, num_epochs)
 
             if scheduler is not None:
                 scheduler.step()
 
+            elapsed = time.time() - t0
+            epoch_times.append(elapsed)
+            eta = sum(epoch_times[-10:]) / len(epoch_times[-10:]) * (num_epochs - epoch)
+
             metrics = {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}}
-            self._log_epoch(epoch, metrics, optimizer.param_groups[0]["lr"])
+            self._log_epoch(epoch, num_epochs, metrics, optimizer.param_groups[0]["lr"],
+                            elapsed, eta)
 
             loss_for_save = val_metrics.get("total_loss", train_metrics.get("total_loss", 0.0))
             self._save(epoch, loss_for_save, tag="last")
 
     def _train_epoch(
-        self, loader: DataLoader, optimizer: torch.optim.Optimizer, epoch: int
+        self, loader: DataLoader, optimizer: torch.optim.Optimizer,
+        epoch: int, num_epochs: int = 0,
     ) -> Dict[str, float]:
         self.model.train()
         meters: Dict[str, AverageMeter] = {}
+        total = len(loader)
 
-        for batch in loader:
+        pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [train]", total=total)
+        for step, batch in enumerate(pbar, 1):
             # SceneSequenceDataset バッチ
             images = batch["images"].to(self.device)     # (B, T, 3, H, W)
             # last-frame targets (detection loss)
             targets = _move_targets_to_device(batch["targets"], self.device)
 
-            ctx = autocast() if self.use_amp else _null_ctx()
+            ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
                 out = self.model(images)
 
@@ -576,18 +716,27 @@ class Stage4Trainer(BaseTrainer):
                     meters[k] = AverageMeter()
                 meters[k].update(v.item() if isinstance(v, torch.Tensor) else v, B)
 
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix({k: f"{m.avg:.4f}" for k, m in meters.items()},
+                                 refresh=False)
+            elif step % max(1, total // 10) == 0:
+                loss_str = "  ".join(f"{k}={m.avg:.4f}" for k, m in meters.items())
+                print(f"  step {step:4d}/{total}  {loss_str}")
+
         return {k: m.avg for k, m in meters.items()}
 
     @torch.no_grad()
-    def _val_epoch(self, loader: DataLoader) -> Dict[str, float]:
+    def _val_epoch(self, loader: DataLoader,
+                   epoch: int = 0, num_epochs: int = 0) -> Dict[str, float]:
         self.model.eval()
         meters: Dict[str, AverageMeter] = {}
 
-        for batch in loader:
+        pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [val  ]", total=len(loader))
+        for batch in pbar:
             images = batch["images"].to(self.device)
             targets = _move_targets_to_device(batch["targets"], self.device)
 
-            ctx = autocast() if self.use_amp else _null_ctx()
+            ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
                 out = self.model(images)
                 if out.pred_logits is not None:
@@ -607,12 +756,34 @@ class Stage4Trainer(BaseTrainer):
                     meters[k] = AverageMeter()
                 meters[k].update(v.item(), B)
 
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix({k: f"{m.avg:.4f}" for k, m in meters.items()},
+                                 refresh=False)
+
         return {k: m.avg for k, m in meters.items()}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _fmt_time(seconds: float) -> str:
+    """秒を h:mm:ss 形式に変換"""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _make_pbar(loader, desc: str, total: int):
+    """tqdm が使える場合はプログレスバー、そうでなければ素のイテレータを返す"""
+    if _TQDM_AVAILABLE:
+        return tqdm(loader, desc=desc, total=total, ncols=100, leave=False,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining} {postfix}]")
+    return loader
+
 
 def _move_targets_to_device(targets, device):
     """List[Dict[str, Tensor]] を指定デバイスに移動する"""

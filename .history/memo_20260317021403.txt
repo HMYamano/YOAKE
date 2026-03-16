@@ -1,0 +1,3 @@
+python scripts/train_stage1_detector.py train_anno=C:\Users\utopi\デスクトップ\data/mot17_yoake/annotations_train.json val_anno==C:\Users\utopi\デスクトップ\data/mot17_yoake/annotations_val.json output_dir=C:\Users\utopi\デスクトップ\outputs/mot17_stage1 num_epochs=100 batch_size=10
+
+学習回す
