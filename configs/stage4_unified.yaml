@@ -1,0 +1,31 @@
+# Stage 4: Unified Fine-tuning
+# 全モジュールを小さい lr で fine-tune
+
+model:
+  training_stage: 4
+  id_head:
+    use_action_summary: true
+    use_metric_loss: true
+
+optimizer:
+  lr: 1.0e-5             # fine-tune は小さい lr
+  backbone_lr_factor: 0.1
+
+scheduler:
+  scheduler: cosine
+  warmup_epochs: 2
+  total_epochs: 50
+
+train:
+  stage: 4
+  output_dir: outputs/stage4
+  max_epochs: 50
+  early_stopping_patience: 15
+  use_amp: true
+  seed: 42
+
+loss:
+  w_action: 1.0
+  w_id_cls: 1.0
+  w_id_metric: 0.5
+  w_temporal_smooth: 0.1

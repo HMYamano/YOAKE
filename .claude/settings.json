@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import sys; sys.path.insert\\(0,''src''\\); from htrtdetr.config import HTRTDETRConfig; print\\(''Config OK''\\)\")",
+      "Bash(/c/Users/utopi/AppData/Local/Microsoft/WindowsApps/python.exe -c \"import sys; sys.path.insert\\(0,''src''\\); from htrtdetr.config.config import HTRTDETRConfig; cfg = HTRTDETRConfig\\(\\); print\\(''Config OK, num_queries='', cfg.model.detector.head.num_queries\\)\")",
+      "Bash(/c/Users/utopi/miniconda3/python.exe -c \":*)",
+      "Bash(xargs wc:*)",
+      "Bash(/c/Users/utopi/miniconda3/envs/yoake/python.exe -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(/c/Users/utopi/miniconda3/python.exe -m pip show torch)",
+      "Bash(/c/Users/utopi/miniconda3/python.exe -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(/c/Users/utopi/miniconda3/envs/yoru/python.exe -c \"import torch; print\\(''torch'', torch.__version__\\)\")",
+      "Read(//c/Users/utopi/YOAKE/**)"
+    ]
+  }
+}

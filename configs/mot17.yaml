@@ -1,0 +1,25 @@
+# MOT17 公開データセット検証用設定
+# 歩行者トラッキング (行動ラベルなし)
+# Override: default.yaml
+
+model:
+  detector:
+    head:
+      num_classes: 1    # person のみ
+
+  action_head:
+    num_actions: 1      # action_id=-1 のみ (unannotated) なので dummy 1 クラス
+
+data:
+  image_size: [640, 640]
+  window_size: 16
+  window_stride: 8
+  batch_size: 2         # MOT17 は解像度が高いためメモリ節約
+  num_workers: 4
+
+loss:
+  w_action: 0.0         # 行動ラベルなしのため action loss を無効化
+
+train:
+  max_epochs: 50        # クイック検証用に削減
+  early_stopping_patience: 10

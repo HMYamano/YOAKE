@@ -1,0 +1,29 @@
+# YOAKE dependencies
+# Python >= 3.10 推奨
+
+# Core
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Data
+Pillow>=9.0.0
+numpy>=1.24.0
+
+# Config
+pyyaml>=6.0
+
+# Matching
+scipy>=1.10.0
+
+# Visualization (optional)
+matplotlib>=3.7.0
+
+# Video I/O (optional)
+opencv-python>=4.8.0
+
+# Experiment tracking (optional)
+# wandb>=0.16.0
+
+# Development / testing
+# pytest>=7.0.0
+# pytest-cov>=4.0.0

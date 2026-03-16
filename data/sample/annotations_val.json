@@ -1,0 +1,166 @@
+{
+  "meta": {
+    "version": "1.1",
+    "created": "2026-03-16",
+    "description": "Sample validation annotations for YOAKE — Drosophila melanogaster behavior analysis",
+    "coordinate_format": "xyxy_pixels",
+    "bbox_format": "[x1, y1, x2, y2]"
+  },
+  "class_names": ["fly"],
+  "action_names": ["stationary", "walking", "grooming", "courtship", "aggression"],
+  "videos": [
+    {
+      "video_id": "val_video_001",
+      "fps": 30.0,
+      "width": 640,
+      "height": 640,
+      "image_dir": "data/frames/val_001",
+      "frames": [
+        {
+          "frame_index": 0,
+          "image_path": "data/frames/val_001/frame_0000.jpg",
+          "objects": [
+            {"object_id": 1, "bbox": [90,  60, 145, 110],  "class_id": 0, "track_id": 0, "action_id": 0},
+            {"object_id": 2, "bbox": [380, 280, 435, 330], "class_id": 0, "track_id": 1, "action_id": 1},
+            {"object_id": 3, "bbox": [500, 400, 555, 450], "class_id": 0, "track_id": 2, "action_id": 3}
+          ]
+        },
+        {
+          "frame_index": 1,
+          "image_path": "data/frames/val_001/frame_0001.jpg",
+          "objects": [
+            {"object_id": 4, "bbox": [92,  62, 147, 112],  "class_id": 0, "track_id": 0, "action_id": 0},
+            {"object_id": 5, "bbox": [387, 285, 442, 335], "class_id": 0, "track_id": 1, "action_id": 1},
+            {"object_id": 6, "bbox": [501, 401, 556, 451], "class_id": 0, "track_id": 2, "action_id": 3}
+          ]
+        },
+        {
+          "frame_index": 2,
+          "image_path": "data/frames/val_001/frame_0002.jpg",
+          "objects": [
+            {"object_id": 7,  "bbox": [93,  63, 148, 113],  "class_id": 0, "track_id": 0, "action_id": 2},
+            {"object_id": 8,  "bbox": [393, 289, 448, 339], "class_id": 0, "track_id": 1, "action_id": 1},
+            {"object_id": 9,  "bbox": [502, 402, 557, 452], "class_id": 0, "track_id": 2, "action_id": 3}
+          ]
+        },
+        {
+          "frame_index": 3,
+          "image_path": "data/frames/val_001/frame_0003.jpg",
+          "objects": [
+            {"object_id": 10, "bbox": [94,  64, 149, 114],  "class_id": 0, "track_id": 0, "action_id": 2},
+            {"object_id": 11, "bbox": [398, 292, 453, 342], "class_id": 0, "track_id": 1, "action_id": 3},
+            {"object_id": 12, "bbox": [503, 403, 558, 453], "class_id": 0, "track_id": 2, "action_id": 3}
+          ]
+        },
+        {
+          "frame_index": 4,
+          "image_path": "data/frames/val_001/frame_0004.jpg",
+          "objects": [
+            {"object_id": 13, "bbox": [95,  65, 150, 115],  "class_id": 0, "track_id": 0, "action_id": 2},
+            {"object_id": 14, "bbox": [402, 295, 457, 345], "class_id": 0, "track_id": 1, "action_id": 3},
+            {"object_id": 15, "bbox": [504, 404, 559, 454], "class_id": 0, "track_id": 2, "action_id": 4}
+          ]
+        },
+        {
+          "frame_index": 5,
+          "image_path": "data/frames/val_001/frame_0005.jpg",
+          "objects": [
+            {"object_id": 16, "bbox": [97,  67, 152, 117],  "class_id": 0, "track_id": 0, "action_id": 0},
+            {"object_id": 17, "bbox": [405, 297, 460, 347], "class_id": 0, "track_id": 1, "action_id": 3},
+            {"object_id": 18, "bbox": [505, 405, 560, 455], "class_id": 0, "track_id": 2, "action_id": 4}
+          ]
+        },
+        {
+          "frame_index": 6,
+          "image_path": "data/frames/val_001/frame_0006.jpg",
+          "objects": [
+            {"object_id": 19, "bbox": [99,  69, 154, 119],  "class_id": 0, "track_id": 0, "action_id": 0},
+            {"object_id": 20, "bbox": [407, 299, 462, 349], "class_id": 0, "track_id": 1, "action_id": 0},
+            {"object_id": 21, "bbox": [506, 406, 561, 456], "class_id": 0, "track_id": 2, "action_id": 4}
+          ]
+        },
+        {
+          "frame_index": 7,
+          "image_path": "data/frames/val_001/frame_0007.jpg",
+          "objects": [
+            {"object_id": 22, "bbox": [100, 70, 155, 120],  "class_id": 0, "track_id": 0, "action_id": 1},
+            {"object_id": 23, "bbox": [409, 300, 464, 350], "class_id": 0, "track_id": 1, "action_id": 0},
+            {"object_id": 24, "bbox": [507, 407, 562, 457], "class_id": 0, "track_id": 2, "action_id": 0}
+          ]
+        },
+        {
+          "frame_index": 8,
+          "image_path": "data/frames/val_001/frame_0008.jpg",
+          "objects": [
+            {"object_id": 25, "bbox": [103, 73, 158, 123],  "class_id": 0, "track_id": 0, "action_id": 1},
+            {"object_id": 26, "bbox": [411, 302, 466, 352], "class_id": 0, "track_id": 1, "action_id": 0},
+            {"object_id": 27, "bbox": [508, 408, 563, 458], "class_id": 0, "track_id": 2, "action_id": 0}
+          ]
+        },
+        {
+          "frame_index": 9,
+          "image_path": "data/frames/val_001/frame_0009.jpg",
+          "objects": [
+            {"object_id": 28, "bbox": [107, 77, 162, 127],  "class_id": 0, "track_id": 0, "action_id": 1},
+            {"object_id": 29, "bbox": [413, 303, 468, 353], "class_id": 0, "track_id": 1, "action_id": 1},
+            {"object_id": 30, "bbox": [509, 409, 564, 459], "class_id": 0, "track_id": 2, "action_id": 0}
+          ]
+        },
+        {
+          "frame_index": 10,
+          "image_path": "data/frames/val_001/frame_0010.jpg",
+          "objects": [
+            {"object_id": 31, "bbox": [110, 80, 165, 130],  "class_id": 0, "track_id": 0, "action_id": 1},
+            {"object_id": 32, "bbox": [415, 305, 470, 355], "class_id": 0, "track_id": 1, "action_id": 1},
+            {"object_id": 33, "bbox": [510, 410, 565, 460], "class_id": 0, "track_id": 2, "action_id": 1}
+          ]
+        },
+        {
+          "frame_index": 11,
+          "image_path": "data/frames/val_001/frame_0011.jpg",
+          "objects": [
+            {"object_id": 34, "bbox": [112, 82, 167, 132],  "class_id": 0, "track_id": 0, "action_id": 0},
+            {"object_id": 35, "bbox": [416, 306, 471, 356], "class_id": 0, "track_id": 1, "action_id": 1},
+            {"object_id": 36, "bbox": [511, 411, 566, 461], "class_id": 0, "track_id": 2, "action_id": 1}
+          ]
+        },
+        {
+          "frame_index": 12,
+          "image_path": "data/frames/val_001/frame_0012.jpg",
+          "objects": [
+            {"object_id": 37, "bbox": [113, 83, 168, 133],  "class_id": 0, "track_id": 0, "action_id": 0},
+            {"object_id": 38, "bbox": [417, 307, 472, 357], "class_id": 0, "track_id": 1, "action_id": 2},
+            {"object_id": 39, "bbox": [512, 412, 567, 462], "class_id": 0, "track_id": 2, "action_id": 1}
+          ]
+        },
+        {
+          "frame_index": 13,
+          "image_path": "data/frames/val_001/frame_0013.jpg",
+          "objects": [
+            {"object_id": 40, "bbox": [114, 84, 169, 134],  "class_id": 0, "track_id": 0, "action_id": 0},
+            {"object_id": 41, "bbox": [418, 308, 473, 358], "class_id": 0, "track_id": 1, "action_id": 2},
+            {"object_id": 42, "bbox": [513, 413, 568, 463], "class_id": 0, "track_id": 2, "action_id": 2}
+          ]
+        },
+        {
+          "frame_index": 14,
+          "image_path": "data/frames/val_001/frame_0014.jpg",
+          "objects": [
+            {"object_id": 43, "bbox": [115, 85, 170, 135],  "class_id": 0, "track_id": 0, "action_id": 0},
+            {"object_id": 44, "bbox": [419, 309, 474, 359], "class_id": 0, "track_id": 1, "action_id": 2},
+            {"object_id": 45, "bbox": [514, 414, 569, 464], "class_id": 0, "track_id": 2, "action_id": 2}
+          ]
+        },
+        {
+          "frame_index": 15,
+          "image_path": "data/frames/val_001/frame_0015.jpg",
+          "objects": [
+            {"object_id": 46, "bbox": [116, 86, 171, 136],  "class_id": 0, "track_id": 0, "action_id": 1},
+            {"object_id": 47, "bbox": [420, 310, 475, 360], "class_id": 0, "track_id": 1, "action_id": 2},
+            {"object_id": 48, "bbox": [515, 415, 570, 465], "class_id": 0, "track_id": 2, "action_id": 2}
+          ]
+        }
+      ]
+    }
+  ]
+}

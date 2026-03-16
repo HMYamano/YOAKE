@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "htrtdetr"
+version = "0.1.0"
+description = "YOAKE: Hierarchical Temporal RT-DETR for Animal Behavior Analysis"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["computer-vision", "object-detection", "multi-object-tracking", "action-recognition", "animal-behavior"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "Pillow>=9.0.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "scipy>=1.10.0",
+]
+
+[project.scripts]
+annotate = "htrtdetr.annotator:main"
+
+[project.optional-dependencies]
+annotate = ["opencv-python>=4.8.0", "dearpygui>=1.11.0"]
+vis = ["matplotlib>=3.7.0", "opencv-python>=4.8.0"]
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "black", "isort", "mypy"]
+wandb = ["wandb>=0.16.0"]
+all = ["matplotlib>=3.7.0", "opencv-python>=4.8.0", "wandb>=0.16.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

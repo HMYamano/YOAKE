@@ -1,0 +1,180 @@
+# YOAKE Default Configuration
+# すべての設定のデフォルト値。各 stage 用 yaml でここを override する。
+
+model:
+  training_stage: 1
+
+  detector:
+    backbone:
+      name: resnet18
+      pretrained: true
+      freeze_bn: false
+    fpn:
+      out_channels: 256
+      num_levels: 3
+    head:
+      hidden_dim: 256
+      num_queries: 100
+      num_decoder_layers: 4
+      num_heads: 8
+      ffn_dim: 1024
+      dropout: 0.1
+      num_classes: 1       # ショウジョウバエ = 1 クラス
+    cost_class: 2.0
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    score_threshold: 0.3
+    nms_threshold: 0.5
+
+  temporal:
+    feature_dim: 256
+    short_branch:
+      kernel_size: 3
+      dilation: 1
+      num_frames: 3
+      use_depthwise: true
+      use_residual: true
+      use_channel_attention: false
+    mid_branch:
+      kernel_size: 3
+      dilation: 2
+      num_frames: 8
+      use_depthwise: true
+      use_residual: true
+      use_channel_attention: false
+    long_branch:
+      kernel_size: 3
+      dilation: 4
+      num_frames: 16
+      use_depthwise: true
+      use_residual: true
+      use_channel_attention: false
+    output_dim: 256
+    fusion_method: concat_proj   # concat_proj | sum | attention
+
+  id_head:
+    feature_dim: 256
+    embedding_dim: 128
+    memory_dim: 256
+    max_ids: 50
+    new_id_threshold: 0.5
+    use_appearance: true
+    use_geometry: true
+    use_motion: true
+    use_action_summary: false
+    use_metric_loss: false
+    metric_loss_margin: 0.3
+    memory_ttl: 30
+
+  action_head:
+    feature_dim: 256
+    temporal_dim: 256
+    interaction_dim: 64
+    hidden_dims: [512, 256]
+    num_actions: 5              # idle, walk, groom, interact, other
+    dropout: 0.1
+    use_interaction: true
+    use_nn_distance: true
+    use_relative_angle: true
+    use_relative_velocity: true
+    use_overlap: true
+
+  interaction:
+    feature_dim: 256
+    output_dim: 64
+    max_neighbors: 5
+    distance_bins: 16
+    angle_bins: 8
+
+data:
+  train_root: data/train
+  val_root: data/val
+  test_root: data/test
+  annotation_format: json
+  image_size: [640, 640]
+  window_size: 16
+  window_stride: 8
+  augment_train: true
+  aug_hflip: true
+  aug_vflip: false
+  aug_brightness: 0.2
+  aug_contrast: 0.2
+  aug_saturation: 0.1
+  aug_scale_range: [0.8, 1.2]
+  batch_size: 4
+  num_workers: 4
+  pin_memory: true
+
+loss:
+  w_class: 2.0
+  w_bbox_l1: 5.0
+  w_bbox_giou: 2.0
+  w_action: 1.0
+  w_id_cls: 1.0
+  w_id_metric: 0.5
+  w_temporal_smooth: 0.1
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+
+optimizer:
+  optimizer: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  momentum: 0.9
+  backbone_lr_factor: 0.1
+  grad_clip_norm: 0.1
+
+scheduler:
+  scheduler: cosine
+  warmup_epochs: 5
+  total_epochs: 100
+  eta_min: 1.0e-6
+  step_size: 30
+  gamma: 0.1
+  milestones: [60, 80]
+
+train:
+  stage: 1
+  output_dir: outputs/stage1
+  resume: null
+  max_epochs: 100
+  early_stopping_patience: 20
+  use_amp: true
+  seed: 42
+  deterministic: true
+  log_interval: 10
+  val_interval: 1
+  save_best: true
+  save_last: true
+  use_wandb: false
+  wandb_project: ht-rtdetr
+  wandb_run_name: run
+
+eval:
+  checkpoint: weights/full_model_best.pth
+  output_dir: outputs/eval
+  split: val
+  iou_thresholds: [0.5, 0.75]
+  min_track_length: 5
+  action_names:
+    - idle
+    - walk
+    - groom
+    - interact
+    - other
+  save_predictions: true
+  save_visualizations: false
+
+inference:
+  checkpoint: weights/full_model_best.pth
+  input_path: ""
+  output_path: outputs/inference
+  fps: null
+  show_bbox: true
+  show_id: true
+  show_action: true
+  show_confidence: true
+  bbox_thickness: 2
+  font_scale: 0.5
+  reset_memory_on_scene_change: true
+  scene_change_threshold: 0.5

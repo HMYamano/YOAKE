@@ -1,0 +1,53 @@
+# fly_dataset.yaml — Drosophila melanogaster dataset configuration
+#
+# このファイルは data config の上書き設定です。
+# train scripts で以下のように使います:
+#   cfg = cfg.merge(yaml.safe_load(open("configs/fly_dataset.yaml")))["data"]
+#
+# または HTRTDETRConfig.from_yaml() / merge() で読み込んでください。
+
+data:
+  # アノテーションファイルのパス
+  train_anno: "data/sample/annotations_train.json"
+  val_anno:   "data/sample/annotations_val.json"
+  test_anno:  ""
+
+  # 画像サイズ (H, W) — 640x640 でトレーニング
+  image_size: [640, 640]
+
+  # Sequence window 設定
+  window_size: 16          # 1 sample あたりのフレーム数 (HTM の long branch が使う最大)
+  window_stride: 8         # sliding window のストライド (オーバーラップ 50%)
+
+  # DataLoader
+  batch_size: 8            # Stage 1 / 2 / 3 の default batch size
+  num_workers: 4
+  pin_memory: true
+
+  # データ拡張 (Stage 1 用)
+  augment_train: true
+  aug_hflip: true
+  aug_vflip: false
+  aug_brightness: 0.2
+  aug_contrast: 0.2
+  aug_saturation: 0.1
+  aug_scale_range: [0.8, 1.2]
+
+# モデル設定 (Drosophila 用のクラス/アクション数上書き)
+model:
+  detector:
+    head:
+      num_classes: 1       # fly のみ
+      num_queries: 30      # 最大検出数 (アリーナ内のハエ数)
+  action_head:
+    num_actions: 5         # stationary / walking / grooming / courtship / aggression
+
+# 損失設定の上書き
+loss:
+  w_class: 2.0
+  w_bbox_l1: 5.0
+  w_bbox_giou: 2.0
+  w_action: 1.0
+  w_id_cls: 1.0
+  w_id_metric: 0.5
+  focal_gamma: 2.0

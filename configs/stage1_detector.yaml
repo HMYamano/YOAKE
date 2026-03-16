@@ -1,0 +1,33 @@
+# Stage 1: Detector Pretraining
+# default.yaml を base にして stage1 固有の値を override
+
+model:
+  training_stage: 1
+  detector:
+    head:
+      num_classes: 1
+      num_queries: 100
+      num_decoder_layers: 4
+
+data:
+  image_size: [640, 640]
+  batch_size: 4
+  window_size: 1   # Stage 1 は single frame
+  augment_train: true
+
+optimizer:
+  lr: 1.0e-4
+  backbone_lr_factor: 0.1
+
+scheduler:
+  scheduler: cosine
+  warmup_epochs: 5
+  total_epochs: 100
+
+train:
+  stage: 1
+  output_dir: outputs/stage1
+  max_epochs: 100
+  early_stopping_patience: 25
+  use_amp: true
+  seed: 42
