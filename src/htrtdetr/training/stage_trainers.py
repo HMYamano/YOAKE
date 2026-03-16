@@ -26,7 +26,7 @@ from .losses import DetectionLoss, ActionLoss, IDLoss, CombinedLoss
 from .matching import collect_matched_gt
 
 try:
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.amp import GradScaler, autocast
     _AMP_AVAILABLE = True
 except ImportError:
     _AMP_AVAILABLE = False
@@ -53,7 +53,7 @@ class BaseTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.use_amp = cfg.train.use_amp and _AMP_AVAILABLE and device.type == "cuda"
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = GradScaler("cuda") if self.use_amp else None
 
         self.start_epoch = 0
         self.best_metric = float("inf")
@@ -62,11 +62,11 @@ class BaseTrainer:
         if params is None:
             params = [p for p in self.model.parameters() if p.requires_grad]
         cfg = self.cfg.optimizer
-        if cfg.name.lower() == "adamw":
+        if cfg.optimizer.lower() == "adamw":
             return torch.optim.AdamW(
                 params, lr=cfg.lr, weight_decay=cfg.weight_decay
             )
-        elif cfg.name.lower() == "sgd":
+        elif cfg.optimizer.lower() == "sgd":
             return torch.optim.SGD(
                 params, lr=cfg.lr, momentum=cfg.momentum, weight_decay=cfg.weight_decay
             )
@@ -74,10 +74,10 @@ class BaseTrainer:
 
     def _make_scheduler(self, optimizer, num_epochs: int):
         cfg = self.cfg.scheduler
-        name = cfg.name.lower()
+        name = cfg.scheduler.lower()
         if name == "cosine":
             return torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=num_epochs, eta_min=cfg.min_lr
+                optimizer, T_max=num_epochs, eta_min=cfg.eta_min
             )
         elif name == "step":
             return torch.optim.lr_scheduler.StepLR(

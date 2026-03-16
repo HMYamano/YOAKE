@@ -847,21 +847,15 @@ class AnnotationApp:
     # ═══════════════════════════════════════════════════════════════════
 
     def _open_video_dialog(self) -> None:
-        if dpg.does_item_exist("open_video_dlg"):
-            dpg.delete_item("open_video_dlg")
-        dpg.add_file_dialog(
-            label="Open Video",
-            extensions=".mp4,.avi,.mov,.mkv,.webm,.m4v",
-            callback=self._on_video_selected,
-            tag="open_video_dlg",
-            width=700, height=450,
+        path = _tk_open_file(
+            title="Open Video",
+            filetypes=[
+                ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"),
+                ("All files", "*.*"),
+            ],
         )
-
-    def _on_video_selected(self, sender, app_data) -> None:
-        selections = app_data.get("selections", {})
-        if not selections:
-            return
-        self._load_video(Path(list(selections.values())[0]))
+        if path is not None:
+            self._load_video(path)
 
     def _load_video(self, path: Path) -> None:
         if self.cap is not None:
@@ -1327,24 +1321,15 @@ class AnnotationApp:
         if self.cap is None:
             self._status("No video loaded.")
             return
-        if dpg.does_item_exist("save_dlg"):
-            dpg.delete_item("save_dlg")
-        default = str(self.annotation_path or "annotations.json")
-        dpg.add_file_dialog(
-            label="Save Annotation",
-            default_filename=default,
-            extensions=".json",
-            callback=self._on_save_confirmed,
-            tag="save_dlg",
-            width=700, height=450,
-            file_count=1,
+        initial = (self.annotation_path.name
+                   if self.annotation_path else "annotations.json")
+        path = _tk_save_file(
+            title="Save Annotation",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initial_file=initial,
         )
-
-    def _on_save_confirmed(self, sender, app_data) -> None:
-        path_str = app_data.get("file_path_name", "")
-        if not path_str:
-            return
-        self._write_annotation(Path(path_str))
+        if path is not None:
+            self._write_annotation(path)
 
     def _write_annotation(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1388,21 +1373,9 @@ class AnnotationApp:
         if self.cap is None:
             self._status("No video loaded.")
             return
-        if dpg.does_item_exist("export_dlg"):
-            dpg.delete_item("export_dlg")
-        dpg.add_file_dialog(
-            label="Select Output Directory",
-            directory_selector=True,
-            callback=self._on_export_dir_selected,
-            tag="export_dlg",
-            width=700, height=450,
-        )
-
-    def _on_export_dir_selected(self, sender, app_data) -> None:
-        out_dir = app_data.get("file_path_name", "")
-        if not out_dir:
+        out = _tk_ask_dir(title="Select Output Directory")
+        if out is None:
             return
-        out = Path(out_dir)
         video_id = self.video_path.stem if self.video_path else "video_001"
         img_dir = out / "images" / video_id
         img_dir.mkdir(parents=True, exist_ok=True)
@@ -1419,21 +1392,12 @@ class AnnotationApp:
         self._status(f"Exported {len(frame_indices)} frames → {img_dir}")
 
     def _load_annotation_dialog(self) -> None:
-        if dpg.does_item_exist("load_ann_dlg"):
-            dpg.delete_item("load_ann_dlg")
-        dpg.add_file_dialog(
-            label="Load Annotation JSON",
-            extensions=".json",
-            callback=self._on_load_ann_selected,
-            tag="load_ann_dlg",
-            width=700, height=450,
+        path = _tk_open_file(
+            title="Load Annotation JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
-
-    def _on_load_ann_selected(self, sender, app_data) -> None:
-        selections = app_data.get("selections", {})
-        if not selections:
-            return
-        self._load_annotation_file(Path(list(selections.values())[0]))
+        if path is not None:
+            self._load_annotation_file(path)
 
     def _load_annotation_file(self, path: Path) -> None:
         try:
