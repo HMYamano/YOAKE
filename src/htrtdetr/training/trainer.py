@@ -26,8 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
-from torch.amp import autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -89,7 +88,7 @@ class Trainer:
         )
 
         # AMP
-        self.scaler = GradScaler() if train_cfg.use_amp else None
+        self.scaler = GradScaler('cuda') if train_cfg.use_amp else None
 
         # ログ
         Path(train_cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -256,12 +255,6 @@ class Trainer:
             if meters["loss_action"].count > 0:
                 pf["act"] = f"{meters['loss_action'].avg:.4f}"
             batch_bar.set_postfix(pf)
-
-            if (step + 1) % self.cfg.log_interval == 0:
-                self.logger.info(
-                    f"[Epoch {epoch}][Step {step+1}/{len(self.train_loader)}] "
-                    + " | ".join(f"{m}" for m in meters.values() if m.count > 0)
-                )
 
         batch_bar.close()
 
