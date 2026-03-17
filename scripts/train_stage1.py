@@ -185,22 +185,28 @@ def main() -> None:
         )
 
     collate_fn = get_collate_fn("single")
+    _nw = cfg.data.num_workers
+    _loader_kwargs = dict(
+        pin_memory=cfg.data.pin_memory,
+        persistent_workers=(_nw > 0 and cfg.data.persistent_workers),
+        prefetch_factor=(cfg.data.prefetch_factor if _nw > 0 else None),
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.data.batch_size,
         shuffle=True,
-        num_workers=cfg.data.num_workers,
-        pin_memory=cfg.data.pin_memory,
+        num_workers=_nw,
         collate_fn=collate_fn,
         drop_last=True,
+        **_loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.data.batch_size,
         shuffle=False,
-        num_workers=cfg.data.num_workers,
-        pin_memory=cfg.data.pin_memory,
+        num_workers=_nw,
         collate_fn=collate_fn,
+        **_loader_kwargs,
     )
 
     logger.info(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")

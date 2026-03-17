@@ -66,6 +66,8 @@ class Trainer:
 
         # デバイス
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
         self.model = self.model.to(self.device)
 
         # 再現性
@@ -219,7 +221,7 @@ class Trainer:
         for step, batch in enumerate(batch_bar):
             batch = move_batch_to_device(batch, self.device)
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             with autocast('cuda', enabled=(self.scaler is not None)):
                 loss_dict = self._forward_loss(batch)

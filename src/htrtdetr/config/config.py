@@ -218,8 +218,10 @@ class DataConfig:
     aug_scale_range: Tuple[float, float] = (0.8, 1.2)
     # DataLoader
     batch_size: int = 4              # シーケンス単位のバッチ
-    num_workers: int = 4
+    num_workers: int = 8
     pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +296,7 @@ class TrainConfig:
     use_amp: bool = True
     # 再現性
     seed: int = 42
-    deterministic: bool = True
+    deterministic: bool = False
     # ログ
     log_interval: int = 10           # step interval
     val_interval: int = 1            # epoch interval
