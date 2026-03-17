@@ -182,6 +182,7 @@ cython_debug/
 
 # IDE / Editor
 .vscode/
+.history/
 
 # Claude Code
 .claude/settings.local.json
