@@ -289,7 +289,7 @@ class TrainConfig:
     resume: Optional[str] = None     # checkpoint path
     # Epochs
     max_epochs: int = 100
-    early_stopping_patience: int = 20
+    early_stopping_patience: int = 50
     # AMP (Automatic Mixed Precision)
     use_amp: bool = True
     # 再現性

@@ -144,6 +144,58 @@ class VideoReader:
         self.cap.release()
 
 
+class ImageDirReader:
+    """MOT17 の img1/ ディレクトリなど、連番画像フォルダを動画として読む。"""
+
+    _EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+
+    def __init__(self, path: str, img_size: int = 640, fps: float = 30.0):
+        dir_path = Path(path)
+        if not dir_path.is_dir():
+            raise IOError(f"Not a directory: {path}")
+
+        # seqinfo.ini があれば FPS を読む
+        seqinfo = dir_path / "seqinfo.ini"
+        if not seqinfo.exists():
+            seqinfo = dir_path.parent / "seqinfo.ini"
+        if seqinfo.exists():
+            import configparser
+            cfg = configparser.ConfigParser()
+            cfg.read(str(seqinfo))
+            fps = float(cfg["Sequence"].get("frameRate", fps))
+
+        frames = sorted(
+            p for p in dir_path.iterdir()
+            if p.suffix.lower() in self._EXTS
+        )
+        if not frames:
+            raise IOError(f"No image files found in: {path}")
+
+        self.frames = frames
+        self.img_size = img_size
+        self.fps = fps
+        self.total_frames = len(frames)
+        self._idx = 0
+
+        first = cv2.imread(str(frames[0]))
+        self.orig_h, self.orig_w = first.shape[:2]
+
+    def read_frame(self) -> Optional[Tuple[np.ndarray, torch.Tensor]]:
+        if self._idx >= len(self.frames):
+            return None
+        bgr = cv2.imread(str(self.frames[self._idx]))
+        self._idx += 1
+        if bgr is None:
+            return None
+        bgr_r = cv2.resize(bgr, (self.img_size, self.img_size))
+        rgb = cv2.cvtColor(bgr_r, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
+        return bgr_r, tensor
+
+    def release(self):
+        pass
+
+
 class VideoWriter:
     def __init__(self, path: str, fps: float, width: int, height: int):
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -160,6 +212,17 @@ class VideoWriter:
 # Inference
 # ---------------------------------------------------------------------------
 
+def _make_reader(path: str, img_size: int):
+    """mp4 ファイルまたは画像ディレクトリを自動判別して Reader を返す。"""
+    p = Path(path)
+    if p.is_dir():
+        # MOT17 の img1/ サブディレクトリがあれば自動で降りる
+        img1 = p / "img1"
+        target = img1 if img1.is_dir() else p
+        return ImageDirReader(str(target), img_size=img_size)
+    return VideoReader(path, img_size=img_size)
+
+
 def run_inference(
     model: torch.nn.Module,
     video_path: str,
@@ -172,15 +235,16 @@ def run_inference(
     write_video: bool = True,
 ) -> Dict:
     """
-    動画全体に推論を実行し、mp4 + JSON を保存する。
+    動画 (.mp4) または画像ディレクトリ (MOT17 img1/ 等) に推論を実行し、
+    mp4 + JSON を保存する。
     Returns summary dict.
     """
     if not _CV2_AVAILABLE:
         raise RuntimeError("OpenCV (cv2) is required for video inference.")
 
-    reader = VideoReader(video_path, img_size=img_size)
+    reader = _make_reader(video_path, img_size=img_size)
     fps = reader.fps
-    video_name = Path(video_path).stem
+    video_name = Path(video_path).name  # ディレクトリ名にも対応
     out_video_path = str(output_dir / f"{video_name}_pred.mp4")
     out_json_path = str(output_dir / f"{video_name}_pred.json")
 
@@ -300,20 +364,38 @@ def parse_overrides(argv) -> dict:
     return overrides
 
 
+def _build_model(checkpoint_path: str, device: torch.device, stage: int = 3):
+    cfg = get_stage4_config()
+    model = build_model(cfg.model)
+    model.to(device)
+    model.set_stage(stage)
+    if Path(checkpoint_path).exists():
+        load_checkpoint(model, checkpoint_path, device=device)
+        print(f"Loaded checkpoint: {checkpoint_path}")
+    else:
+        print("Warning: checkpoint not found, using random weights.")
+    return model
+
+
 def main():
     overrides = parse_overrides(sys.argv[1:])
 
     input_path = overrides.get("input", None)
-    checkpoint_path = overrides.get("checkpoint", "outputs/stage4/checkpoint_best.pth")
+    checkpoint_path = overrides.get("checkpoint", "outputs/stage3/checkpoint_best.pth")
     output_dir = Path(overrides.get("output_dir", "outputs/inference"))
     score_threshold = float(overrides.get("score_threshold", "0.3"))
     window_size = int(overrides.get("window_size", "16"))
     img_size = int(overrides.get("img_size", "640"))
     action_names_str = overrides.get("action_names", "")
     no_video = overrides.get("no_video", "false").lower() == "true"
+    mot17_dir = overrides.get("mot17_dir", None)   # MOT17一括処理モード
 
-    if input_path is None:
-        print("Usage: python tools/infer_video.py input=<video.mp4> checkpoint=<path>")
+    if input_path is None and mot17_dir is None:
+        print("Usage:")
+        print("  # 単一動画 / 画像ディレクトリ")
+        print("  python tools/infer_video.py input=<video.mp4|img_dir> checkpoint=<path>")
+        print("  # MOT17 全シーケンス一括")
+        print("  python tools/infer_video.py mot17_dir=data/MOT17/train checkpoint=<path>")
         sys.exit(1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -321,23 +403,12 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Input: {input_path}")
     print(f"Checkpoint: {checkpoint_path}")
 
-    cfg = get_stage4_config()
-    model = build_model(cfg.model)
-    model.to(device)
-    model.set_stage(4)
+    model = _build_model(checkpoint_path, device, stage=3)
 
-    if Path(checkpoint_path).exists():
-        load_checkpoint(model, checkpoint_path, device=device)
-        print(f"Loaded checkpoint: {checkpoint_path}")
-    else:
-        print("Warning: checkpoint not found, using random weights.")
-
-    summary = run_inference(
+    common_kwargs = dict(
         model=model,
-        video_path=input_path,
         output_dir=output_dir,
         device=device,
         score_threshold=score_threshold,
@@ -347,13 +418,37 @@ def main():
         write_video=not no_video,
     )
 
-    print(f"\nDone.")
-    print(f"  Frames: {summary['total_frames']}")
-    print(f"  Total detections: {summary['total_detections']}")
-    print(f"  Inference FPS: {summary['inference_fps']:.1f}")
-    if summary["output_video"]:
-        print(f"  Video: {summary['output_video']}")
-    print(f"  JSON:  {summary['output_json']}")
+    if mot17_dir is not None:
+        # MOT17 全シーケンス一括処理
+        mot17_path = Path(mot17_dir)
+        seq_dirs = sorted(d for d in mot17_path.iterdir() if d.is_dir())
+        # DPM のみ処理（gt が同一なので重複排除）
+        seq_dirs = [d for d in seq_dirs if "DPM" in d.name] or seq_dirs
+        print(f"\nMOT17 batch mode: {len(seq_dirs)} sequences")
+
+        for seq_dir in seq_dirs:
+            seq_output = output_dir / seq_dir.name
+            seq_output.mkdir(parents=True, exist_ok=True)
+            print(f"\n--- {seq_dir.name} ---")
+            summary = run_inference(video_path=str(seq_dir), output_dir=seq_output, **common_kwargs)
+            print(f"  Frames: {summary['total_frames']}  "
+                  f"FPS: {summary['inference_fps']:.1f}  "
+                  f"Dets: {summary['total_detections']}")
+            if summary["output_video"]:
+                print(f"  Video: {summary['output_video']}")
+        print(f"\nAll sequences done → {output_dir}")
+
+    else:
+        # 単一ファイル / ディレクトリ
+        print(f"Input: {input_path}")
+        summary = run_inference(video_path=input_path, **common_kwargs)
+        print(f"\nDone.")
+        print(f"  Frames: {summary['total_frames']}")
+        print(f"  Total detections: {summary['total_detections']}")
+        print(f"  Inference FPS: {summary['inference_fps']:.1f}")
+        if summary["output_video"]:
+            print(f"  Video: {summary['output_video']}")
+        print(f"  JSON:  {summary['output_json']}")
 
 
 if __name__ == "__main__":

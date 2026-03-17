@@ -497,6 +497,7 @@ class RTDETRDetector(BaseDetector):
             pred_boxes=final_boxes,            # (B, Q, 4) [cx, cy, w, h]
             query_features=final_out,          # (B, Q, hidden_dim)
             encoder_features=encoder_features, # List[(B, C, H_i, W_i)]
+            aux_outputs=aux_outputs,           # List[{pred_logits, pred_boxes}] 中間層
         )
 
     def get_hidden_dim(self) -> int:

@@ -75,6 +75,8 @@ class HTRTDETROutput:
         action_probs: Optional[torch.Tensor] = None,        # (B*N_det, num_actions)
         # 有効な検出の情報
         det_results: Optional[List[Dict]] = None,           # B 個の dict
+        # 中間デコーダ層の出力 (auxiliary loss 用)
+        aux_outputs: Optional[List[Dict]] = None,
     ):
         self.pred_logits = pred_logits
         self.pred_boxes = pred_boxes
@@ -85,6 +87,7 @@ class HTRTDETROutput:
         self.action_logits = action_logits
         self.action_probs = action_probs
         self.det_results = det_results
+        self.aux_outputs = aux_outputs
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +403,7 @@ class HTRTDETR(nn.Module):
             pred_logits=det_out.pred_logits,
             pred_boxes=det_out.pred_boxes,
             query_features=det_out.query_features,
+            aux_outputs=det_out.aux_outputs,
         )
 
     # ------------------------------------------------------------------ #

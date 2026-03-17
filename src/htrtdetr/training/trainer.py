@@ -26,8 +26,10 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from ..config.config import TrainConfig, LossConfig
 from ..models.ht_rtdetr import HTRTDETR
@@ -130,9 +132,15 @@ class Trainer:
             f"Epochs: {self.cfg.max_epochs} | Device: {self.device}"
         )
 
-        for epoch in range(self.start_epoch, self.cfg.max_epochs):
+        epoch_bar = tqdm(
+            range(self.start_epoch, self.cfg.max_epochs),
+            desc="Training",
+            unit="epoch",
+            dynamic_ncols=True,
+        )
+        for epoch in epoch_bar:
             # --- Train epoch ---
-            train_metrics = self._train_epoch(epoch)
+            train_metrics = self._train_epoch(epoch, epoch_bar)
 
             # --- Val epoch ---
             if (epoch + 1) % self.cfg.val_interval == 0:
@@ -149,6 +157,12 @@ class Trainer:
             self.metrics_logger.log(all_metrics, step=epoch)
             self.wandb.log(all_metrics, step=epoch)
             self._log_epoch(epoch, train_metrics, val_metrics)
+
+            # --- Epoch bar postfix ---
+            postfix = {"train_loss": f"{train_metrics.get('train_loss', 0):.4f}"}
+            if val_metrics:
+                postfix["val_loss"] = f"{val_metrics.get('val_loss', 0):.4f}"
+            epoch_bar.set_postfix(postfix)
 
             # --- Checkpoint ---
             if self.cfg.save_last:
@@ -182,7 +196,7 @@ class Trainer:
         self.wandb.finish()
         self.logger.info("Training completed.")
 
-    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+    def _train_epoch(self, epoch: int, epoch_bar: tqdm = None) -> Dict[str, float]:
         """1 epoch の学習"""
         self.model.train()
         self.criterion.train()
@@ -195,12 +209,20 @@ class Trainer:
         }
         epoch_start = time.time()
 
-        for step, batch in enumerate(self.train_loader):
+        batch_bar = tqdm(
+            self.train_loader,
+            desc=f"Epoch {epoch + 1}/{self.cfg.max_epochs} train",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        )
+
+        for step, batch in enumerate(batch_bar):
             batch = move_batch_to_device(batch, self.device)
 
             self.optimizer.zero_grad()
 
-            with autocast(enabled=(self.scaler is not None)):
+            with autocast('cuda', enabled=(self.scaler is not None)):
                 loss_dict = self._forward_loss(batch)
 
             total_loss = loss_dict.get("total_loss", loss_dict.get("loss_detection", 0.0))
@@ -227,11 +249,21 @@ class Trainer:
                 if key in loss_dict:
                     meters[key].update(loss_dict[key].item(), bs)
 
+            # バッチバー postfix
+            pf = {"loss": f"{meters['loss'].avg:.4f}"}
+            if meters["loss_detection"].count > 0:
+                pf["det"] = f"{meters['loss_detection'].avg:.4f}"
+            if meters["loss_action"].count > 0:
+                pf["act"] = f"{meters['loss_action'].avg:.4f}"
+            batch_bar.set_postfix(pf)
+
             if (step + 1) % self.cfg.log_interval == 0:
                 self.logger.info(
                     f"[Epoch {epoch}][Step {step+1}/{len(self.train_loader)}] "
                     + " | ".join(f"{m}" for m in meters.values() if m.count > 0)
                 )
+
+        batch_bar.close()
 
         epoch_time = time.time() - epoch_start
         return {
@@ -250,16 +282,26 @@ class Trainer:
 
         total_loss = AverageMeter("val_loss")
 
-        for batch in self.val_loader:
+        val_bar = tqdm(
+            self.val_loader,
+            desc=f"Epoch {epoch + 1}/{self.cfg.max_epochs}   val",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        )
+
+        for batch in val_bar:
             batch = move_batch_to_device(batch, self.device)
 
-            with autocast(enabled=(self.scaler is not None)):
+            with autocast('cuda', enabled=(self.scaler is not None)):
                 loss_dict = self._forward_loss(batch)
 
             loss = loss_dict.get("total_loss", 0.0)
             bs = batch["images"].shape[0] if "images" in batch else 1
             total_loss.update(loss.item() if isinstance(loss, torch.Tensor) else loss, bs)
+            val_bar.set_postfix({"val_loss": f"{total_loss.avg:.4f}"})
 
+        val_bar.close()
         return {"val_loss": total_loss.avg}
 
     def _forward_loss(self, batch: Dict) -> Dict[str, torch.Tensor]:

@@ -2,14 +2,18 @@
 train_stage1.py — Stage 1: Detector Pretraining / Finetuning
 
 使い方:
-    # デフォルト設定で学習
+    # デフォルト設定で学習 (YOAKE_tryal のデータを自動検出)
     python scripts/train_stage1.py
 
-    # config yaml を指定
-    python scripts/train_stage1.py configs/stage1_detector.yaml
+    # アノテーションファイルを直接指定
+    python scripts/train_stage1.py \
+        train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/train/annotations.json \
+        val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/val/annotations.json
 
-    # yaml を起点にいくつかの値を上書き
-    python scripts/train_stage1.py configs/stage1_detector.yaml \
+    # その他のパラメータを上書き
+    python scripts/train_stage1.py \
+        train_anno=path/to/train.json \
+        val_anno=path/to/val.json \
         train.max_epochs=50 data.batch_size=8
 
 argparse は使わない。sys.argv からシンプルに設定ファイルと上書き値を読む。
@@ -20,7 +24,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from torch.utils.data import DataLoader
 
@@ -32,6 +36,15 @@ from htrtdetr.utils import set_seed, get_logger
 
 
 # ---------------------------------------------------------------------------
+# デフォルトデータパス
+# ---------------------------------------------------------------------------
+
+_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+DEFAULT_TRAIN_ANNO = f"{_YOAKE_TRYAL}/data/train/annotations.json"
+DEFAULT_VAL_ANNO   = f"{_YOAKE_TRYAL}/data/val/annotations.json"
+
+
+# ---------------------------------------------------------------------------
 # argv パーサー (argparse なし)
 # ---------------------------------------------------------------------------
 
@@ -39,10 +52,8 @@ def parse_argv(argv: list) -> tuple[str, Dict[str, Any]]:
     """
     argv を解析して (config_path, overrides) を返す。
 
-    例:
-        train_stage1.py                         → ("", {})
-        train_stage1.py my.yaml                 → ("my.yaml", {})
-        train_stage1.py my.yaml key=value       → ("my.yaml", {"key": value})
+    train_anno= / val_anno= はスクリプトレベルのキーとして特別扱い。
+    それ以外の key=value はネストキー ("train.max_epochs") として config に渡す。
     """
     config_path = ""
     overrides: Dict[str, Any] = {}
@@ -51,6 +62,10 @@ def parse_argv(argv: list) -> tuple[str, Dict[str, Any]]:
     for arg in args:
         if "=" in arg:
             k, v = arg.split("=", 1)
+            # train_anno / val_anno は文字列のまま保持
+            if k in ("train_anno", "val_anno"):
+                overrides[k] = v
+                continue
             # 簡易型変換
             if v.lower() in ("true", "false"):
                 v = v.lower() == "true"
@@ -81,6 +96,10 @@ def parse_argv(argv: list) -> tuple[str, Dict[str, Any]]:
 def main() -> None:
     config_path, overrides = parse_argv(sys.argv)
 
+    # スクリプトレベルのキーを先に取り出す
+    train_anno_path: Optional[str] = overrides.pop("train_anno", None)
+    val_anno_path:   Optional[str] = overrides.pop("val_anno",   None)
+
     # Config 構築
     if config_path:
         cfg = HTRTDETRConfig.from_yaml(config_path)
@@ -98,21 +117,31 @@ def main() -> None:
 
     set_seed(cfg.train.seed, cfg.train.deterministic)
 
+    # ----- アノテーションパスの解決 -----
+    # 優先順位: コマンドライン引数 > デフォルトパス (YOAKE_tryal) > DummyDataset
+    if train_anno_path is None and Path(DEFAULT_TRAIN_ANNO).exists():
+        train_anno_path = DEFAULT_TRAIN_ANNO
+    if val_anno_path is None and Path(DEFAULT_VAL_ANNO).exists():
+        val_anno_path = DEFAULT_VAL_ANNO
+
     # ----- Dataset -----
-    use_dummy = not (
-        Path(cfg.data.train_root).exists() and
-        any(Path(cfg.data.train_root).iterdir())
-    )
+    _img_size = cfg.data.image_size
+    if isinstance(_img_size, int):
+        _img_size = (_img_size, _img_size)
+    else:
+        _img_size = tuple(_img_size)
+
+    use_dummy = train_anno_path is None or not Path(train_anno_path).exists()
 
     if use_dummy:
         logger.warning(
-            f"Train data not found at '{cfg.data.train_root}'. "
-            "Using DummyDataset for smoke-test."
+            "Train annotation not found. Using DummyDataset for smoke-test.\n"
+            f"  指定方法: python scripts/train_stage1.py train_anno=<path/to/train.json>"
         )
         train_dataset = DummyDataset(
             n_samples=100,
             window_size=1,
-            image_size=tuple(cfg.data.image_size),
+            image_size=_img_size,
             num_classes=cfg.model.detector.head.num_classes,
             num_actions=cfg.model.action_head.num_actions,
             mode="single",
@@ -120,30 +149,39 @@ def main() -> None:
         val_dataset = DummyDataset(
             n_samples=20,
             window_size=1,
-            image_size=tuple(cfg.data.image_size),
+            image_size=_img_size,
             num_classes=cfg.model.detector.head.num_classes,
             num_actions=cfg.model.action_head.num_actions,
             mode="single",
         )
     else:
-        # 実データ読み込み
-        train_ann = str(Path(cfg.data.train_root) / "annotations.json")
-        val_ann = str(Path(cfg.data.val_root) / "annotations.json")
+        logger.info(f"Train annotation: {train_anno_path}")
 
-        train_videos, _, _ = load_annotations(train_ann)
-        val_videos, _, _ = load_annotations(val_ann)
+        train_videos, _, _ = load_annotations(train_anno_path)
+
+        # val アノテーションがなければ train を流用 (過学習確認用)
+        if val_anno_path and Path(val_anno_path).exists():
+            logger.info(f"Val   annotation: {val_anno_path}")
+            val_videos, _, _ = load_annotations(val_anno_path)
+        else:
+            logger.warning("Val annotation not found. Using train data as val.")
+            val_videos = train_videos
+
+        # アノテーション内の image_path が絶対パスの場合は data_root="" でよい
+        first_path = train_videos[0].frames[0].image_path if train_videos else ""
+        data_root = "" if Path(first_path).is_absolute() else cfg.data.train_root
 
         train_dataset = SingleFrameDataset(
             train_videos,
-            image_size=tuple(cfg.data.image_size),
+            image_size=_img_size,
             augment=cfg.data.augment_train,
-            data_root=cfg.data.train_root,
+            data_root=data_root,
         )
         val_dataset = SingleFrameDataset(
             val_videos,
-            image_size=tuple(cfg.data.image_size),
+            image_size=_img_size,
             augment=False,
-            data_root=cfg.data.val_root,
+            data_root=data_root,
         )
 
     collate_fn = get_collate_fn("single")
@@ -171,7 +209,6 @@ def main() -> None:
     model = build_model(cfg.model)
     logger.info(f"Model parameters: {model.num_parameters()}")
 
-    # Stage 1 設定
     model.set_stage(1)
 
     # ----- Trainer -----

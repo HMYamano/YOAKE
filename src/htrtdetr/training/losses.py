@@ -540,6 +540,20 @@ class CombinedLoss(nn.Module):
             )
             losses.update(det_losses)
 
+            # Auxiliary losses (各中間デコーダ層)
+            aux_outputs = getattr(model_output, "aux_outputs", None)
+            if aux_outputs:
+                aux_total = model_output.pred_logits.new_zeros(())
+                for i, aux in enumerate(aux_outputs):
+                    aux_losses = self.detection_loss(
+                        aux["pred_logits"],
+                        aux["pred_boxes"],
+                        frame_targets,
+                    )
+                    aux_total = aux_total + aux_losses["loss_detection"]
+                    losses[f"aux_det_layer{i}"] = aux_losses["loss_detection"]  # ログ用 (合計には含まない)
+                losses["loss_detection_aux"] = aux_total
+
         # ----- Stage 2: Action -----
         if s in (2, 4) and model_output.action_logits is not None:
             # GT action_id を収集

@@ -82,7 +82,7 @@ def load_checkpoint(
     """checkpoint を読み込む。欠損 key は無視して部分 load も可能。"""
     if not Path(path).exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     missing, unexpected = model.load_state_dict(
         ckpt["model_state"], strict=strict
     )

@@ -38,6 +38,7 @@ class DetectionOutput:
     pred_boxes: torch.Tensor
     query_features: torch.Tensor
     encoder_features: Optional[List[torch.Tensor]] = None
+    aux_outputs: Optional[List[Dict]] = None  # 各中間デコーダ層の予測 (auxiliary loss 用)
 
 
 # ---------------------------------------------------------------------------
