@@ -576,8 +576,10 @@ class CombinedLoss(nn.Module):
                 )
                 losses.update(id_losses)
 
-        # Total loss
-        total = sum(v for k, v in losses.items() if k.startswith("loss_"))
+        # Total loss — sum only the top-level aggregate losses to avoid
+        # double-counting (loss_class/bbox/giou are already included in loss_detection)
+        _AGGREGATE_KEYS = ("loss_detection", "loss_detection_aux", "loss_action", "loss_id")
+        total = sum(losses[k] for k in _AGGREGATE_KEYS if k in losses)
         losses["total_loss"] = total
 
         return losses

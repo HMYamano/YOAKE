@@ -9,7 +9,9 @@
       "Bash(/c/Users/utopi/miniconda3/python.exe -m pip show torch)",
       "Bash(/c/Users/utopi/miniconda3/python.exe -c \"import sys; print\\(sys.version\\)\")",
       "Bash(/c/Users/utopi/miniconda3/envs/yoru/python.exe -c \"import torch; print\\(''torch'', torch.__version__\\)\")",
-      "Read(//c/Users/utopi/YOAKE/**)"
+      "Read(//c/Users/utopi/YOAKE/**)",
+      "Bash(python3 -c \":*)",
+      "Bash(python -c \":*)"
     ]
   }
 }

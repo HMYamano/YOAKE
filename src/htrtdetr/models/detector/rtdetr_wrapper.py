@@ -437,12 +437,23 @@ class RTDETRDetector(BaseDetector):
 
     def _init_weights(self) -> None:
         """bbox head の bias を初期化 (DETR 論文の prior 推奨)"""
-        # bbox head の最終層 bias を 0.5 に
-        nn.init.constant_(self.pred_head.bbox_head[-1].bias, 0.0)
+        # cx, cy: 0.0 → sigmoid = 0.5 (center of image)
+        # w, h: -2.0 → sigmoid ≈ 0.12 (small initial box size, ~12% of image)
+        # MOT17 の歩行者は画像幅の ~3-10%、高さの ~10-25% 程度なので、
+        # 初期ボックスを画像全体の50%に設定すると収束が遅くなる
+        bias_init = torch.zeros(4)
+        bias_init[2] = -2.0  # w
+        bias_init[3] = -2.0  # h
+        with torch.no_grad():
+            self.pred_head.bbox_head[-1].bias.copy_(bias_init)
+            for aux_head in self.aux_heads:
+                aux_head.bbox_head[-1].bias.copy_(bias_init)
         # class head の bias を log(p/(1-p)) に (focal loss 推奨)
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         nn.init.constant_(self.pred_head.class_head.bias, bias_value)
+        for aux_head in self.aux_heads:
+            nn.init.constant_(aux_head.class_head.bias, bias_value)
 
     def forward(self, images: torch.Tensor) -> DetectionOutput:
         """
