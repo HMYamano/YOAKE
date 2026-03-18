@@ -14,11 +14,13 @@ from typing import Dict, Any
 
 from torch.utils.data import DataLoader
 
-from htrtdetr.config import get_stage3_config, HTRTDETRConfig
+from htrtdetr.config import get_stage3_config, HTRTDETRConfig, clamp_temporal_branches
 from htrtdetr.data import DummyDataset, SlidingWindowDataset, load_annotations, get_collate_fn
 from htrtdetr.models import build_model
 from htrtdetr.training import Trainer
 from htrtdetr.utils import set_seed, get_logger, load_model_weights
+
+_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
 
 
 def parse_argv(argv):
@@ -26,10 +28,13 @@ def parse_argv(argv):
     for arg in argv[1:]:
         if "=" in arg:
             k, v = arg.split("=", 1)
-            try: v = int(v)
-            except:
-                try: v = float(v)
-                except: pass
+            if v.lower() in ("true", "false"):
+                v = v.lower() == "true"
+            else:
+                try: v = int(v)
+                except:
+                    try: v = float(v)
+                    except: pass
             keys = k.split(".")
             d = overrides
             for key in keys[:-1]:
@@ -40,8 +45,34 @@ def parse_argv(argv):
     return config_path, overrides
 
 
+def _find_checkpoint(root: str, stage: int) -> str:
+    """outputs 以下を再帰検索して stage{N}_best.pth を見つける。
+
+    優先順位:
+      1. outputs/*/stage{N}/stage{N}_best.pth  (バリアント別: large / medium / small)
+      2. outputs/stage{N}/stage{N}_best.pth     (フラット構造・旧形式)
+
+    複数候補がある場合は最終更新日時が最新のものを返す。
+    見つからなければ空文字列を返す。
+    """
+    fname = f"stage{stage}_best.pth"
+    candidates = sorted(
+        Path(root).glob(f"outputs/*/stage{stage}/{fname}"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        return str(candidates[0])
+    flat = Path(root) / "outputs" / f"stage{stage}" / fname
+    if flat.exists():
+        return str(flat)
+    return ""
+
+
 def main() -> None:
     config_path, overrides = parse_argv(sys.argv)
+
+    root = overrides.pop("root", _YOAKE_TRYAL)
 
     if config_path:
         cfg = HTRTDETRConfig.from_yaml(config_path)
@@ -50,8 +81,15 @@ def main() -> None:
     else:
         cfg = get_stage3_config(overrides if overrides else None)
 
+    if not overrides.get("train", {}).get("output_dir"):
+        cfg.train.output_dir = f"{root}/outputs/stage3"
+
+    # window_size が small な場合に temporal branch の num_frames を自動クリップ
+    clamp_temporal_branches(cfg)
+
     logger = get_logger("stage3", log_file=str(Path(cfg.train.output_dir) / "stage3.log"))
     logger.info("Stage 3: ID Head Training")
+    logger.info(f"Root   : {root}")
     set_seed(cfg.train.seed)
 
     use_dummy = not (
@@ -111,14 +149,19 @@ def main() -> None:
     model = build_model(cfg.model)
     model.set_stage(3)
 
-    # Stage 1/2 の重みをロード
-    for ckpt_path in ["outputs/stage2/stage2_best.pth", "outputs/stage1/stage1_best.pth"]:
-        if Path(ckpt_path).exists():
-            logger.info(f"Loading weights from {ckpt_path}")
-            load_model_weights(ckpt_path, model, strict=False)
-            break
-    else:
-        logger.warning("No previous stage weights found. Training from scratch.")
+    # Stage 2 → Stage 1 の順に最新チェックポイントを探索してロード
+    # train.resume が指定されていれば Trainer が処理するためここではスキップ
+    if not cfg.train.resume:
+        loaded = False
+        for prev_stage in (2, 1):
+            ckpt_path = _find_checkpoint(root, stage=prev_stage)
+            if ckpt_path:
+                logger.info(f"Loading Stage {prev_stage} weights from {ckpt_path}")
+                load_model_weights(ckpt_path, model, strict=False)
+                loaded = True
+                break
+        if not loaded:
+            logger.warning("No previous stage weights found. Training from scratch.")
 
     trainer = Trainer(
         model=model,
@@ -127,6 +170,8 @@ def main() -> None:
         num_classes=cfg.model.detector.head.num_classes,
         num_actions=cfg.model.action_head.num_actions,
         max_ids=cfg.model.id_head.max_ids,
+        optimizer_cfg=cfg.optimizer,
+        scheduler_cfg=cfg.scheduler,
     )
     trainer.train()
     logger.info(f"Stage 3 complete. Best: {cfg.train.output_dir}/stage3_best.pth")

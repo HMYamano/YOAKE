@@ -448,12 +448,18 @@ class RTDETRDetector(BaseDetector):
             self.pred_head.bbox_head[-1].bias.copy_(bias_init)
             for aux_head in self.aux_heads:
                 aux_head.bbox_head[-1].bias.copy_(bias_init)
-        # class head の bias を log(p/(1-p)) に (focal loss 推奨)
+        # class head の bias 初期化 (focal loss 推奨)
+        # foreground クラスだけを低確率に設定し、background (最後のクラス) は 0 のまま
+        # こうすることで P(foreground) ≈ prior_prob << P(background) となり
+        # class imbalance に対する focal loss の補正が正しく機能する
         prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-        nn.init.constant_(self.pred_head.class_head.bias, bias_value)
-        for aux_head in self.aux_heads:
-            nn.init.constant_(aux_head.class_head.bias, bias_value)
+        fg_bias = -math.log((1 - prior_prob) / prior_prob)  # ≈ -4.6
+        with torch.no_grad():
+            self.pred_head.class_head.bias[:-1] = fg_bias   # foreground classes
+            self.pred_head.class_head.bias[-1]  = 0.0       # background
+            for aux_head in self.aux_heads:
+                aux_head.class_head.bias[:-1] = fg_bias
+                aux_head.class_head.bias[-1]  = 0.0
 
     def forward(self, images: torch.Tensor) -> DetectionOutput:
         """

@@ -30,6 +30,8 @@ from htrtdetr.data.annotation import load_annotation
 from htrtdetr.training.stage_trainers import Stage1Trainer
 from htrtdetr.utils.misc import set_seed
 
+_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+
 
 def parse_overrides(argv) -> dict:
     """key=value 形式の引数を dict に変換する"""
@@ -58,7 +60,8 @@ def main():
     # コマンドライン上書き
     train_anno_path = overrides.pop("train_anno", "data/sample/annotations_train.json")
     val_anno_path = overrides.pop("val_anno", "data/sample/annotations_val.json")
-    output_dir = overrides.pop("output_dir", "outputs/stage1")
+    root = overrides.pop("root", _YOAKE_TRYAL)
+    output_dir = overrides.pop("output_dir", f"{root}/outputs/stage1")
     num_epochs = int(overrides.pop("num_epochs", 50))
     batch_size = int(overrides.pop("batch_size", cfg.data.batch_size))
     resume = overrides.pop("resume", None)

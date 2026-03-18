@@ -1,5 +1,0 @@
-variant,action_accuracy,action_macro_f1,id_accuracy,similarity_gap,stage,description
-clip_4,0.0,0.0,0.0,0.0,2,Window size = 4
-clip_8,0.0,0.0,0.0,0.0,2,Window size = 8
-clip_16,0.0,0.0,0.0,0.0,2,Window size = 16 (default)
-clip_32,0.0,0.0,0.0,0.0,2,Window size = 32

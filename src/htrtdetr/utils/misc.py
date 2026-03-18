@@ -104,7 +104,7 @@ def load_model_weights(
     prefix_to_remove: str = "",
 ) -> None:
     """model weights のみを読み込む (optimizer 等は無視)"""
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt.get("model_state", ckpt)  # state dict が直接の場合にも対応
     if prefix_to_remove:
         state = {

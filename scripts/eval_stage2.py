@@ -27,6 +27,9 @@ from htrtdetr.evaluation.evaluator import ActionEvaluator
 from htrtdetr.utils.misc import load_checkpoint
 
 
+_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+
+
 def parse_overrides(argv) -> dict:
     overrides = {}
     for arg in argv:
@@ -41,8 +44,9 @@ def main():
     overrides = parse_overrides(sys.argv[1:])
 
     anno_path = overrides.get("anno", "data/sample/annotations_val.json")
-    checkpoint_path = overrides.get("checkpoint", "outputs/stage2/checkpoint_best.pth")
-    output_dir = Path(overrides.get("output_dir", "outputs/eval_stage2"))
+    root = overrides.pop("root", _YOAKE_TRYAL)
+    checkpoint_path = overrides.get("checkpoint", f"{root}/outputs/stage2/checkpoint_best.pth")
+    output_dir = Path(overrides.get("output_dir", f"{root}/outputs/eval_stage2"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

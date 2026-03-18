@@ -76,6 +76,7 @@ Output per detection: [bbox, det_score, class_id, track_id, id_conf, action_id, 
 - **4-stage training**: each stage freezes previously trained modules to stabilize learning of new components
 - **Config-first design**: all hyperparameters are managed by typed dataclasses and YAML files; no `argparse` in the main API
 - **Mixed precision support**: native PyTorch AMP for 1.5–2x training speedup on Ampere+ GPUs
+- **Three model size variants**: `small` (ResNet-18, ~15–20M), `medium` (ResNet-34, ~30–40M), `large` (ResNet-50, ~55–70M) via `get_variant_config()`
 
 ---
 
@@ -177,7 +178,7 @@ YOAKE uses a custom JSON annotation format (v1.1) described in full in [docs/DAT
 {
   "meta": { "version": "1.1", "fps_default": 25.0, "image_root": "images/" },
   "class_names": ["fly"],
-  "action_names": ["idle", "walk", "groom", "court", "other"],
+  "action_names": ["idle", "walk", "groom", "interact", "other"],
   "videos": [
     {
       "video_id": "vid_001", "fps": 25.0, "width": 1024, "height": 1024,
@@ -341,7 +342,7 @@ python tools/infer_video.py \
     output_dir=outputs/inference \
     score_threshold=0.3 \
     window_size=16 \
-    action_names=idle,walk,groom,court,other
+    action_names=idle,walk,groom,interact,other
 ```
 
 ### JSON-only output (no annotated video)

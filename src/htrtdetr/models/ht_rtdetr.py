@@ -341,10 +341,11 @@ class HTRTDETR(nn.Module):
                         continue
                     feat_b = id_feat[ptr:ptr + N_b]
                     box_b = all_boxes_cat[ptr:ptr + N_b]
-                    # Dummy memory (学習時は memory を使わない — GT ID で監督)
-                    dummy_emb = self.id_head.memory_net.input_proj(feat_b)
+                    # geometry/motion を concat して input_proj の次元に合わせる
+                    vel_b = torch.zeros(N_b, 2, device=feat_b.device)
+                    x_b = self.id_head._build_input(feat_b, box_b, vel_b)
                     h = torch.zeros(N_b, self.cfg.id_head.memory_dim, device=feat_b.device)
-                    _, emb = self.id_head.memory_net(feat_b, h)
+                    _, emb = self.id_head.memory_net(x_b, h)
                     logits = self.id_head.id_classifier(emb)
                     id_logits_list.append(logits)
                     id_emb_list.append(emb)

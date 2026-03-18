@@ -23,6 +23,9 @@ from .config import (
     get_stage4_config,
     validate_config,
     ConfigValidationError,
+    clamp_temporal_branches,
+    build_model_config,
+    get_variant_config,
 )
 from .ablation import (
     AblationVariant,
@@ -67,6 +70,10 @@ __all__ = [
     # Validation
     "validate_config",
     "ConfigValidationError",
+    "clamp_temporal_branches",
+    # Variant helpers
+    "build_model_config",
+    "get_variant_config",
     # Ablation
     "AblationVariant",
     "AblationSuite",

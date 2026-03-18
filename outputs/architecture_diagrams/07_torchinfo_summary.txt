@@ -1,0 +1,323 @@
+================================================================================
+  RT-DETR Detector (ResNet-18, 640×640)
+================================================================================
+  [Error during summary: Failed to run torchinfo. See above stack traces for more details. Executed layers up to: [ResNetBackbone: 1, Sequential: 2, Conv2d: 3, BatchNorm2d: 3, ReLU: 3, MaxPool2d: 3, Sequential: 2, BasicBlock: 3, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, BasicBlock: 3, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Sequential: 2, BasicBlock: 3, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Conv2d: 4, BatchNorm2d: 4, Sequential: 4, Conv2d: 5, BatchNorm2d: 5, ReLU: 4, BasicBlock: 3, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Sequential: 2, BasicBlock: 3, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Conv2d: 4, BatchNorm2d: 4, Sequential: 4, Conv2d: 5, BatchNorm2d: 5, ReLU: 4, BasicBlock: 3, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Sequential: 2, BasicBlock: 3, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Conv2d: 4, BatchNorm2d: 4, Sequential: 4, Conv2d: 5, BatchNorm2d: 5, ReLU: 4, BasicBlock: 3, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, Conv2d: 4, BatchNorm2d: 4, ReLU: 4, FPN: 1, Conv2d: 3, Conv2d: 3, Conv2d: 3, Sequential: 3, Conv2d: 4, GroupNorm: 4, ReLU: 4, Sequential: 3, Conv2d: 4, GroupNorm: 4, ReLU: 4, Sequential: 3, Conv2d: 4, GroupNorm: 4, ReLU: 4, AIFI: 1, SinePositionEncoding2D: 2, MultiheadAttention: 2, LayerNorm: 2, Sequential: 2, Linear: 3, ReLU: 3, Linear: 3, LayerNorm: 2, SinePositionEncoding2D: 1, SinePositionEncoding2D: 1, SinePositionEncoding2D: 1, Linear: 1, TransformerDecoder: 1, TransformerDecoderLayer: 3, MultiheadAttention: 4, Dropout: 4, LayerNorm: 4, MultiheadAttention: 4, Dropout: 4, LayerNorm: 4, Sequential: 4, Linear: 5, ReLU: 5, Dropout: 5, Linear: 5, Dropout: 4, LayerNorm: 4, TransformerDecoderLayer: 3, MultiheadAttention: 4, Dropout: 4, LayerNorm: 4, MultiheadAttention: 4, Dropout: 4, LayerNorm: 4, Sequential: 4, Linear: 5, ReLU: 5, Dropout: 5, Linear: 5, Dropout: 4, LayerNorm: 4, TransformerDecoderLayer: 3, MultiheadAttention: 4, Dropout: 4, LayerNorm: 4, MultiheadAttention: 4, Dropout: 4, LayerNorm: 4, Sequential: 4, Linear: 5, ReLU: 5, Dropout: 5, Linear: 5, Dropout: 4, LayerNorm: 4, TransformerDecoderLayer: 3, MultiheadAttention: 4, Dropout: 4, LayerNorm: 4, MultiheadAttention: 4, Dropout: 4, LayerNorm: 4, Sequential: 4, Linear: 5, ReLU: 5, Dropout: 5, Linear: 5, Dropout: 4, LayerNorm: 4, DetectionPredHead: 1, Linear: 2, Sequential: 2, Linear: 3, ReLU: 3, Linear: 3, ReLU: 3, Linear: 3, DetectionPredHead: 2, Linear: 3, Sequential: 3, Linear: 4, ReLU: 4, Linear: 4, ReLU: 4, Linear: 4, DetectionPredHead: 2, Linear: 3, Sequential: 3, Linear: 4, ReLU: 4, Linear: 4, ReLU: 4, Linear: 4, DetectionPredHead: 2, Linear: 3, Sequential: 3, Linear: 4, ReLU: 4, Linear: 4, ReLU: 4, Linear: 4]]
+
+================================================================================
+  ResNet-18 Backbone
+================================================================================
+===================================================================================================================
+Layer (type (var_name))                  Input Shape               Output Shape              Param #
+===================================================================================================================
+ResNetBackbone (ResNetBackbone)          [1, 3, 640, 640]          [1, 128, 80, 80]          --
+├─Sequential (stem)                      [1, 3, 640, 640]          [1, 64, 160, 160]         --
+│    └─Conv2d (0)                        [1, 3, 640, 640]          [1, 64, 320, 320]         9,408
+│    └─BatchNorm2d (1)                   [1, 64, 320, 320]         [1, 64, 320, 320]         128
+│    └─ReLU (2)                          [1, 64, 320, 320]         [1, 64, 320, 320]         --
+│    └─MaxPool2d (3)                     [1, 64, 320, 320]         [1, 64, 160, 160]         --
+├─Sequential (layer1)                    [1, 64, 160, 160]         [1, 64, 160, 160]         --
+│    └─BasicBlock (0)                    [1, 64, 160, 160]         [1, 64, 160, 160]         --
+│    │    └─Conv2d (conv1)               [1, 64, 160, 160]         [1, 64, 160, 160]         36,864
+│    │    └─BatchNorm2d (bn1)            [1, 64, 160, 160]         [1, 64, 160, 160]         128
+│    │    └─ReLU (relu)                  [1, 64, 160, 160]         [1, 64, 160, 160]         --
+│    │    └─Conv2d (conv2)               [1, 64, 160, 160]         [1, 64, 160, 160]         36,864
+│    │    └─BatchNorm2d (bn2)            [1, 64, 160, 160]         [1, 64, 160, 160]         128
+│    │    └─ReLU (relu)                  [1, 64, 160, 160]         [1, 64, 160, 160]         --
+│    └─BasicBlock (1)                    [1, 64, 160, 160]         [1, 64, 160, 160]         --
+│    │    └─Conv2d (conv1)               [1, 64, 160, 160]         [1, 64, 160, 160]         36,864
+│    │    └─BatchNorm2d (bn1)            [1, 64, 160, 160]         [1, 64, 160, 160]         128
+│    │    └─ReLU (relu)                  [1, 64, 160, 160]         [1, 64, 160, 160]         --
+│    │    └─Conv2d (conv2)               [1, 64, 160, 160]         [1, 64, 160, 160]         36,864
+│    │    └─BatchNorm2d (bn2)            [1, 64, 160, 160]         [1, 64, 160, 160]         128
+│    │    └─ReLU (relu)                  [1, 64, 160, 160]         [1, 64, 160, 160]         --
+├─Sequential (layer2)                    [1, 64, 160, 160]         [1, 128, 80, 80]          --
+│    └─BasicBlock (0)                    [1, 64, 160, 160]         [1, 128, 80, 80]          --
+│    │    └─Conv2d (conv1)               [1, 64, 160, 160]         [1, 128, 80, 80]          73,728
+│    │    └─BatchNorm2d (bn1)            [1, 128, 80, 80]          [1, 128, 80, 80]          256
+│    │    └─ReLU (relu)                  [1, 128, 80, 80]          [1, 128, 80, 80]          --
+│    │    └─Conv2d (conv2)               [1, 128, 80, 80]          [1, 128, 80, 80]          147,456
+│    │    └─BatchNorm2d (bn2)            [1, 128, 80, 80]          [1, 128, 80, 80]          256
+│    │    └─Sequential (downsample)      [1, 64, 160, 160]         [1, 128, 80, 80]          8,448
+│    │    └─ReLU (relu)                  [1, 128, 80, 80]          [1, 128, 80, 80]          --
+│    └─BasicBlock (1)                    [1, 128, 80, 80]          [1, 128, 80, 80]          --
+│    │    └─Conv2d (conv1)               [1, 128, 80, 80]          [1, 128, 80, 80]          147,456
+│    │    └─BatchNorm2d (bn1)            [1, 128, 80, 80]          [1, 128, 80, 80]          256
+│    │    └─ReLU (relu)                  [1, 128, 80, 80]          [1, 128, 80, 80]          --
+│    │    └─Conv2d (conv2)               [1, 128, 80, 80]          [1, 128, 80, 80]          147,456
+│    │    └─BatchNorm2d (bn2)            [1, 128, 80, 80]          [1, 128, 80, 80]          256
+│    │    └─ReLU (relu)                  [1, 128, 80, 80]          [1, 128, 80, 80]          --
+├─Sequential (layer3)                    [1, 128, 80, 80]          [1, 256, 40, 40]          --
+│    └─BasicBlock (0)                    [1, 128, 80, 80]          [1, 256, 40, 40]          --
+│    │    └─Conv2d (conv1)               [1, 128, 80, 80]          [1, 256, 40, 40]          294,912
+│    │    └─BatchNorm2d (bn1)            [1, 256, 40, 40]          [1, 256, 40, 40]          512
+│    │    └─ReLU (relu)                  [1, 256, 40, 40]          [1, 256, 40, 40]          --
+│    │    └─Conv2d (conv2)               [1, 256, 40, 40]          [1, 256, 40, 40]          589,824
+│    │    └─BatchNorm2d (bn2)            [1, 256, 40, 40]          [1, 256, 40, 40]          512
+│    │    └─Sequential (downsample)      [1, 128, 80, 80]          [1, 256, 40, 40]          33,280
+│    │    └─ReLU (relu)                  [1, 256, 40, 40]          [1, 256, 40, 40]          --
+│    └─BasicBlock (1)                    [1, 256, 40, 40]          [1, 256, 40, 40]          --
+│    │    └─Conv2d (conv1)               [1, 256, 40, 40]          [1, 256, 40, 40]          589,824
+│    │    └─BatchNorm2d (bn1)            [1, 256, 40, 40]          [1, 256, 40, 40]          512
+│    │    └─ReLU (relu)                  [1, 256, 40, 40]          [1, 256, 40, 40]          --
+│    │    └─Conv2d (conv2)               [1, 256, 40, 40]          [1, 256, 40, 40]          589,824
+│    │    └─BatchNorm2d (bn2)            [1, 256, 40, 40]          [1, 256, 40, 40]          512
+│    │    └─ReLU (relu)                  [1, 256, 40, 40]          [1, 256, 40, 40]          --
+├─Sequential (layer4)                    [1, 256, 40, 40]          [1, 512, 20, 20]          --
+│    └─BasicBlock (0)                    [1, 256, 40, 40]          [1, 512, 20, 20]          --
+│    │    └─Conv2d (conv1)               [1, 256, 40, 40]          [1, 512, 20, 20]          1,179,648
+│    │    └─BatchNorm2d (bn1)            [1, 512, 20, 20]          [1, 512, 20, 20]          1,024
+│    │    └─ReLU (relu)                  [1, 512, 20, 20]          [1, 512, 20, 20]          --
+│    │    └─Conv2d (conv2)               [1, 512, 20, 20]          [1, 512, 20, 20]          2,359,296
+│    │    └─BatchNorm2d (bn2)            [1, 512, 20, 20]          [1, 512, 20, 20]          1,024
+│    │    └─Sequential (downsample)      [1, 256, 40, 40]          [1, 512, 20, 20]          132,096
+│    │    └─ReLU (relu)                  [1, 512, 20, 20]          [1, 512, 20, 20]          --
+│    └─BasicBlock (1)                    [1, 512, 20, 20]          [1, 512, 20, 20]          --
+│    │    └─Conv2d (conv1)               [1, 512, 20, 20]          [1, 512, 20, 20]          2,359,296
+│    │    └─BatchNorm2d (bn1)            [1, 512, 20, 20]          [1, 512, 20, 20]          1,024
+│    │    └─ReLU (relu)                  [1, 512, 20, 20]          [1, 512, 20, 20]          --
+│    │    └─Conv2d (conv2)               [1, 512, 20, 20]          [1, 512, 20, 20]          2,359,296
+│    │    └─BatchNorm2d (bn2)            [1, 512, 20, 20]          [1, 512, 20, 20]          1,024
+│    │    └─ReLU (relu)                  [1, 512, 20, 20]          [1, 512, 20, 20]          --
+===================================================================================================================
+Total params: 11,176,512
+Trainable params: 11,176,512
+Non-trainable params: 0
+Total mult-adds (G): 14.80
+===================================================================================================================
+Input size (MB): 4.92
+Forward/backward pass size (MB): 324.40
+Params size (MB): 44.71
+Estimated Total Size (MB): 374.02
+===================================================================================================================
+
+================================================================================
+  FPN (Feature Pyramid Network)
+================================================================================
+===================================================================================================================
+Layer (type (var_name))                  Input Shape               Output Shape              Param #
+===================================================================================================================
+FPN (FPN)                                [1, 128, 80, 80]          [1, 256, 80, 80]          --
+├─ModuleList (lateral_convs)             --                        --                        --
+│    └─Conv2d (0)                        [1, 128, 80, 80]          [1, 256, 80, 80]          33,024
+│    └─Conv2d (1)                        [1, 256, 40, 40]          [1, 256, 40, 40]          65,792
+│    └─Conv2d (2)                        [1, 512, 20, 20]          [1, 256, 20, 20]          131,328
+├─ModuleList (output_convs)              --                        --                        --
+│    └─Sequential (0)                    [1, 256, 80, 80]          [1, 256, 80, 80]          --
+│    │    └─Conv2d (0)                   [1, 256, 80, 80]          [1, 256, 80, 80]          590,080
+│    │    └─GroupNorm (1)                [1, 256, 80, 80]          [1, 256, 80, 80]          512
+│    │    └─ReLU (2)                     [1, 256, 80, 80]          [1, 256, 80, 80]          --
+│    └─Sequential (1)                    [1, 256, 40, 40]          [1, 256, 40, 40]          --
+│    │    └─Conv2d (0)                   [1, 256, 40, 40]          [1, 256, 40, 40]          590,080
+│    │    └─GroupNorm (1)                [1, 256, 40, 40]          [1, 256, 40, 40]          512
+│    │    └─ReLU (2)                     [1, 256, 40, 40]          [1, 256, 40, 40]          --
+│    └─Sequential (2)                    [1, 256, 20, 20]          [1, 256, 20, 20]          --
+│    │    └─Conv2d (0)                   [1, 256, 20, 20]          [1, 256, 20, 20]          590,080
+│    │    └─GroupNorm (1)                [1, 256, 20, 20]          [1, 256, 20, 20]          512
+│    │    └─ReLU (2)                     [1, 256, 20, 20]          [1, 256, 20, 20]          --
+===================================================================================================================
+Total params: 2,001,920
+Trainable params: 2,001,920
+Non-trainable params: 0
+Total mult-adds (G): 5.33
+===================================================================================================================
+Input size (MB): 5.73
+Forward/backward pass size (MB): 51.61
+Params size (MB): 8.01
+Estimated Total Size (MB): 65.35
+===================================================================================================================
+
+================================================================================
+  AIFI (Intra-scale Attention)
+================================================================================
+===================================================================================================================
+Layer (type (var_name))                  Input Shape               Output Shape              Param #
+===================================================================================================================
+AIFI (AIFI)                              [1, 256, 20, 20]          [1, 256, 20, 20]          --
+├─SinePositionEncoding2D (pos_enc)       [1, 256, 20, 20]          [1, 256, 20, 20]          --
+├─MultiheadAttention (attn)              [1, 400, 256]             [1, 400, 256]             263,168
+├─LayerNorm (norm1)                      [1, 400, 256]             [1, 400, 256]             512
+├─Sequential (ffn)                       [1, 400, 256]             [1, 400, 256]             --
+│    └─Linear (0)                        [1, 400, 256]             [1, 400, 1024]            263,168
+│    └─ReLU (1)                          [1, 400, 1024]            [1, 400, 1024]            --
+│    └─Linear (2)                        [1, 400, 1024]            [1, 400, 256]             262,400
+├─LayerNorm (norm2)                      [1, 400, 256]             [1, 400, 256]             512
+===================================================================================================================
+Total params: 789,760
+Trainable params: 789,760
+Non-trainable params: 0
+Total mult-adds (M): 0.53
+===================================================================================================================
+Input size (MB): 0.41
+Forward/backward pass size (MB): 5.73
+Params size (MB): 2.11
+Estimated Total Size (MB): 8.25
+===================================================================================================================
+
+================================================================================
+  Transformer Decoder (4 layers)
+================================================================================
+=============================================================================================================================
+Layer (type (var_name))                            Input Shape               Output Shape              Param #
+=============================================================================================================================
+TransformerDecoder (TransformerDecoder)            [1, 100, 256]             [1, 100, 256]             --
+├─ModuleList (layers)                              --                        --                        --
+│    └─TransformerDecoderLayer (0)                 [1, 100, 256]             [1, 100, 256]             --
+│    │    └─MultiheadAttention (self_attn)         [1, 100, 256]             [1, 100, 256]             263,168
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm1)                      [1, 100, 256]             [1, 100, 256]             512
+│    │    └─MultiheadAttention (cross_attn)        [1, 100, 256]             [1, 100, 256]             263,168
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm2)                      [1, 100, 256]             [1, 100, 256]             512
+│    │    └─Sequential (ffn)                       [1, 100, 256]             [1, 100, 256]             525,568
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm3)                      [1, 100, 256]             [1, 100, 256]             512
+│    └─TransformerDecoderLayer (1)                 [1, 100, 256]             [1, 100, 256]             --
+│    │    └─MultiheadAttention (self_attn)         [1, 100, 256]             [1, 100, 256]             263,168
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm1)                      [1, 100, 256]             [1, 100, 256]             512
+│    │    └─MultiheadAttention (cross_attn)        [1, 100, 256]             [1, 100, 256]             263,168
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm2)                      [1, 100, 256]             [1, 100, 256]             512
+│    │    └─Sequential (ffn)                       [1, 100, 256]             [1, 100, 256]             525,568
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm3)                      [1, 100, 256]             [1, 100, 256]             512
+│    └─TransformerDecoderLayer (2)                 [1, 100, 256]             [1, 100, 256]             --
+│    │    └─MultiheadAttention (self_attn)         [1, 100, 256]             [1, 100, 256]             263,168
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm1)                      [1, 100, 256]             [1, 100, 256]             512
+│    │    └─MultiheadAttention (cross_attn)        [1, 100, 256]             [1, 100, 256]             263,168
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm2)                      [1, 100, 256]             [1, 100, 256]             512
+│    │    └─Sequential (ffn)                       [1, 100, 256]             [1, 100, 256]             525,568
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm3)                      [1, 100, 256]             [1, 100, 256]             512
+│    └─TransformerDecoderLayer (3)                 [1, 100, 256]             [1, 100, 256]             --
+│    │    └─MultiheadAttention (self_attn)         [1, 100, 256]             [1, 100, 256]             263,168
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm1)                      [1, 100, 256]             [1, 100, 256]             512
+│    │    └─MultiheadAttention (cross_attn)        [1, 100, 256]             [1, 100, 256]             263,168
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm2)                      [1, 100, 256]             [1, 100, 256]             512
+│    │    └─Sequential (ffn)                       [1, 100, 256]             [1, 100, 256]             525,568
+│    │    └─Dropout (dropout)                      [1, 100, 256]             [1, 100, 256]             --
+│    │    └─LayerNorm (norm3)                      [1, 100, 256]             [1, 100, 256]             512
+=============================================================================================================================
+Total params: 4,213,760
+Trainable params: 4,213,760
+Non-trainable params: 0
+Total mult-adds (M): 2.11
+=============================================================================================================================
+Input size (MB): 2.36
+Forward/backward pass size (MB): 6.55
+Params size (MB): 8.43
+Estimated Total Size (MB): 17.34
+=============================================================================================================================
+
+================================================================================
+  Hierarchical Temporal Module (HTM)
+================================================================================
+=======================================================================================================================================
+Layer (type (var_name))                                      Input Shape               Output Shape              Param #
+=======================================================================================================================================
+HierarchicalTemporalModule (HierarchicalTemporalModule)      [4, 16, 256]              [4, 16, 256]              --
+├─Sequential (input_proj)                                    [4, 16, 256]              [4, 16, 256]              --
+│    └─Linear (0)                                            [4, 16, 256]              [4, 16, 256]              65,792
+│    └─LayerNorm (1)                                         [4, 16, 256]              [4, 16, 256]              512
+├─TemporalBranch (short_branch)                              [4, 256, 3]               [4, 256, 3]               --
+│    └─DepthwiseSeparableTemporalConv (conv)                 [4, 256, 3]               [4, 256, 3]               --
+│    │    └─Conv1d (depthwise)                               [4, 256, 3]               [4, 256, 3]               768
+│    │    └─Conv1d (pointwise)                               [4, 256, 3]               [4, 256, 3]               65,536
+│    │    └─BatchNorm1d (bn)                                 [4, 256, 3]               [4, 256, 3]               512
+│    │    └─ReLU (act)                                       [4, 256, 3]               [4, 256, 3]               --
+├─TemporalBranch (mid_branch)                                [4, 256, 8]               [4, 256, 8]               --
+│    └─DepthwiseSeparableTemporalConv (conv)                 [4, 256, 8]               [4, 256, 8]               --
+│    │    └─Conv1d (depthwise)                               [4, 256, 8]               [4, 256, 8]               768
+│    │    └─Conv1d (pointwise)                               [4, 256, 8]               [4, 256, 8]               65,536
+│    │    └─BatchNorm1d (bn)                                 [4, 256, 8]               [4, 256, 8]               512
+│    │    └─ReLU (act)                                       [4, 256, 8]               [4, 256, 8]               --
+├─TemporalBranch (long_branch)                               [4, 256, 16]              [4, 256, 16]              --
+│    └─DepthwiseSeparableTemporalConv (conv)                 [4, 256, 16]              [4, 256, 16]              --
+│    │    └─Conv1d (depthwise)                               [4, 256, 16]              [4, 256, 16]              768
+│    │    └─Conv1d (pointwise)                               [4, 256, 16]              [4, 256, 16]              65,536
+│    │    └─BatchNorm1d (bn)                                 [4, 256, 16]              [4, 256, 16]              512
+│    │    └─ReLU (act)                                       [4, 256, 16]              [4, 256, 16]              --
+├─BranchFusion (fusion)                                      [4, 256, 16]              [4, 256, 16]              --
+│    └─Sequential (proj)                                     [4, 16, 768]              [4, 16, 256]              --
+│    │    └─Linear (0)                                       [4, 16, 768]              [4, 16, 256]              196,864
+│    │    └─LayerNorm (1)                                    [4, 16, 256]              [4, 16, 256]              512
+│    │    └─ReLU (2)                                         [4, 16, 256]              [4, 16, 256]              --
+├─LayerNorm (output_norm)                                    [4, 16, 256]              [4, 16, 256]              512
+=======================================================================================================================================
+Total params: 464,640
+Trainable params: 464,640
+Non-trainable params: 0
+Total mult-adds (M): 8.22
+=======================================================================================================================================
+Input size (MB): 0.07
+Forward/backward pass size (MB): 1.32
+Params size (MB): 1.86
+Estimated Total Size (MB): 3.24
+=======================================================================================================================================
+
+================================================================================
+  Memory-based ID Head
+================================================================================
+=============================================================================================================================
+Layer (type (var_name))                            Kernel Shape              Param #                   Trainable
+=============================================================================================================================
+MemoryIDHead (MemoryIDHead)                        --                        --                        True
+├─MemoryUpdateNet (memory_net)                     --                        --                        True
+│    └─Linear (input_proj)                         --                        67,328                    True
+│    └─GRUCell (gru_cell)                          --                        394,752                   True
+│    └─IDEmbeddingNet (embedding_head)             --                        --                        True
+│    │    └─Sequential (net)                       --                        99,200                    True
+├─Linear (id_classifier)                           --                        6,579                     True
+├─InteractionFeatureExtractor (interaction)        --                        --                        True
+│    └─Sequential (proj)                           --                        --                        True
+│    │    └─Linear (0)                             --                        384                       True
+│    │    └─ReLU (1)                               --                        --                        --
+│    │    └─Linear (2)                             --                        4,160                     True
+=============================================================================================================================
+Total params: 572,403
+Trainable params: 572,403
+Non-trainable params: 0
+=============================================================================================================================
+
+================================================================================
+  Action Head
+================================================================================
+===================================================================================================================
+Layer (type (var_name))                  Input Shape               Output Shape              Param #
+===================================================================================================================
+ActionHead (ActionHead)                  [8, 256]                  [8, 5]                    --
+├─Sequential (input_proj)                [8, 576]                  [8, 512]                  --
+│    └─Linear (0)                        [8, 576]                  [8, 512]                  295,424
+│    └─LayerNorm (1)                     [8, 512]                  [8, 512]                  1,024
+│    └─ReLU (2)                          [8, 512]                  [8, 512]                  --
+├─Sequential (mlp)                       [8, 512]                  [8, 256]                  --
+│    └─Linear (0)                        [8, 512]                  [8, 256]                  131,328
+│    └─LayerNorm (1)                     [8, 256]                  [8, 256]                  512
+│    └─ReLU (2)                          [8, 256]                  [8, 256]                  --
+│    └─Dropout (3)                       [8, 256]                  [8, 256]                  --
+├─Identity (temporal_aggregator)         [8, 256]                  [8, 256]                  --
+├─Linear (classifier)                    [8, 256]                  [8, 5]                    1,285
+===================================================================================================================
+Total params: 429,573
+Trainable params: 429,573
+Non-trainable params: 0
+Total mult-adds (M): 3.44
+===================================================================================================================
+Input size (MB): 0.02
+Forward/backward pass size (MB): 0.10
+Params size (MB): 1.72
+Estimated Total Size (MB): 1.83
+===================================================================================================================
+
+================================================================================
+  HTRTDETR Full Model — Parameter Count
+================================================================================
+  detector            :   18,805,848 params
+  temporal            :      464,640 params
+  id_head             :      572,403 params
+  action_head         :      429,573 params
+  total               :   20,609,552 params

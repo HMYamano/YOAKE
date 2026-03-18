@@ -7,7 +7,7 @@ ID classification accuracy を計算する。
 使い方:
   python scripts/eval_stage3.py \
       anno=data/sample/annotations_val.json \
-      checkpoint=outputs/stage3/checkpoint_best.pth \
+      checkpoint=outputs/stage3/stage3_best.pth \
       output_dir=outputs/eval_stage3
 """
 
@@ -28,6 +28,9 @@ from htrtdetr.data.annotation import load_annotation
 from htrtdetr.utils.misc import load_checkpoint
 
 
+_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+
+
 def parse_overrides(argv) -> dict:
     overrides = {}
     for arg in argv:
@@ -42,8 +45,9 @@ def main():
     overrides = parse_overrides(sys.argv[1:])
 
     anno_path = overrides.get("anno", "data/sample/annotations_val.json")
-    checkpoint_path = overrides.get("checkpoint", "outputs/stage3/checkpoint_best.pth")
-    output_dir = Path(overrides.get("output_dir", "outputs/eval_stage3"))
+    root = overrides.pop("root", _YOAKE_TRYAL)
+    checkpoint_path = overrides.get("checkpoint", f"{root}/outputs/stage3/stage3_best.pth")
+    output_dir = Path(overrides.get("output_dir", f"{root}/outputs/eval_stage3"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

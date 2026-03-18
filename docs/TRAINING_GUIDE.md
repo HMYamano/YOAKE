@@ -28,7 +28,7 @@ This guide covers environment setup, data preparation, and the four-stage traini
 ### Hardware
 
 - **GPU**: NVIDIA RTX 8000 (48 GB VRAM) or equivalent. The minimum recommended VRAM for default batch size is **16 GB**. An RTX 3090, A5000, or A6000 will work at `batch_size=4`. Reduce to `batch_size=2` on 12 GB cards.
-- **CPU**: 8+ cores recommended for data loading (`num_workers=4` default).
+- **CPU**: 8+ cores recommended for data loading (`num_workers=8` default).
 - **Storage**: Allow approximately 50 GB for a medium-sized dataset (100 videos, 300 frames each) plus checkpoints.
 
 ### Software
@@ -212,15 +212,20 @@ Evaluate Stage 1:
 ```bash
 python scripts/eval_stage1.py \
     anno=data/val/annotations.json \
-    checkpoint=outputs/stage1/checkpoint_best.pth \
-    output_dir=outputs/eval_stage1
+    checkpoint=outputs/stage1/stage1_best.pth \
+    output_dir=outputs/eval_stage1 \
+    score_thresh=0.3
 ```
+
+> **Note:** `eval_stage1.py` also generates `score_distribution.json` in the output directory. Use `score_thresh=0.05` to evaluate with a lower threshold and capture the full score distribution.
 
 ---
 
 ### Stage 2: Action Head
 
 **Goal**: Train the Hierarchical Temporal Module (HTM) and the Action Head MLP using geometric (per-track) features, with the detector frozen.
+
+> **Note:** During Stage 2 training the visual detector is bypassed entirely. Pre-computed per-track geometric features (bounding box trajectory, normalized position, velocity) are fed directly into the HTM via `forward_geo_sequence()`. This avoids wasting GPU time running the frozen detector and allows larger effective batch sizes.
 
 **Frozen modules**: ResNet-18 backbone, FPN, AIFI, DETR decoder
 **Active modules**: HTM (all three branches), Action Head MLP
@@ -243,6 +248,7 @@ Key arguments:
 | `stage1_ckpt` | `null` | Checkpoint from Stage 1 (initializes detector weights) |
 | `num_epochs` | `30` | Typically 20–40 epochs are sufficient |
 | `batch_size` | `4` | Same as Stage 1 |
+| `backbone_lr_factor` | `0.0` | Set to 0.0 in Stage 2 config to fully freeze detector LR |
 
 Because the detector is frozen, GPU memory is lower in this stage. Larger batches are feasible (`batch_size=8` on 16 GB).
 
@@ -260,6 +266,8 @@ python scripts/eval_stage2.py \
 ### Stage 3: ID Head
 
 **Goal**: Train the Hierarchical Temporal Module (HTM) and the Memory-based ID Head (GRU) using geometric features, with the detector frozen. Track IDs within each video are remapped to contiguous local IDs [0..N-1] and treated as a classification problem.
+
+> **Note:** During Stage 3 training the visual detector is bypassed entirely. Pre-computed per-track geometric features (bounding box trajectory, normalized position, velocity) are fed directly into the HTM via `forward_geo_sequence()`. This avoids wasting GPU time running the frozen detector and allows larger effective batch sizes.
 
 **Frozen modules**: ResNet-18 backbone, FPN, AIFI, DETR decoder
 **Active modules**: HTM (all three branches), GRU memory, ID embedding head
@@ -377,7 +385,7 @@ All hyperparameters are defined in `configs/default.yaml` and can be overridden 
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `optimizer.lr` | 1e-4 | Use a lower LR (1e-5) if Stage 1–3 weights diverge |
+| `optimizer.lr` | 1e-5 | Stage 4 default LR is 1e-5 (lower than earlier stages to prevent divergence of pre-trained weights) |
 | `loss.w_temporal_smooth` | 0.1 | Temporal smoothness regularization weight |
 | `train.early_stopping_patience` | 20 | Stop if val loss does not improve for this many epochs |
 
@@ -500,7 +508,7 @@ python scripts/train_stage1_detector.py \
 
 ## 9. Expected Training Times
 
-These estimates are for a dataset of approximately 80 training videos × 300 frames × 5 animals on a single NVIDIA RTX 8000 with `batch_size=4` and `num_workers=4`.
+These estimates are for a dataset of approximately 80 training videos × 300 frames × 5 animals on a single NVIDIA RTX 8000 with `batch_size=4` and `num_workers=8`.
 
 | Stage | Epochs | Approx. time per epoch | Total |
 |-------|--------|------------------------|-------|

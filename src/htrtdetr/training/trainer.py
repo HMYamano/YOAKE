@@ -58,6 +58,8 @@ class Trainer:
         num_classes: int = 1,
         num_actions: int = 5,
         max_ids: int = 50,
+        optimizer_cfg=None,
+        scheduler_cfg=None,
     ):
         self.model = model
         self.train_loader = train_loader
@@ -84,10 +86,12 @@ class Trainer:
 
         # Optimizer & Scheduler
         from ..config.config import OptimizerConfig, SchedulerConfig
-        self.optimizer = build_optimizer(model, OptimizerConfig())
-        self.scheduler = build_scheduler(
-            self.optimizer, SchedulerConfig(total_epochs=train_cfg.max_epochs)
+        opt_cfg = optimizer_cfg if optimizer_cfg is not None else OptimizerConfig()
+        sch_cfg = scheduler_cfg if scheduler_cfg is not None else SchedulerConfig(
+            total_epochs=train_cfg.max_epochs
         )
+        self.optimizer = build_optimizer(model, opt_cfg)
+        self.scheduler = build_scheduler(self.optimizer, sch_cfg)
 
         # AMP
         self.scaler = GradScaler('cuda') if train_cfg.use_amp else None
@@ -126,6 +130,47 @@ class Trainer:
         self.best_metric = ckpt.get("metrics", {}).get("val_loss", float("inf"))
         self.logger.info(f"Resumed at epoch {self.start_epoch}")
 
+    # ------------------------------------------------------------------
+    # Ultralytics-style display helpers
+    # ------------------------------------------------------------------
+
+    def _loss_col_names(self) -> List[str]:
+        """Stage に応じた loss カラム名リストを返す"""
+        names = ["box_loss"]
+        if self.cfg.stage >= 2:
+            names.append("act_loss")
+        if self.cfg.stage >= 3:
+            names.append("id_loss")
+        return names
+
+    def _gpu_mem(self) -> str:
+        if torch.cuda.is_available():
+            return f"{torch.cuda.memory_reserved() / 1E9:.3g}G"
+        return "0G"
+
+    def _print_train_header(self) -> None:
+        """エポック開始前にヘッダー行を表示する"""
+        cols = ["Epoch", "GPU_mem"] + self._loss_col_names() + ["Instances", "Size"]
+        print(("\n" + "%11s" * len(cols)) % tuple(cols))
+
+    def _print_val_results(self, val_metrics: Dict) -> None:
+        """バリデーション結果をUltralytics風に表示する"""
+        if not val_metrics:
+            return
+        if "val_AP50" in val_metrics:
+            header = "%22s%11s%11s%11s" % ("Class", "Images", "Instances", "AP50")
+            n_imgs = len(self.val_loader.dataset) if hasattr(self.val_loader, "dataset") else "-"
+            row = "%22s%11s%11s%11.4g" % ("all", n_imgs, "-", val_metrics["val_AP50"])
+        else:
+            header = "%22s%11s" % ("Class", "val_loss")
+            row = "%22s%11.4g" % ("all", val_metrics.get("val_loss", 0.0))
+        print(header)
+        print(row)
+
+    # ------------------------------------------------------------------
+    # Main training loop
+    # ------------------------------------------------------------------
+
     def train(self) -> None:
         """メインの学習ループ"""
         self.logger.info(
@@ -133,19 +178,16 @@ class Trainer:
             f"Epochs: {self.cfg.max_epochs} | Device: {self.device}"
         )
 
-        epoch_bar = tqdm(
-            range(self.start_epoch, self.cfg.max_epochs),
-            desc="Training",
-            unit="epoch",
-            dynamic_ncols=True,
-        )
-        for epoch in epoch_bar:
+        self._print_train_header()
+
+        for epoch in range(self.start_epoch, self.cfg.max_epochs):
             # --- Train epoch ---
-            train_metrics = self._train_epoch(epoch, epoch_bar)
+            train_metrics = self._train_epoch(epoch)
 
             # --- Val epoch ---
             if (epoch + 1) % self.cfg.val_interval == 0:
                 val_metrics = self._val_epoch(epoch)
+                self._print_val_results(val_metrics)
             else:
                 val_metrics = {}
 
@@ -157,13 +199,9 @@ class Trainer:
             all_metrics = {"epoch": epoch, **train_metrics, **val_metrics}
             self.metrics_logger.log(all_metrics, step=epoch)
             self.wandb.log(all_metrics, step=epoch)
-            self._log_epoch(epoch, train_metrics, val_metrics)
-
-            # --- Epoch bar postfix ---
-            postfix = {"train_loss": f"{train_metrics.get('train_loss', 0):.4f}"}
-            if val_metrics:
-                postfix["val_loss"] = f"{val_metrics.get('val_loss', 0):.4f}"
-            epoch_bar.set_postfix(postfix)
+            train_str = "  ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
+            val_str = "  ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
+            self.logger.info(f"Epoch {epoch}/{self.cfg.max_epochs}  [{train_str}]  [{val_str}]")
 
             # --- Checkpoint ---
             if self.cfg.save_last:
@@ -173,16 +211,24 @@ class Trainer:
                     epoch=epoch, metrics=all_metrics,
                 )
 
-            val_loss = val_metrics.get("val_loss", float("inf"))
-            if self.cfg.save_best and val_loss < self.best_metric:
-                self.best_metric = val_loss
+            # Stage 1: AP50 (高いほど良い) で best を決定
+            # その他: val_loss (低いほど良い) で best を決定
+            if self.cfg.stage == 1 and "val_AP50" in val_metrics:
+                metric_for_save = -val_metrics["val_AP50"]
+                metric_display = f"AP50={val_metrics['val_AP50']:.4f}"
+            else:
+                metric_for_save = val_metrics.get("val_loss", float("inf"))
+                metric_display = f"val_loss={metric_for_save:.4f}"
+
+            if self.cfg.save_best and metric_for_save < self.best_metric:
+                self.best_metric = metric_for_save
                 save_checkpoint(
                     str(Path(self.cfg.output_dir) / f"stage{self.cfg.stage}_best.pth"),
                     self.model, self.optimizer, self.scheduler,
                     epoch=epoch, metrics=all_metrics,
                 )
                 self.no_improve_count = 0
-                self.logger.info(f"[Epoch {epoch}] Best model saved (val_loss={val_loss:.4f})")
+                self.logger.info(f"[Epoch {epoch}] Best model saved ({metric_display})")
             else:
                 self.no_improve_count += 1
 
@@ -197,8 +243,8 @@ class Trainer:
         self.wandb.finish()
         self.logger.info("Training completed.")
 
-    def _train_epoch(self, epoch: int, epoch_bar: tqdm = None) -> Dict[str, float]:
-        """1 epoch の学習"""
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        """1 epoch の学習 (Ultralytics 風表示)"""
         self.model.train()
         self.criterion.train()
 
@@ -210,16 +256,29 @@ class Trainer:
         }
         epoch_start = time.time()
 
+        loss_cols = self._loss_col_names()  # e.g. ["box_loss", "act_loss"]
+        # ヘッダー行のカラム数に合わせた書式
+        # Epoch  GPU_mem  [loss_cols...]  Instances  Size
+        n_fixed = 2  # Epoch + GPU_mem
+        n_trail = 2  # Instances + Size
+        fmt_desc = "%11s" * n_fixed + "%11.4g" * len(loss_cols) + "%11s" * n_trail
+
+        # 画像サイズ (最初の batch から推定)
+        img_size = "?"
+
         batch_bar = tqdm(
             self.train_loader,
-            desc=f"Epoch {epoch + 1}/{self.cfg.max_epochs} train",
-            unit="batch",
+            total=len(self.train_loader),
             dynamic_ncols=True,
-            leave=False,
+            leave=True,
         )
 
         for step, batch in enumerate(batch_bar):
             batch = move_batch_to_device(batch, self.device)
+
+            if step == 0 and "images" in batch:
+                h, w = batch["images"].shape[-2:]
+                img_size = f"{h}x{w}"
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -238,25 +297,39 @@ class Trainer:
                 self.scaler.update()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 0.1
-                )
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.1)
                 self.optimizer.step()
 
             # メトリクス更新
             bs = batch["images"].shape[0] if "images" in batch else 1
+            n_inst = sum(
+                len(t["boxes"]) for t in (batch["targets"] if isinstance(batch["targets"][0], dict)
+                                          else [t[-1] for t in batch["targets"]])
+            ) if "targets" in batch else 0
             meters["loss"].update(total_loss.item(), bs)
             for key in ("loss_detection", "loss_action", "loss_id"):
                 if key in loss_dict:
                     meters[key].update(loss_dict[key].item(), bs)
 
-            # バッチバー postfix
-            pf = {"loss": f"{meters['loss'].avg:.4f}"}
-            if meters["loss_detection"].count > 0:
-                pf["det"] = f"{meters['loss_detection'].avg:.4f}"
-            if meters["loss_action"].count > 0:
-                pf["act"] = f"{meters['loss_action'].avg:.4f}"
-            batch_bar.set_postfix(pf)
+            # loss_cols の順に平均値を収集
+            loss_vals = []
+            col_to_meter = {
+                "box_loss": "loss_detection",
+                "act_loss": "loss_action",
+                "id_loss":  "loss_id",
+            }
+            for col in loss_cols:
+                m = meters[col_to_meter[col]]
+                loss_vals.append(m.avg if m.count > 0 else 0.0)
+
+            # Ultralytics 風の描画: desc が 1 行分のデータ
+            epoch_str = f"{epoch + 1}/{self.cfg.max_epochs}"
+            desc = fmt_desc % (
+                epoch_str, self._gpu_mem(),
+                *loss_vals,
+                str(n_inst), img_size,
+            )
+            batch_bar.set_description(desc)
 
         batch_bar.close()
 
@@ -277,6 +350,11 @@ class Trainer:
 
         total_loss = AverageMeter("val_loss")
 
+        # Stage 1 では AP50 も計算する
+        from ..evaluation.evaluator import DetectionEvaluator
+        from ..utils.misc import cxcywh_to_xyxy as _cxcywh_to_xyxy
+        evaluator = DetectionEvaluator(iou_thresholds=[0.5]) if self.cfg.stage == 1 else None
+
         val_bar = tqdm(
             self.val_loader,
             desc=f"Epoch {epoch + 1}/{self.cfg.max_epochs}   val",
@@ -289,7 +367,28 @@ class Trainer:
             batch = move_batch_to_device(batch, self.device)
 
             with autocast('cuda', enabled=(self.scaler is not None)):
-                loss_dict = self._forward_loss(batch)
+                if self.cfg.stage == 1:
+                    images = batch["images"]
+                    targets = batch["targets"]
+                    output = self.model.forward_single_frame(images)
+                    loss_dict = self.criterion(output, targets, stage=1)
+
+                    # AP50 計算
+                    probs = output.pred_logits.softmax(dim=-1)[:, :, :-1]
+                    scores, labels = probs.max(dim=-1)
+                    pred_xyxy = _cxcywh_to_xyxy(output.pred_boxes)
+                    for b in range(images.shape[0]):
+                        mask = scores[b] > 0.05
+                        evaluator.update(
+                            pred_xyxy[b][mask].cpu(),
+                            scores[b][mask].cpu(),
+                            labels[b][mask].cpu(),
+                            targets[b]["boxes"].cpu(),
+                            targets[b]["class_ids"].cpu(),
+                            box_format="xyxy",
+                        )
+                else:
+                    loss_dict = self._forward_loss(batch)
 
             loss = loss_dict.get("total_loss", 0.0)
             bs = batch["images"].shape[0] if "images" in batch else 1
@@ -297,7 +396,12 @@ class Trainer:
             val_bar.set_postfix({"val_loss": f"{total_loss.avg:.4f}"})
 
         val_bar.close()
-        return {"val_loss": total_loss.avg}
+
+        result = {"val_loss": total_loss.avg}
+        if evaluator is not None:
+            det_metrics = evaluator.compute()
+            result["val_AP50"] = det_metrics.get("AP50", 0.0)
+        return result
 
     def _forward_loss(self, batch: Dict) -> Dict[str, torch.Tensor]:
         """batch を forward して loss を計算する"""
@@ -333,4 +437,6 @@ class Trainer:
         )
         if val_metrics:
             msg += f" | val_loss={val_metrics.get('val_loss', 0):.4f}"
+            if "val_AP50" in val_metrics:
+                msg += f" | val_AP50={val_metrics['val_AP50']:.4f}"
         self.logger.info(msg)

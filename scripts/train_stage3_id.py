@@ -30,6 +30,8 @@ from htrtdetr.data.annotation import load_annotation
 from htrtdetr.training.stage_trainers import Stage3Trainer
 from htrtdetr.utils.misc import set_seed, load_model_weights
 
+_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+
 
 def parse_overrides(argv) -> dict:
     overrides = {}
@@ -55,7 +57,8 @@ def main():
     train_anno_path = overrides.pop("train_anno", "data/sample/annotations_train.json")
     val_anno_path = overrides.pop("val_anno", "data/sample/annotations_val.json")
     stage1_ckpt = overrides.pop("stage1_ckpt", None)
-    output_dir = overrides.pop("output_dir", "outputs/stage3")
+    root = overrides.pop("root", _YOAKE_TRYAL)
+    output_dir = overrides.pop("output_dir", f"{root}/outputs/stage3")
     num_epochs = int(overrides.pop("num_epochs", 30))
     batch_size = int(overrides.pop("batch_size", cfg.data.batch_size))
     resume = overrides.pop("resume", None)

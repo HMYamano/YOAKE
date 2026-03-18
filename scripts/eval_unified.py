@@ -29,6 +29,9 @@ from htrtdetr.evaluation.evaluator import DetectionEvaluator, ActionEvaluator, T
 from htrtdetr.utils.misc import load_checkpoint, cxcywh_to_xyxy
 
 
+_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+
+
 def parse_overrides(argv) -> dict:
     overrides = {}
     for arg in argv:
@@ -43,8 +46,9 @@ def main():
     overrides = parse_overrides(sys.argv[1:])
 
     anno_path = overrides.get("anno", "data/sample/annotations_val.json")
-    checkpoint_path = overrides.get("checkpoint", "outputs/stage4/checkpoint_best.pth")
-    output_dir = Path(overrides.get("output_dir", "outputs/eval_unified"))
+    root = overrides.pop("root", _YOAKE_TRYAL)
+    checkpoint_path = overrides.get("checkpoint", f"{root}/outputs/stage4/checkpoint_best.pth")
+    output_dir = Path(overrides.get("output_dir", f"{root}/outputs/eval_unified"))
     score_threshold = float(overrides.get("score_threshold", "0.3"))
     output_dir.mkdir(parents=True, exist_ok=True)
 

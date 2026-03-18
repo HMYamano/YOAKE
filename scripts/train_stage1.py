@@ -39,9 +39,7 @@ from htrtdetr.utils import set_seed, get_logger
 # デフォルトデータパス
 # ---------------------------------------------------------------------------
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
-DEFAULT_TRAIN_ANNO = f"{_YOAKE_TRYAL}/data/train/annotations.json"
-DEFAULT_VAL_ANNO   = f"{_YOAKE_TRYAL}/data/val/annotations.json"
+_DEFAULT_ROOT = "C:/Users/hayam/Desktop/YOAKE_tryal"
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +60,8 @@ def parse_argv(argv: list) -> tuple[str, Dict[str, Any]]:
     for arg in args:
         if "=" in arg:
             k, v = arg.split("=", 1)
-            # train_anno / val_anno は文字列のまま保持
-            if k in ("train_anno", "val_anno"):
+            # 文字列のまま保持するスクリプトレベルキー
+            if k in ("train_anno", "val_anno", "root"):
                 overrides[k] = v
                 continue
             # 簡易型変換
@@ -97,6 +95,7 @@ def main() -> None:
     config_path, overrides = parse_argv(sys.argv)
 
     # スクリプトレベルのキーを先に取り出す
+    root:            str           = overrides.pop("root",       _DEFAULT_ROOT)
     train_anno_path: Optional[str] = overrides.pop("train_anno", None)
     val_anno_path:   Optional[str] = overrides.pop("val_anno",   None)
 
@@ -108,21 +107,30 @@ def main() -> None:
     else:
         cfg = get_stage1_config(overrides if overrides else None)
 
+    # output_dir が overrides で明示されていなければ root から構築
+    if not overrides.get("train", {}).get("output_dir"):
+        cfg.train.output_dir = f"{root}/outputs/stage1"
+
     logger = get_logger(
         "stage1",
         log_file=str(Path(cfg.train.output_dir) / "stage1.log"),
     )
     logger.info(f"Stage 1: Detector Training | config: {config_path or 'default'}")
-    logger.info(f"Output: {cfg.train.output_dir}")
+    logger.info(f"Root   : {root}")
+    logger.info(f"Output : {cfg.train.output_dir}")
 
     set_seed(cfg.train.seed, cfg.train.deterministic)
 
     # ----- アノテーションパスの解決 -----
-    # 優先順位: コマンドライン引数 > デフォルトパス (YOAKE_tryal) > DummyDataset
-    if train_anno_path is None and Path(DEFAULT_TRAIN_ANNO).exists():
-        train_anno_path = DEFAULT_TRAIN_ANNO
-    if val_anno_path is None and Path(DEFAULT_VAL_ANNO).exists():
-        val_anno_path = DEFAULT_VAL_ANNO
+    # 優先順位: コマンドライン引数 > root 配下のデフォルトパス > DummyDataset
+    if train_anno_path is None:
+        _default = f"{root}/data/train/annotations.json"
+        if Path(_default).exists():
+            train_anno_path = _default
+    if val_anno_path is None:
+        _default = f"{root}/data/val/annotations.json"
+        if Path(_default).exists():
+            val_anno_path = _default
 
     # ----- Dataset -----
     _img_size = cfg.data.image_size
@@ -227,6 +235,8 @@ def main() -> None:
         num_classes=cfg.model.detector.head.num_classes,
         num_actions=cfg.model.action_head.num_actions,
         max_ids=cfg.model.id_head.max_ids,
+        optimizer_cfg=cfg.optimizer,
+        scheduler_cfg=cfg.scheduler,
     )
 
     trainer.train()

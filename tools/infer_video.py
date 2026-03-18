@@ -370,7 +370,7 @@ def _build_model(checkpoint_path: str, device: torch.device, stage: int = 3):
     model.to(device)
     model.set_stage(stage)
     if Path(checkpoint_path).exists():
-        load_checkpoint(model, checkpoint_path, device=device)
+        load_checkpoint(checkpoint_path, model, map_location=str(device))
         print(f"Loaded checkpoint: {checkpoint_path}")
     else:
         print("Warning: checkpoint not found, using random weights.")
@@ -409,7 +409,6 @@ def main():
 
     common_kwargs = dict(
         model=model,
-        output_dir=output_dir,
         device=device,
         score_threshold=score_threshold,
         window_size=window_size,
@@ -441,7 +440,7 @@ def main():
     else:
         # 単一ファイル / ディレクトリ
         print(f"Input: {input_path}")
-        summary = run_inference(video_path=input_path, **common_kwargs)
+        summary = run_inference(video_path=input_path, output_dir=output_dir, **common_kwargs)
         print(f"\nDone.")
         print(f"  Frames: {summary['total_frames']}")
         print(f"  Total detections: {summary['total_detections']}")

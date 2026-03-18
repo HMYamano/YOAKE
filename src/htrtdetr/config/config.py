@@ -15,6 +15,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# データ格納先ルート (出力もここに集約する)
+_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+
 # yaml は optional 依存 (pyyaml)
 try:
     import yaml
@@ -140,6 +143,9 @@ class MemoryIDConfig:
     metric_loss_margin: float = 0.3
     # memory の寿命 (フレーム数, これを超えると削除)
     memory_ttl: int = 30
+    # 種分離IDプール (複数種混在シーン向け)
+    use_species_separated_pools: bool = False
+    num_species: int = 1             # 種数 (num_classes と合わせる)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +293,7 @@ class SchedulerConfig:
 class TrainConfig:
     """学習全体の設定"""
     stage: int = 1                   # 1 | 2 | 3 | 4
-    output_dir: str = "outputs/stage1"
+    output_dir: str = f"{_YOAKE_TRYAL}/outputs/stage1"
     resume: Optional[str] = None     # checkpoint path
     # Epochs
     max_epochs: int = 100
@@ -316,7 +322,7 @@ class TrainConfig:
 class EvalConfig:
     """評価の設定"""
     checkpoint: str = "weights/full_model_best.pth"
-    output_dir: str = "outputs/eval"
+    output_dir: str = f"{_YOAKE_TRYAL}/outputs/eval"
     split: str = "val"               # "val" | "test"
     # Detection
     iou_thresholds: List[float] = field(
@@ -341,7 +347,7 @@ class InferenceConfig:
     """推論の設定"""
     checkpoint: str = "weights/full_model_best.pth"
     input_path: str = ""             # 動画 or 画像ディレクトリ
-    output_path: str = "outputs/inference"
+    output_path: str = f"{_YOAKE_TRYAL}/outputs/inference"
     # Video
     fps: Optional[float] = None      # None → 元動画の fps を使用
     # Visualization overlay
@@ -451,8 +457,9 @@ def get_stage1_config(overrides: Optional[Dict] = None) -> HTRTDETRConfig:
     """Stage 1: Detector pretraining / finetuning"""
     cfg = HTRTDETRConfig()
     cfg.train.stage = 1
-    cfg.train.output_dir = "outputs/stage1"
-    cfg.train.max_epochs = 100
+    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/stage1"
+    cfg.train.max_epochs = 500
+    cfg.train.early_stopping_patience = 200
     cfg.optimizer.lr = 1e-4
     if overrides:
         cfg = cfg.merge(overrides)
@@ -463,7 +470,7 @@ def get_stage2_config(overrides: Optional[Dict] = None) -> HTRTDETRConfig:
     """Stage 2: Action head pretraining"""
     cfg = HTRTDETRConfig()
     cfg.train.stage = 2
-    cfg.train.output_dir = "outputs/stage2"
+    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/stage2"
     cfg.train.max_epochs = 80
     cfg.optimizer.lr = 5e-5
     # Stage 2 では detector の重みを freeze する
@@ -477,7 +484,7 @@ def get_stage3_config(overrides: Optional[Dict] = None) -> HTRTDETRConfig:
     """Stage 3: ID head pretraining"""
     cfg = HTRTDETRConfig()
     cfg.train.stage = 3
-    cfg.train.output_dir = "outputs/stage3"
+    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/stage3"
     cfg.train.max_epochs = 80
     cfg.optimizer.lr = 5e-5
     cfg.model.id_head.use_metric_loss = True
@@ -516,6 +523,12 @@ def validate_config(cfg: "HTRTDETRConfig") -> None:
 
     if m.detector.head.num_decoder_layers < 1:
         errors.append(f"model.detector.head.num_decoder_layers must be >= 1, got {m.detector.head.num_decoder_layers}")
+
+    if m.detector.head.hidden_dim != m.detector.fpn.out_channels:
+        errors.append(
+            f"model.detector.head.hidden_dim ({m.detector.head.hidden_dim}) "
+            f"must match model.detector.fpn.out_channels ({m.detector.fpn.out_channels})"
+        )
 
     if m.temporal.feature_dim != m.detector.fpn.out_channels:
         errors.append(
@@ -582,14 +595,247 @@ def validate_config(cfg: "HTRTDETRConfig") -> None:
         raise ConfigValidationError(msg)
 
 
+def clamp_temporal_branches(cfg: "HTRTDETRConfig") -> None:
+    """data.window_size に合わせて temporal branch の num_frames を上限クリップする。
+
+    window_size を CLI や YAML で小さく設定した場合、
+    large variant のデフォルト (long_branch.num_frames=16) が
+    validate_config() の制約に引っかかるのを自動修正する。
+
+    各学習スクリプトで config 確定後・validate_config() 呼び出し前に実行すること。
+
+    例::
+        cfg = get_variant_config("large", stage=2)
+        cfg = cfg.merge(overrides)
+        clamp_temporal_branches(cfg)   # ← ここで clamp
+        validate_config(cfg)           # エラーなし
+    """
+    ws = cfg.data.window_size
+    t = cfg.model.temporal
+    for branch in (t.short_branch, t.mid_branch, t.long_branch):
+        if branch.num_frames > ws:
+            branch.num_frames = ws
+
+
 def get_stage4_config(overrides: Optional[Dict] = None) -> HTRTDETRConfig:
     """Stage 4: Unified fine-tuning"""
     cfg = HTRTDETRConfig()
     cfg.train.stage = 4
-    cfg.train.output_dir = "outputs/stage4"
+    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/stage4"
     cfg.train.max_epochs = 50
     cfg.optimizer.lr = 1e-5           # 小さい lr で fine-tune
     cfg.model.id_head.use_action_summary = True
+    if overrides:
+        cfg = cfg.merge(overrides)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Model size variants: small / medium / large
+# ---------------------------------------------------------------------------
+
+# サポートするバリアント名
+ModelVariant = str  # Literal["small", "medium", "large"]
+
+# バリアントごとのパラメーター定義
+_VARIANT_SPECS: Dict[str, Dict[str, Any]] = {
+    "small": {
+        # Backbone: ResNet-18 (~11M)
+        "backbone_name": "resnet18",
+        "backbone_out_channels": [128, 256, 512],
+        # FPN / Decoder
+        "fpn_out_channels": 128,
+        "hidden_dim": 128,
+        "num_decoder_layers": 2,
+        "num_heads": 4,
+        "ffn_dim": 512,
+        # Temporal
+        "temporal_output_dim": 128,
+        "channel_attention": [False, False, False],  # [short, mid, long]
+        # ID Head
+        "embedding_dim": 64,
+        "memory_dim": 128,
+        # Action Head
+        "interaction_dim": 32,
+        "hidden_dims": [256, 128],
+        # Interaction module
+        "interaction_output_dim": 32,
+        # Approximate total: ~15-20M
+    },
+    "medium": {
+        # Backbone: ResNet-34 (~21M)
+        "backbone_name": "resnet34",
+        "backbone_out_channels": [128, 256, 512],
+        # FPN / Decoder
+        "fpn_out_channels": 256,
+        "hidden_dim": 256,
+        "num_decoder_layers": 4,
+        "num_heads": 8,
+        "ffn_dim": 1024,
+        # Temporal
+        "temporal_output_dim": 256,
+        "channel_attention": [False, False, False],
+        # ID Head
+        "embedding_dim": 128,
+        "memory_dim": 256,
+        # Action Head
+        "interaction_dim": 64,
+        "hidden_dims": [512, 256],
+        # Interaction module
+        "interaction_output_dim": 64,
+        # Approximate total: ~30-40M
+    },
+    "large": {
+        # Backbone: ResNet-50 (~25M)
+        "backbone_name": "resnet50",
+        "backbone_out_channels": [512, 1024, 2048],
+        # FPN / Decoder
+        "fpn_out_channels": 512,
+        "hidden_dim": 512,
+        "num_decoder_layers": 6,
+        "num_heads": 16,
+        "ffn_dim": 2048,
+        # Temporal
+        "temporal_output_dim": 512,
+        "channel_attention": [True, True, True],
+        # ID Head
+        "embedding_dim": 256,
+        "memory_dim": 512,
+        # Action Head
+        "interaction_dim": 128,
+        "hidden_dims": [1024, 512, 256],
+        # Interaction module
+        "interaction_output_dim": 128,
+        # Approximate total: ~55-70M
+    },
+}
+
+
+def build_model_config(variant: ModelVariant) -> ModelConfig:
+    """指定バリアント (small / medium / large) に対応する ModelConfig を返す。
+
+    すべての次元依存関係 (fpn.out_channels == temporal.feature_dim など) を
+    自動的に整合させる。
+
+    Args:
+        variant: "small" | "medium" | "large"
+
+    Returns:
+        ModelConfig: バリアントに対応した設定
+
+    Raises:
+        ValueError: 不明なバリアント名が渡された場合
+    """
+    if variant not in _VARIANT_SPECS:
+        raise ValueError(
+            f"Unknown model variant: {variant!r}. "
+            f"Choose from {list(_VARIANT_SPECS.keys())}"
+        )
+
+    s = _VARIANT_SPECS[variant]
+    d = s["fpn_out_channels"]  # 全モジュール共通の feature 次元
+
+    backbone = BackboneConfig(
+        name=s["backbone_name"],
+        pretrained=True,
+        out_channels=s["backbone_out_channels"],
+    )
+    fpn = FPNConfig(
+        in_channels=s["backbone_out_channels"],
+        out_channels=d,
+    )
+    head = DetectorHeadConfig(
+        hidden_dim=s["hidden_dim"],
+        num_decoder_layers=s["num_decoder_layers"],
+        num_heads=s["num_heads"],
+        ffn_dim=s["ffn_dim"],
+    )
+    detector = DetectorConfig(backbone=backbone, fpn=fpn, head=head)
+
+    ca = s["channel_attention"]
+    temporal = HierarchicalTemporalConfig(
+        feature_dim=d,
+        short_branch=TemporalBranchConfig(
+            kernel_size=3, dilation=1, num_frames=3,
+            use_depthwise=True, use_residual=True,
+            use_channel_attention=ca[0],
+        ),
+        mid_branch=TemporalBranchConfig(
+            kernel_size=3, dilation=2, num_frames=8,
+            use_depthwise=True, use_residual=True,
+            use_channel_attention=ca[1],
+        ),
+        long_branch=TemporalBranchConfig(
+            kernel_size=3, dilation=4, num_frames=16,
+            use_depthwise=True, use_residual=True,
+            use_channel_attention=ca[2],
+        ),
+        output_dim=s["temporal_output_dim"],
+    )
+
+    id_head = MemoryIDConfig(
+        feature_dim=d,
+        embedding_dim=s["embedding_dim"],
+        memory_dim=s["memory_dim"],
+    )
+
+    action_head = ActionHeadConfig(
+        feature_dim=d,
+        temporal_dim=s["temporal_output_dim"],
+        interaction_dim=s["interaction_dim"],
+        hidden_dims=s["hidden_dims"],
+    )
+
+    interaction = InteractionConfig(
+        feature_dim=d,
+        output_dim=s["interaction_output_dim"],
+    )
+
+    return ModelConfig(
+        detector=detector,
+        temporal=temporal,
+        id_head=id_head,
+        action_head=action_head,
+        interaction=interaction,
+    )
+
+
+def get_variant_config(
+    variant: ModelVariant,
+    stage: int = 1,
+    overrides: Optional[Dict] = None,
+) -> HTRTDETRConfig:
+    """バリアントとステージを組み合わせた HTRTDETRConfig を返す。
+
+    既存の get_stage{N}_config() と build_model_config() を合成し、
+    一度の呼び出しで完全な設定を取得できるようにする。
+
+    Args:
+        variant: "small" | "medium" | "large"
+        stage: 1 | 2 | 3 | 4
+        overrides: 追加で上書きしたい設定 (dict)
+
+    Returns:
+        HTRTDETRConfig
+
+    Example::
+
+        cfg = get_variant_config("small", stage=1)
+        cfg = get_variant_config("large", stage=4, overrides={"data.batch_size": 2})
+    """
+    _stage_builders = {
+        1: get_stage1_config,
+        2: get_stage2_config,
+        3: get_stage3_config,
+        4: get_stage4_config,
+    }
+    if stage not in _stage_builders:
+        raise ValueError(f"stage must be 1-4, got {stage}")
+
+    cfg = _stage_builders[stage]()
+    cfg.model = build_model_config(variant)
+    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/{variant}/stage{stage}"
+
     if overrides:
         cfg = cfg.merge(overrides)
     return cfg

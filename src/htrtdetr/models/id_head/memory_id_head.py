@@ -94,9 +94,15 @@ class IdentityMemory:
         self.tracks: Dict[int, Dict] = {}
         self._next_id = 0
 
-    def get_active_ids(self) -> List[int]:
-        """TTL > 0 の active な ID リストを返す"""
-        return [tid for tid, s in self.tracks.items() if s["ttl"] > 0]
+    def get_active_ids(self, species_class: Optional[int] = None) -> List[int]:
+        """TTL > 0 の active な ID リストを返す。
+        species_class を指定した場合はその種のみを返す。"""
+        if species_class is None:
+            return [tid for tid, s in self.tracks.items() if s["ttl"] > 0]
+        return [
+            tid for tid, s in self.tracks.items()
+            if s["ttl"] > 0 and s.get("species_class", 0) == species_class
+        ]
 
     def get_embeddings(self, ids: List[int]) -> Optional[torch.Tensor]:
         """指定 ID の embedding を (N, D) で返す"""
@@ -150,8 +156,10 @@ class IdentityMemory:
         embedding: torch.Tensor,
         bbox: torch.Tensor,
         gru_hidden: torch.Tensor,
+        species_class: int = 0,
     ) -> int:
-        """新規 track を追加し、track_id を返す"""
+        """新規 track を追加し、track_id を返す。
+        species_class: 種クラスID（単一種の場合は 0 のまま）"""
         tid = self._next_id
         self._next_id += 1
         self.tracks[tid] = {
@@ -162,6 +170,7 @@ class IdentityMemory:
             "ttl": self.memory_ttl,
             "frame_count": 1,
             "action_summary": None,
+            "species_class": species_class,
         }
         return tid
 
@@ -411,13 +420,19 @@ class MemoryIDHead(nn.Module):
     @torch.no_grad()
     def forward_inference(
         self,
-        features: torch.Tensor,  # (N, feature_dim)
-        bboxes: torch.Tensor,    # (N, 4) [cx, cy, w, h]
+        features: torch.Tensor,                      # (N, feature_dim)
+        bboxes: torch.Tensor,                        # (N, 4) [cx, cy, w, h]
         memory: IdentityMemory,
+        species_classes: Optional[torch.Tensor] = None,  # (N,) int, 種クラスID
     ) -> Dict[str, torch.Tensor]:
         """
         推論時の forward。
         memory と照合して track_id を割り当て、memory を更新する。
+
+        species_classes が指定され use_species_separated_pools=True の場合、
+        同種の memory のみとマッチングを行う（異種間の ID 混同を防ぐ）。
+        species_classes=None または use_species_separated_pools=False の場合は
+        従来の一括マッチングと同一の挙動になる。
 
         Returns:
             track_ids: (N,) 割り当てた track ID
@@ -434,12 +449,8 @@ class MemoryIDHead(nn.Module):
                 "embeddings": torch.zeros(0, self.cfg.embedding_dim, device=device),
             }
 
-        active_ids = memory.get_active_ids()
-
-        # velocity を memory から取得
+        # velocity はゼロ初期化（memory から取得する拡張は forward_train と共通化可能）
         velocities = torch.zeros(N, 2, device=device)
-
-        # 入力構築 (velocity は初回はゼロ)
         x = self._build_input(features, bboxes, velocities)
         hidden_states = torch.zeros(N, self.cfg.memory_dim, device=device)
 
@@ -449,37 +460,62 @@ class MemoryIDHead(nn.Module):
         track_ids = torch.full((N,), -1, dtype=torch.long, device=device)
         id_scores = torch.zeros(N, device=device)
 
-        if active_ids:
-            # memory の embedding と比較
-            mem_embs = memory.get_embeddings(active_ids)  # (M, D)
-            mem_boxes = memory.get_bboxes(active_ids)     # (M, 4) [cx, cy, w, h]
+        use_separation = (
+            self.cfg.use_species_separated_pools
+            and species_classes is not None
+        )
 
-            # Cosine similarity: (N, M)
-            sim = torch.mm(embeddings, mem_embs.t())
+        if use_separation:
+            # --- 種ごとに独立してマッチング ---
+            for sp in species_classes.unique().tolist():
+                sp = int(sp)
+                det_indices = (species_classes == sp).nonzero(as_tuple=True)[0]
+                sp_active_ids = memory.get_active_ids(species_class=sp)
+                if not sp_active_ids:
+                    continue  # この種の memory がなければスキップ（全て新規IDに）
 
-            # IoU similarity: (N, M)
-            # cxcywh → xyxy に変換
-            det_xyxy = cxcywh_to_xyxy(bboxes)
-            mem_xyxy = cxcywh_to_xyxy(mem_boxes)
-            iou_mat = box_iou(det_xyxy, mem_xyxy)  # (N, M)
+                sp_embs = embeddings[det_indices]          # (n_sp, D)
+                sp_bboxes = bboxes[det_indices]            # (n_sp, 4)
+                mem_embs = memory.get_embeddings(sp_active_ids)  # (M_sp, D)
+                mem_boxes = memory.get_bboxes(sp_active_ids)     # (M_sp, 4)
 
-            # Combined cost matrix (similarity を最大化 = コストを最小化)
-            cost_mat = -(0.5 * sim + 0.5 * iou_mat)  # (N, M)
+                sim = torch.mm(sp_embs, mem_embs.t())            # (n_sp, M_sp)
+                det_xyxy = cxcywh_to_xyxy(sp_bboxes)
+                mem_xyxy = cxcywh_to_xyxy(mem_boxes)
+                iou_mat = box_iou(det_xyxy, mem_xyxy)            # (n_sp, M_sp)
+                cost_mat = -(0.5 * sim + 0.5 * iou_mat)
 
-            # Hungarian matching
-            assigned = self._hungarian_match(cost_mat, threshold=-self.cfg.new_id_threshold)
-
-            for det_i, mem_j in assigned:
-                if mem_j >= 0:
-                    track_ids[det_i] = active_ids[mem_j]
-                    id_scores[det_i] = sim[det_i, mem_j]
+                assigned = self._hungarian_match(cost_mat, threshold=-self.cfg.new_id_threshold)
+                for local_i, mem_j in assigned:
+                    global_i = det_indices[local_i].item()
+                    if mem_j >= 0:
+                        track_ids[global_i] = sp_active_ids[mem_j]
+                        id_scores[global_i] = sim[local_i, mem_j]
+        else:
+            # --- 従来の一括マッチング (backward compatible) ---
+            active_ids = memory.get_active_ids()
+            if active_ids:
+                mem_embs = memory.get_embeddings(active_ids)  # (M, D)
+                mem_boxes = memory.get_bboxes(active_ids)     # (M, 4)
+                sim = torch.mm(embeddings, mem_embs.t())      # (N, M)
+                det_xyxy = cxcywh_to_xyxy(bboxes)
+                mem_xyxy = cxcywh_to_xyxy(mem_boxes)
+                iou_mat = box_iou(det_xyxy, mem_xyxy)         # (N, M)
+                cost_mat = -(0.5 * sim + 0.5 * iou_mat)
+                assigned = self._hungarian_match(cost_mat, threshold=-self.cfg.new_id_threshold)
+                for det_i, mem_j in assigned:
+                    if mem_j >= 0:
+                        track_ids[det_i] = active_ids[mem_j]
+                        id_scores[det_i] = sim[det_i, mem_j]
 
         # 未割り当ての detection に新規 ID を割り当て
         matched_ids = []
         for i in range(N):
+            sp_class = int(species_classes[i].item()) if species_classes is not None else 0
             if track_ids[i].item() == -1:
                 new_id = memory.add_new_track(
-                    embeddings[i], bboxes[i], new_hidden[i]
+                    embeddings[i], bboxes[i], new_hidden[i],
+                    species_class=sp_class,
                 )
                 track_ids[i] = new_id
                 id_scores[i] = 1.0
@@ -487,9 +523,7 @@ class MemoryIDHead(nn.Module):
             else:
                 tid = track_ids[i].item()
                 matched_ids.append(tid)
-                memory.update_track(
-                    tid, embeddings[i], bboxes[i], new_hidden[i]
-                )
+                memory.update_track(tid, embeddings[i], bboxes[i], new_hidden[i])
 
         # TTL 更新
         memory.decrement_ttl(matched_ids)
