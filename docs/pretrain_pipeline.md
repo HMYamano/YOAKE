@@ -125,61 +125,63 @@
 
 #### 2-1. ディレクトリ構成の作成
 
-```bash
+```powershell
 # 作業ディレクトリ
-WORK="C:/Users/hayam/Desktop/YOAKE_tryal"
+$WORK = "C:/Users/utopi/YOAKE_pre-train"
 
 # Stage ごとのデータディレクトリ
-mkdir -p "$WORK/data/stage1/train"
-mkdir -p "$WORK/data/stage1/val"
-mkdir -p "$WORK/data/stage2/train"
-mkdir -p "$WORK/data/stage2/val"
-mkdir -p "$WORK/data/stage3/train"
-mkdir -p "$WORK/data/stage3/val"
-mkdir -p "$WORK/data/stage4/train"
-mkdir -p "$WORK/data/stage4/val"
+New-Item -ItemType Directory -Force -Path "$WORK/data/stage1/train" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/data/stage1/val" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/data/stage2/train" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/data/stage2/val" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/data/stage3/train" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/data/stage3/val" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/data/stage4/train" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/data/stage4/val" | Out-Null
 
 # 出力ディレクトリ
-mkdir -p "$WORK/outputs/large/stage1"
-mkdir -p "$WORK/outputs/large/stage2"
-mkdir -p "$WORK/outputs/large/stage3"
-mkdir -p "$WORK/outputs/large/stage4"
+New-Item -ItemType Directory -Force -Path "$WORK/outputs/large/stage1" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/outputs/large/stage2" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/outputs/large/stage3" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/outputs/large/stage4" | Out-Null
 
 # Config 保存先
-mkdir -p "$WORK/configs"
+New-Item -ItemType Directory -Force -Path "$WORK/configs" | Out-Null
 
 # 変換スクリプト用
-mkdir -p "$WORK/convert"
+New-Item -ItemType Directory -Force -Path "$WORK/convert" | Out-Null
 
 # 元データ保存先
-mkdir -p "$WORK/raw/coco"
-mkdir -p "$WORK/raw/ap10k"
-mkdir -p "$WORK/raw/animal_kingdom"
-mkdir -p "$WORK/raw/calms21"
-mkdir -p "$WORK/raw/dancetrack"
-mkdir -p "$WORK/raw/bee23"
-mkdir -p "$WORK/raw/animaltrack"
+New-Item -ItemType Directory -Force -Path "$WORK/raw/coco" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/raw/ap10k" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/raw/animal_kingdom" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/raw/calms21" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/raw/dancetrack" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/raw/bee23" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WORK/raw/animaltrack" | Out-Null
 ```
 
 #### 2-2. データセットのダウンロード
 
-```bash
+```powershell
 # ---- COCO 2017 ----
 cd "$WORK/raw/coco"
-wget http://images.cocodataset.org/zips/train2017.zip
-wget http://images.cocodataset.org/zips/val2017.zip
-wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
-unzip -q train2017.zip && unzip -q val2017.zip && unzip -q annotations_trainval2017.zip
+Invoke-WebRequest -Uri "http://images.cocodataset.org/zips/train2017.zip" -OutFile "train2017.zip"
+Invoke-WebRequest -Uri "http://images.cocodataset.org/zips/val2017.zip" -OutFile "val2017.zip"
+Invoke-WebRequest -Uri "http://images.cocodataset.org/annotations/annotations_trainval2017.zip" -OutFile "annotations_trainval2017.zip"
+Expand-Archive -Path "train2017.zip" -DestinationPath "." -Force
+Expand-Archive -Path "val2017.zip" -DestinationPath "." -Force
+Expand-Archive -Path "annotations_trainval2017.zip" -DestinationPath "." -Force
 
 # ---- AP-10K ----
 # GitHub: GuanghuiHan/AnimalPose
-# git clone https://github.com/GuanghuiHan/AnimalPose "$WORK/raw/ap10k"
+git clone https://github.com/GuanghuiHan/AnimalPose "$WORK/raw/ap10k"
 # またはリポジトリの指示に従ってダウンロード
 
 # ---- Animal Kingdom ----
 # 公式: https://sutdcv.github.io/Animal-Kingdom
-# gdown <FILE_ID> -O "$WORK/raw/animal_kingdom/animal_kingdom.zip"
-# unzip -q "$WORK/raw/animal_kingdom/animal_kingdom.zip" -d "$WORK/raw/animal_kingdom"
+gdown <FILE_ID> -O "$WORK/raw/animal_kingdom/animal_kingdom.zip"
+Expand-Archive -Path "$WORK/raw/animal_kingdom/animal_kingdom.zip" -DestinationPath "$WORK/raw/animal_kingdom" -Force
 
 # ---- CalMS21 ----
 # Harvard Dataverse から入手: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/FH92BI
@@ -187,18 +189,18 @@ unzip -q train2017.zip && unzip -q val2017.zip && unzip -q annotations_trainval2
 
 # ---- DanceTrack ----
 # GitHub: DanceTrack/DanceTrack
-# wget <official_link> -O "$WORK/raw/dancetrack/dancetrack.zip"
-# unzip -q "$WORK/raw/dancetrack/dancetrack.zip" -d "$WORK/raw/dancetrack"
+Invoke-WebRequest -Uri "<official_link>" -OutFile "$WORK/raw/dancetrack/dancetrack.zip"
+Expand-Archive -Path "$WORK/raw/dancetrack/dancetrack.zip" -DestinationPath "$WORK/raw/dancetrack" -Force
 
 # ---- BEE23 ----
 # 公式リポジトリからダウンロード
-# wget <official_link> -O "$WORK/raw/bee23/bee23.zip"
-# unzip -q "$WORK/raw/bee23/bee23.zip" -d "$WORK/raw/bee23"
+Invoke-WebRequest -Uri "<official_link>" -OutFile "$WORK/raw/bee23/bee23.zip"
+Expand-Archive -Path "$WORK/raw/bee23/bee23.zip" -DestinationPath "$WORK/raw/bee23" -Force
 
 # ---- AnimalTrack ----
 # 論文著者配布 (arXiv: 2202.12561)
-# gdown <FILE_ID> -O "$WORK/raw/animaltrack/animaltrack.zip"
-# unzip -q "$WORK/raw/animaltrack/animaltrack.zip" -d "$WORK/raw/animaltrack"
+gdown <FILE_ID> -O "$WORK/raw/animaltrack/animaltrack.zip"
+Expand-Archive -Path "$WORK/raw/animaltrack/animaltrack.zip" -DestinationPath "$WORK/raw/animaltrack" -Force
 ```
 
 #### 2-3. Python 依存パッケージ
@@ -223,11 +225,11 @@ pip install pycocotools h5py scipy tqdm pyyaml
 
 ```python
 # convert_coco_to_yoake.py
-# 実行例:
-#   python convert/convert_coco_to_yoake.py \
-#       --coco_ann C:/Users/hayam/Desktop/YOAKE_tryal/raw/coco/annotations/instances_train2017.json \
-#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/coco/train2017 \
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json \
+# 実行例 (Anaconda PowerShell):
+#   python convert/convert_coco_to_yoake.py `
+#       --coco_ann C:/Users/hayam/Desktop/YOAKE_tryal/raw/coco/annotations/instances_train2017.json `
+#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/coco/train2017 `
+#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json `
 #       --split train
 
 import argparse
@@ -322,10 +324,10 @@ if __name__ == "__main__":
 ```python
 # convert_ap10k_to_yoake.py
 # AP-10K は COCO keypoint 形式 (bbox あり)
-# 実行例:
-#   python convert/convert_ap10k_to_yoake.py \
-#       --ann C:/Users/hayam/Desktop/YOAKE_tryal/raw/ap10k/annotations/ap10k-train-split1.json \
-#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/ap10k/data \
+# 実行例 (Anaconda PowerShell):
+#   python convert/convert_ap10k_to_yoake.py `
+#       --ann C:/Users/hayam/Desktop/YOAKE_tryal/raw/ap10k/annotations/ap10k-train-split1.json `
+#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/ap10k/data `
 #       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/ap10k_annotations.json
 
 import argparse
@@ -413,11 +415,11 @@ Stage 1 では COCO と AP-10K を1つの annotations.json にまとめる。
 
 ```python
 # merge_stage1_annotations.py
-# 実行例:
-#   python convert/merge_stage1_annotations.py \
-#       --inputs \
-#           C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json \
-#           C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/ap10k_annotations.json \
+# 実行例 (Anaconda PowerShell):
+#   python convert/merge_stage1_annotations.py `
+#       --inputs `
+#           C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json `
+#           C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/ap10k_annotations.json `
 #       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations_merged.json
 
 import argparse
@@ -472,13 +474,13 @@ if __name__ == "__main__":
 # convert_animal_kingdom_to_yoake.py
 # Animal Kingdom の action segment CSV/JSON をシーケンス形式に変換する
 # 公式フォーマット: action_recognition/annotation/ 以下に CSV
-# 実行例:
-#   python convert/convert_animal_kingdom_to_yoake.py \
-#       --ann_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/annotation/AR \
-#       --video_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/dataset/AR \
-#       --frame_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/frames \
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage2/train/annotations.json \
-#       --window_size 16 \
+# 実行例 (Anaconda PowerShell):
+#   python convert/convert_animal_kingdom_to_yoake.py `
+#       --ann_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/annotation/AR `
+#       --video_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/dataset/AR `
+#       --frame_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/frames `
+#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage2/train/annotations.json `
+#       --window_size 16 `
 #       --split train
 
 import argparse
@@ -604,11 +606,11 @@ if __name__ == "__main__":
 # convert_mot_to_yoake.py
 # MOT17 / DanceTrack / AnimalTrack はすべて同一のテキスト形式:
 # <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>
-# 実行例:
-#   python convert/convert_mot_to_yoake.py \
-#       --dataset_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/dancetrack/train \
-#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/dancetrack \
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage3/train/annotations.json \
+# 実行例 (Anaconda PowerShell):
+#   python convert/convert_mot_to_yoake.py `
+#       --dataset_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/dancetrack/train `
+#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/dancetrack `
+#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage3/train/annotations.json `
 #       --dataset_name dancetrack
 
 import argparse
@@ -754,10 +756,10 @@ if __name__ == "__main__":
 # convert_calms21_to_yoake_stage4.py
 # CalMS21 は HDF5 形式。行動ラベルと bbox (keypoints) を持つ。
 # 連続フレームの bbox から track_id を Hungarian matching で自動生成する。
-# 実行例:
-#   python convert/convert_calms21_to_yoake_stage4.py \
-#       --calms21_npy C:/Users/hayam/Desktop/YOAKE_tryal/raw/calms21/calms21_task1_train.npy \
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage4/train/annotations.json \
+# 実行例 (Anaconda PowerShell):
+#   python convert/convert_calms21_to_yoake_stage4.py `
+#       --calms21_npy C:/Users/hayam/Desktop/YOAKE_tryal/raw/calms21/calms21_task1_train.npy `
+#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage4/train/annotations.json `
 #       --window_size 16
 
 import argparse
@@ -940,83 +942,82 @@ if __name__ == "__main__":
 
 #### 3-7. 変換実行スクリプト（全 Stage 一括）
 
-```bash
-#!/bin/bash
-# run_all_conversions.sh
+```powershell
+# run_all_conversions.ps1
 # C:/Users/hayam/YOAKE から実行する
 
-REPO="C:/Users/hayam/YOAKE"
-WORK="C:/Users/hayam/Desktop/YOAKE_tryal"
-PY="python"
+$REPO = "C:/Users/hayam/YOAKE"
+$WORK = "C:/Users/hayam/Desktop/YOAKE_tryal"
+$PY = "python"
 
 # --- Stage 1: COCO train ---
-$PY "$REPO/convert/convert_coco_to_yoake.py" \
-    --coco_ann "$WORK/raw/coco/annotations/instances_train2017.json" \
-    --image_root "$WORK/raw/coco/train2017" \
+& $PY "$REPO/convert/convert_coco_to_yoake.py" `
+    --coco_ann "$WORK/raw/coco/annotations/instances_train2017.json" `
+    --image_root "$WORK/raw/coco/train2017" `
     --output "$WORK/data/stage1/train/coco_annotations.json"
 
 # --- Stage 1: COCO val ---
-$PY "$REPO/convert/convert_coco_to_yoake.py" \
-    --coco_ann "$WORK/raw/coco/annotations/instances_val2017.json" \
-    --image_root "$WORK/raw/coco/val2017" \
+& $PY "$REPO/convert/convert_coco_to_yoake.py" `
+    --coco_ann "$WORK/raw/coco/annotations/instances_val2017.json" `
+    --image_root "$WORK/raw/coco/val2017" `
     --output "$WORK/data/stage1/val/annotations.json"
 
 # --- Stage 1: AP-10K ---
-$PY "$REPO/convert/convert_ap10k_to_yoake.py" \
-    --ann "$WORK/raw/ap10k/annotations/ap10k-train-split1.json" \
-    --image_root "$WORK/raw/ap10k/data" \
+& $PY "$REPO/convert/convert_ap10k_to_yoake.py" `
+    --ann "$WORK/raw/ap10k/annotations/ap10k-train-split1.json" `
+    --image_root "$WORK/raw/ap10k/data" `
     --output "$WORK/data/stage1/train/ap10k_annotations.json"
 
 # --- Stage 1: 統合 ---
-$PY "$REPO/convert/merge_stage1_annotations.py" \
-    --inputs \
-        "$WORK/data/stage1/train/coco_annotations.json" \
-        "$WORK/data/stage1/train/ap10k_annotations.json" \
+& $PY "$REPO/convert/merge_stage1_annotations.py" `
+    --inputs `
+        "$WORK/data/stage1/train/coco_annotations.json" `
+        "$WORK/data/stage1/train/ap10k_annotations.json" `
     --output "$WORK/data/stage1/train/annotations.json"
 
 # --- Stage 2: Animal Kingdom ---
-$PY "$REPO/convert/convert_animal_kingdom_to_yoake.py" \
-    --ann_dir "$WORK/raw/animal_kingdom/annotation/AR" \
-    --frame_dir "$WORK/raw/animal_kingdom/frames" \
-    --output "$WORK/data/stage2/train/annotations.json" \
+& $PY "$REPO/convert/convert_animal_kingdom_to_yoake.py" `
+    --ann_dir "$WORK/raw/animal_kingdom/annotation/AR" `
+    --frame_dir "$WORK/raw/animal_kingdom/frames" `
+    --output "$WORK/data/stage2/train/annotations.json" `
     --split train
 
 # --- Stage 3: DanceTrack ---
-$PY "$REPO/convert/convert_mot_to_yoake.py" \
-    --dataset_root "$WORK/raw/dancetrack/train" \
-    --image_root "$WORK/raw/dancetrack" \
-    --output "$WORK/data/stage3/train/dancetrack_annotations.json" \
+& $PY "$REPO/convert/convert_mot_to_yoake.py" `
+    --dataset_root "$WORK/raw/dancetrack/train" `
+    --image_root "$WORK/raw/dancetrack" `
+    --output "$WORK/data/stage3/train/dancetrack_annotations.json" `
     --dataset_name dancetrack --class_name person
 
 # --- Stage 3: BEE23 ---
-$PY "$REPO/convert/convert_mot_to_yoake.py" \
-    --dataset_root "$WORK/raw/bee23/train" \
-    --image_root "$WORK/raw/bee23" \
-    --output "$WORK/data/stage3/train/bee23_annotations.json" \
+& $PY "$REPO/convert/convert_mot_to_yoake.py" `
+    --dataset_root "$WORK/raw/bee23/train" `
+    --image_root "$WORK/raw/bee23" `
+    --output "$WORK/data/stage3/train/bee23_annotations.json" `
     --dataset_name bee23 --class_name bee
 
 # --- Stage 3: AnimalTrack ---
-$PY "$REPO/convert/convert_mot_to_yoake.py" \
-    --dataset_root "$WORK/raw/animaltrack/train" \
-    --image_root "$WORK/raw/animaltrack" \
-    --output "$WORK/data/stage3/train/animaltrack_annotations.json" \
+& $PY "$REPO/convert/convert_mot_to_yoake.py" `
+    --dataset_root "$WORK/raw/animaltrack/train" `
+    --image_root "$WORK/raw/animaltrack" `
+    --output "$WORK/data/stage3/train/animaltrack_annotations.json" `
     --dataset_name animaltrack --class_name animal
 
 # --- Stage 3: 統合 ---
-$PY "$REPO/convert/merge_stage1_annotations.py" \
-    --inputs \
-        "$WORK/data/stage3/train/dancetrack_annotations.json" \
-        "$WORK/data/stage3/train/bee23_annotations.json" \
-        "$WORK/data/stage3/train/animaltrack_annotations.json" \
+& $PY "$REPO/convert/merge_stage1_annotations.py" `
+    --inputs `
+        "$WORK/data/stage3/train/dancetrack_annotations.json" `
+        "$WORK/data/stage3/train/bee23_annotations.json" `
+        "$WORK/data/stage3/train/animaltrack_annotations.json" `
     --output "$WORK/data/stage3/train/annotations.json"
 
 # --- Stage 4: CalMS21 ---
-$PY "$REPO/convert/convert_calms21_to_yoake_stage4.py" \
-    --calms21_npy "$WORK/raw/calms21/calms21_task1_train.npy" \
-    --output "$WORK/data/stage4/train/annotations.json" \
+& $PY "$REPO/convert/convert_calms21_to_yoake_stage4.py" `
+    --calms21_npy "$WORK/raw/calms21/calms21_task1_train.npy" `
+    --output "$WORK/data/stage4/train/annotations.json" `
     --window_size 16
 
-echo "All conversions complete."
+Write-Host "All conversions complete."
 ```
 
 ---
@@ -1306,7 +1307,7 @@ if __name__ == "__main__":
     print("All configs generated.")
 ```
 
-```bash
+```powershell
 # Config ファイルを生成する
 cd C:/Users/hayam/YOAKE
 python setup_pretrain_configs.py
@@ -1347,13 +1348,13 @@ cfg.model.detector.head.num_queries = 300   # large input → queries を増や�
 
 ##### (c) 実行コマンド
 
-```bash
+```powershell
 cd C:/Users/hayam/YOAKE
 
-python scripts/train_stage1.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml \
-    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json \
-    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/val/annotations.json \
+python scripts/train_stage1.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml `
+    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json `
+    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/val/annotations.json `
     root=C:/Users/hayam/Desktop/YOAKE_tryal
 ```
 
@@ -1408,11 +1409,11 @@ cfg.train.max_epochs = 15
 
 ##### (c) 実行コマンド
 
-```bash
+```powershell
 cd C:/Users/hayam/YOAKE
 
-python scripts/train_stage2.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml \
+python scripts/train_stage2.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml `
     root=C:/Users/hayam/Desktop/YOAKE_tryal
 ```
 
@@ -1420,10 +1421,10 @@ python scripts/train_stage2.py \
 > **注**: デフォルト探索パスは `{root}/outputs/stage1/stage1_best.pth` のため、Stage 1 の出力先と合わせること。
 > または `train.resume` で直接指定:
 
-```bash
-python scripts/train_stage2.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml \
-    root=C:/Users/hayam/Desktop/YOAKE_tryal \
+```powershell
+python scripts/train_stage2.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml `
+    root=C:/Users/hayam/Desktop/YOAKE_tryal `
     train.resume=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/large/stage1/stage1_best.pth
 ```
 
@@ -1473,11 +1474,11 @@ cfg.model.id_head.memory_ttl = 30
 
 ##### (c) 実行コマンド
 
-```bash
+```powershell
 cd C:/Users/hayam/YOAKE
 
-python scripts/train_stage3.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage3.yaml \
+python scripts/train_stage3.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage3.yaml `
     root=C:/Users/hayam/Desktop/YOAKE_tryal
 ```
 
@@ -1528,11 +1529,11 @@ cfg.optimizer.backbone_lr_factor = 0.1  # backbone: 1e-6
 
 ##### (c) 実行コマンド
 
-```bash
+```powershell
 cd C:/Users/hayam/YOAKE
 
-python scripts/train_stage4.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4.yaml \
+python scripts/train_stage4.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4.yaml `
     root=C:/Users/hayam/Desktop/YOAKE_tryal
 ```
 
@@ -1716,17 +1717,17 @@ print("Saved multi-species config.")
 
 複数種混在シーンの Pre-training には、**種ごとにラベルを区別した Stage 1 データ**が必要:
 
-```bash
+```powershell
 # Stage 1: COCO + AP-10K (多クラス) → num_classes を種数に合わせて学習
-python scripts/train_stage1.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml \
-    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json \
-    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/val/annotations.json \
+python scripts/train_stage1.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml `
+    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json `
+    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/val/annotations.json `
     root=C:/Users/hayam/Desktop/YOAKE_tryal
 
 # Stage 4: 種分離プール有効
-python scripts/train_stage4.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4_multispecies.yaml \
+python scripts/train_stage4.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4_multispecies.yaml `
     root=C:/Users/hayam/Desktop/YOAKE_tryal
 ```
 
@@ -1762,48 +1763,48 @@ python scripts/train_stage4.py \
 
 #### 8-2. 種固有 Fine-tune コマンド
 
-```bash
-WORK="C:/Users/hayam/Desktop/YOAKE_tryal"
+```powershell
+$WORK = "C:/Users/hayam/Desktop/YOAKE_tryal"
 
 # --- Step 1: 種固有データを YOAKE 形式に変換 ---
 # (上記の変換スクリプトを使用)
 
 # --- Step 2: 検出 fine-tune (Stage 1) ---
-python C:/Users/hayam/YOAKE/scripts/train_stage1.py \
-    train_anno="${WORK}/data/species/train/annotations.json" \
-    val_anno="${WORK}/data/species/val/annotations.json" \
-    root="${WORK}" \
-    train.max_epochs=50 \
-    train.early_stopping_patience=20 \
-    train.use_amp=true \
-    train.resume="${WORK}/outputs/large/stage1/stage1_best.pth" \
-    data.batch_size=16 \
-    data.num_workers=8 \
-    optimizer.lr=5e-5 \
+python C:/Users/hayam/YOAKE/scripts/train_stage1.py `
+    train_anno="$WORK/data/species/train/annotations.json" `
+    val_anno="$WORK/data/species/val/annotations.json" `
+    root="$WORK" `
+    train.max_epochs=50 `
+    train.early_stopping_patience=20 `
+    train.use_amp=true `
+    train.resume="$WORK/outputs/large/stage1/stage1_best.pth" `
+    data.batch_size=16 `
+    data.num_workers=8 `
+    optimizer.lr=5e-5 `
     optimizer.backbone_lr_factor=0.01
 
 # --- Step 3: 行動 fine-tune (Stage 2) ---
-python C:/Users/hayam/YOAKE/scripts/train_stage2.py \
-    root="${WORK}" \
-    train.max_epochs=30 \
-    train.use_amp=true \
-    data.batch_size=8 \
+python C:/Users/hayam/YOAKE/scripts/train_stage2.py `
+    root="$WORK" `
+    train.max_epochs=30 `
+    train.use_amp=true `
+    data.batch_size=8 `
     data.window_size=16
 
 # --- Step 4: 追跡 fine-tune (Stage 3) ---
-python C:/Users/hayam/YOAKE/scripts/train_stage3.py \
-    root="${WORK}" \
-    train.max_epochs=30 \
-    train.use_amp=true \
-    data.batch_size=8 \
+python C:/Users/hayam/YOAKE/scripts/train_stage3.py `
+    root="$WORK" `
+    train.max_epochs=30 `
+    train.use_amp=true `
+    data.batch_size=8 `
     data.window_size=16
 
 # --- Step 5: 統合 fine-tune (Stage 4) ---
-python C:/Users/hayam/YOAKE/scripts/train_stage4.py \
-    root="${WORK}" \
-    train.max_epochs=20 \
-    train.use_amp=true \
-    data.batch_size=4 \
+python C:/Users/hayam/YOAKE/scripts/train_stage4.py `
+    root="$WORK" `
+    train.max_epochs=20 `
+    train.use_amp=true `
+    data.batch_size=4 `
     data.window_size=16
 ```
 
@@ -1813,28 +1814,28 @@ python C:/Users/hayam/YOAKE/scripts/train_stage4.py \
 
 #### 9-1. VRAM OOM (Out of Memory)
 
-```bash
+```powershell
 # VRAM 使用量の確認
 nvidia-smi
 
 # 対処: batch_size を半減
 # Stage 1: 32 → 16 → 8
-python scripts/train_stage1.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml \
-    train_anno=... val_anno=... \
+python scripts/train_stage1.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml `
+    train_anno=... val_anno=... `
     data.batch_size=16
 
 # Stage 2/3: 8 → 4
-python scripts/train_stage2.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml \
-    root=C:/Users/hayam/Desktop/YOAKE_tryal \
+python scripts/train_stage2.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml `
+    root=C:/Users/hayam/Desktop/YOAKE_tryal `
     data.batch_size=4
 
 # Stage 4: 4 → 2 + window_size を小さく
-python scripts/train_stage4.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4.yaml \
-    root=C:/Users/hayam/Desktop/YOAKE_tryal \
-    data.batch_size=2 \
+python scripts/train_stage4.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4.yaml `
+    root=C:/Users/hayam/Desktop/YOAKE_tryal `
+    data.batch_size=2 `
     data.window_size=8
 ```
 
@@ -1845,14 +1846,14 @@ python scripts/train_stage4.py \
 
 #### 9-2. Loss 発散 (NaN / Inf)
 
-```bash
+```powershell
 # 対処1: grad_clip_norm を下げる (デフォルト 0.1)
 # setup_pretrain_configs.py で optimizer.grad_clip_norm=0.05 に変更して再生成
 
 # 対処2: learning rate を 1/10 に下げる
-python scripts/train_stage1.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml \
-    train_anno=... val_anno=... \
+python scripts/train_stage1.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml `
+    train_anno=... val_anno=... `
     optimizer.lr=1e-5
 
 # 対処3: warmup epochs を増やす (config 再生成で scheduler.warmup_epochs=10 に)
@@ -1919,10 +1920,10 @@ stage1_path = f"{root}/outputs/stage1/stage1_best.pth"
 
 **対処**: `train.resume` で直接パスを指定する:
 
-```bash
-python scripts/train_stage2.py \
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml \
-    root=C:/Users/hayam/Desktop/YOAKE_tryal \
+```powershell
+python scripts/train_stage2.py `
+    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml `
+    root=C:/Users/hayam/Desktop/YOAKE_tryal `
     train.resume=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/large/stage1/stage1_best.pth
 ```
 
