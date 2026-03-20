@@ -134,7 +134,7 @@ class _WarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
         # warmup 後は base_scheduler の lr を返す
         return self.base_scheduler.get_last_lr()
 
-    def step(self, epoch=None) -> None:
+    def step(self) -> None:
         if self.last_epoch >= self.warmup_epochs:
-            self.base_scheduler.step(epoch)
-        super().step(epoch)
+            self.base_scheduler.step()
+        super().step()

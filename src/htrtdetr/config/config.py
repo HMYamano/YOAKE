@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # データ格納先ルート (出力もここに集約する)
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_YOAKE_TRYAL = "C:/Users/utopi/YOAKE_pre-train"
 
 # yaml は optional 依存 (pyyaml)
 try:
@@ -429,9 +429,19 @@ class HTRTDETRConfig:
         """設定を yaml ファイルに保存する"""
         if not _YAML_AVAILABLE:
             raise ImportError("pyyaml が必要です: pip install pyyaml")
+
+        def _convert(obj):
+            if isinstance(obj, tuple):
+                return [_convert(v) for v in obj]
+            if isinstance(obj, dict):
+                return {k: _convert(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_convert(v) for v in obj]
+            return obj
+
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(self.to_dict(), f, default_flow_style=False, allow_unicode=True)
+            yaml.dump(_convert(self.to_dict()), f, default_flow_style=False, allow_unicode=True)
 
     def merge(self, overrides: Dict[str, Any]) -> "HTRTDETRConfig":
         """dict で上書きした新しい config を返す (immutable merge)"""

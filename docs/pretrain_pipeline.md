@@ -2,8 +2,16 @@
 
 > **モデルバリアント**: large (ResNet-50 backbone, feature_dim=512, ~60M params)
 > **GPU**: NVIDIA RTX 8000 (VRAM 48GB) × 1
-> **リポジトリ**: `C:/Users/hayam/YOAKE`
-> **データ・出力先**: `C:/Users/hayam/Desktop/YOAKE_tryal`
+> **リポジトリ**: `C:/Users/utopi/YOAKE`
+> **データ・出力先**: `C:/Users/utopi/YOAKE_pre-train`
+
+> **⚠️ パスのカスタマイズ**: `src/htrtdetr/config/config.py` と `scripts/train_stage2.py` 内の `_YOAKE_TRYAL` / `_DEFAULT_ROOT` 変数にハードコードされたパスがある。初回セットアップ時に自分の環境に合わせて変更すること。
+> ```python
+> # config.py (19行目付近)
+> _YOAKE_TRYAL = "C:/Users/<your-name>/YOAKE_pre-train"
+> # train_stage2.py (33行目付近)
+> _YOAKE_TRYAL = "C:/Users/<your-name>/YOAKE_pre-train"
+> ```
 
 ---
 
@@ -206,9 +214,15 @@ Expand-Archive -Path "$WORK/raw/animaltrack/animaltrack.zip" -DestinationPath "$
 #### 2-3. Python 依存パッケージ
 
 ```bash
-cd C:/Users/hayam/YOAKE
+cd C:/Users/utopi/YOAKE
 pip install pycocotools h5py scipy tqdm pyyaml
 ```
+
+> **PyTorch バージョン要件**: Trainer は `torch.amp.GradScaler('cuda')` (PyTorch 2.0+ の API) を使用する。PyTorch 1.x では `torch.cuda.amp.GradScaler()` を使う必要があるため、**PyTorch 2.0 以上**を推奨。
+> ```bash
+> # バージョン確認
+> python -c "import torch; print(torch.__version__)"
+> ```
 
 ---
 
@@ -223,731 +237,77 @@ pip install pycocotools h5py scipy tqdm pyyaml
 
 #### 3-1. COCO → YOAKE
 
-```python
-# convert_coco_to_yoake.py
-# 実行例 (Anaconda PowerShell):
-#   python convert/convert_coco_to_yoake.py `
-#       --coco_ann C:/Users/hayam/Desktop/YOAKE_tryal/raw/coco/annotations/instances_train2017.json `
-#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/coco/train2017 `
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json `
-#       --split train
-
-import argparse
-import json
-from pathlib import Path
-
-
-def convert_coco(coco_ann_path: str, image_root: str, output_path: str) -> None:
-    with open(coco_ann_path, "r") as f:
-        coco = json.load(f)
-
-    # id → info マッピング
-    img_info = {img["id"]: img for img in coco["images"]}
-    # category id → 0-indexed class_id
-    cat_ids = sorted(c["id"] for c in coco["categories"])
-    cat_id_to_class = {cid: i for i, cid in enumerate(cat_ids)}
-    class_names = [c["name"] for c in sorted(coco["categories"], key=lambda x: x["id"])]
-
-    # image_id → annotations
-    from collections import defaultdict
-    ann_by_img = defaultdict(list)
-    for ann in coco["annotations"]:
-        if ann.get("iscrowd", 0):
-            continue
-        ann_by_img[ann["image_id"]].append(ann)
-
-    videos = []
-    for img_id, img in img_info.items():
-        anns = ann_by_img.get(img_id, [])
-        if not anns:
-            continue  # 物体なし画像はスキップ
-
-        rel_path = str(Path(image_root) / img["file_name"])
-        objects = []
-        for i, ann in enumerate(anns):
-            x, y, w, h = ann["bbox"]
-            x1, y1, x2, y2 = x, y, x + w, y + h
-            objects.append({
-                "object_id": i + 1,
-                "bbox": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
-                "class_id": cat_id_to_class[ann["category_id"]],
-                "track_id": -1,
-                "action_id": -1,
-                "is_crowd": bool(ann.get("iscrowd", 0)),
-            })
-
-        videos.append({
-            "video_id": f"coco_{img_id:012d}",
-            "fps": 1.0,
-            "width": img["width"],
-            "height": img["height"],
-            "num_frames": 1,
-            "frames": [{
-                "frame_index": 0,
-                "image_path": rel_path,
-                "width": img["width"],
-                "height": img["height"],
-                "objects": objects,
-            }],
-        })
-
-    result = {
-        "meta": {
-            "version": "1.1",
-            "description": "COCO 2017 converted to YOAKE format",
-            "created": "2026-03-18",
-            "fps_default": 1.0,
-            "image_root": image_root,
-        },
-        "class_names": class_names,
-        "action_names": ["none"],
-        "videos": videos,
-    }
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"Saved {len(videos)} entries → {output_path}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--coco_ann", required=True)
-    parser.add_argument("--image_root", required=True)
-    parser.add_argument("--output", required=True)
-    args = parser.parse_args()
-    convert_coco(args.coco_ann, args.image_root, args.output)
+```powershell
+python convert/convert_coco_to_yoake.py `
+    --coco_ann C:/Users/utopi/YOAKE_pre-train/raw/coco/annotations/instances_train2017.json `
+    --image_root C:/Users/utopi/YOAKE_pre-train/raw/coco/train2017 `
+    --output C:/Users/utopi/YOAKE_pre-train/data/stage1/train/coco_annotations.json
 ```
 
 #### 3-2. AP-10K → YOAKE
 
-```python
-# convert_ap10k_to_yoake.py
-# AP-10K は COCO keypoint 形式 (bbox あり)
-# 実行例 (Anaconda PowerShell):
-#   python convert/convert_ap10k_to_yoake.py `
-#       --ann C:/Users/hayam/Desktop/YOAKE_tryal/raw/ap10k/annotations/ap10k-train-split1.json `
-#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/ap10k/data `
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/ap10k_annotations.json
-
-import argparse
-import json
-from collections import defaultdict
-from pathlib import Path
-
-
-def convert_ap10k(ann_path: str, image_root: str, output_path: str) -> None:
-    with open(ann_path, "r") as f:
-        data = json.load(f)
-
-    img_info = {img["id"]: img for img in data["images"]}
-    cat_ids = sorted(c["id"] for c in data["categories"])
-    cat_id_to_class = {cid: i for i, cid in enumerate(cat_ids)}
-    class_names = [c["name"] for c in sorted(data["categories"], key=lambda x: x["id"])]
-
-    ann_by_img = defaultdict(list)
-    for ann in data["annotations"]:
-        ann_by_img[ann["image_id"]].append(ann)
-
-    videos = []
-    for img_id, img in img_info.items():
-        anns = ann_by_img.get(img_id, [])
-        if not anns:
-            continue
-
-        rel_path = str(Path(image_root) / img["file_name"])
-        objects = []
-        for i, ann in enumerate(anns):
-            x, y, w, h = ann["bbox"]
-            objects.append({
-                "object_id": i + 1,
-                "bbox": [round(x, 2), round(y, 2), round(x + w, 2), round(y + h, 2)],
-                "class_id": cat_id_to_class[ann["category_id"]],
-                "track_id": -1,
-                "action_id": -1,
-            })
-
-        videos.append({
-            "video_id": f"ap10k_{img_id:08d}",
-            "fps": 1.0,
-            "width": img["width"],
-            "height": img["height"],
-            "num_frames": 1,
-            "frames": [{
-                "frame_index": 0,
-                "image_path": rel_path,
-                "width": img["width"],
-                "height": img["height"],
-                "objects": objects,
-            }],
-        })
-
-    result = {
-        "meta": {
-            "version": "1.1",
-            "description": "AP-10K converted to YOAKE format",
-            "created": "2026-03-18",
-            "image_root": image_root,
-        },
-        "class_names": class_names,
-        "action_names": ["none"],
-        "videos": videos,
-    }
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"Saved {len(videos)} entries → {output_path}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ann", required=True)
-    parser.add_argument("--image_root", required=True)
-    parser.add_argument("--output", required=True)
-    args = parser.parse_args()
-    convert_ap10k(args.ann, args.image_root, args.output)
+```powershell
+python convert/convert_ap10k_to_yoake.py `
+    --ann C:/Users/utopi/YOAKE_pre-train/raw/ap10k/annotations/ap10k-train-split1.json `
+    --image_root C:/Users/utopi/YOAKE_pre-train/raw/ap10k/data `
+    --output C:/Users/utopi/YOAKE_pre-train/data/stage1/train/ap10k_annotations.json
 ```
 
 #### 3-3. COCO + AP-10K のアノテーション統合
 
 Stage 1 では COCO と AP-10K を1つの annotations.json にまとめる。
 
-```python
-# merge_stage1_annotations.py
-# 実行例 (Anaconda PowerShell):
-#   python convert/merge_stage1_annotations.py `
-#       --inputs `
-#           C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json `
-#           C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/ap10k_annotations.json `
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations_merged.json
-
-import argparse
-import json
-from pathlib import Path
-
-
-def merge_annotations(input_paths: list, output_path: str) -> None:
-    all_videos = []
-    all_classes = set()
-    video_id_set = set()
-
-    for path in input_paths:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for cls in data.get("class_names", []):
-            all_classes.add(cls)
-        for v in data["videos"]:
-            if v["video_id"] not in video_id_set:
-                all_videos.append(v)
-                video_id_set.add(v["video_id"])
-
-    class_names = sorted(all_classes)
-    result = {
-        "meta": {
-            "version": "1.1",
-            "description": "COCO + AP-10K merged for Stage 1 pretraining",
-            "created": "2026-03-18",
-        },
-        "class_names": class_names,
-        "action_names": ["none"],
-        "videos": all_videos,
-    }
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"Merged {len(all_videos)} videos, {len(class_names)} classes → {output_path}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--inputs", nargs="+", required=True)
-    parser.add_argument("--output", required=True)
-    args = parser.parse_args()
-    merge_annotations(args.inputs, args.output)
+```powershell
+python convert/merge_stage1_annotations.py `
+    --inputs `
+        C:/Users/utopi/YOAKE_pre-train/data/stage1/train/annotations.json `
+        C:/Users/utopi/YOAKE_pre-train/data/stage1/train/ap10k_annotations.json `
+    --output C:/Users/utopi/YOAKE_pre-train/data/stage1/train/annotations_merged.json
 ```
 
 #### 3-4. Animal Kingdom → YOAKE (Stage 2)
 
-```python
-# convert_animal_kingdom_to_yoake.py
-# Animal Kingdom の action segment CSV/JSON をシーケンス形式に変換する
-# 公式フォーマット: action_recognition/annotation/ 以下に CSV
-# 実行例 (Anaconda PowerShell):
-#   python convert/convert_animal_kingdom_to_yoake.py `
-#       --ann_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/annotation/AR `
-#       --video_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/dataset/AR `
-#       --frame_dir C:/Users/hayam/Desktop/YOAKE_tryal/raw/animal_kingdom/frames `
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage2/train/annotations.json `
-#       --window_size 16 `
-#       --split train
-
-import argparse
-import json
-import os
-from pathlib import Path
-
-
-# Animal Kingdom の action label (一部。実際は 140 クラス)
-AK_ACTIONS = [
-    "eating", "running", "walking", "swimming", "flying",
-    "jumping", "grooming", "fighting", "mating", "resting",
-    # ... (実際の AK ラベルに合わせて拡張)
-]
-
-
-def convert_animal_kingdom(
-    ann_dir: str,
-    frame_dir: str,
-    output_path: str,
-    window_size: int = 16,
-    split: str = "train",
-) -> None:
-    """
-    Animal Kingdom の segment-level アノテーションを YOAKE 形式に変換する。
-
-    Animal Kingdom は各クリップに行動ラベルがつくが bbox は提供されない場合がある。
-    bbox なしの場合はフレーム全体を bbox として扱う (x1=0, y1=0, x2=W, y2=H)。
-    学習では forward_geo_sequence を使う場合は bbox プロキシで十分。
-    """
-    ann_csv = Path(ann_dir) / f"{split}.csv"
-    if not ann_csv.exists():
-        # JSON 形式の場合
-        ann_csv = Path(ann_dir) / f"{split}.json"
-
-    if ann_csv.suffix == ".csv":
-        import csv
-        entries = []
-        with open(ann_csv, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                entries.append(row)
-    else:
-        with open(ann_csv, "r") as f:
-            entries = json.load(f)
-
-    # action 名リスト構築 (実際のファイルから収集)
-    action_set = set()
-    for e in entries:
-        action_set.add(e.get("action", e.get("label", "unknown")))
-    action_names = sorted(action_set)
-    action_to_id = {a: i for i, a in enumerate(action_names)}
-
-    videos = []
-    for e in entries:
-        vid_id = e.get("video_id", e.get("filename", ""))
-        action_name = e.get("action", e.get("label", "unknown"))
-        action_id = action_to_id.get(action_name, -1)
-        start_f = int(e.get("start_frame", 0))
-        end_f = int(e.get("end_frame", start_f + window_size))
-        W = int(e.get("width", 640))
-        H = int(e.get("height", 480))
-
-        # フレーム画像のパスを構築
-        frames = []
-        for fi in range(start_f, end_f):
-            img_path = str(Path(frame_dir) / vid_id / f"{fi:06d}.jpg")
-            frames.append({
-                "frame_index": fi - start_f,
-                "image_path": img_path,
-                "width": W,
-                "height": H,
-                "objects": [{
-                    "object_id": 1,
-                    "bbox": [0.0, 0.0, float(W), float(H)],  # 全画面プロキシ
-                    "class_id": 0,
-                    "track_id": 1,  # 単一個体として仮定
-                    "action_id": action_id,
-                }],
-            })
-
-        videos.append({
-            "video_id": f"ak_{vid_id}_{start_f}",
-            "fps": float(e.get("fps", 30.0)),
-            "width": W,
-            "height": H,
-            "num_frames": len(frames),
-            "frames": frames,
-        })
-
-    result = {
-        "meta": {
-            "version": "1.1",
-            "description": "Animal Kingdom converted to YOAKE format",
-            "created": "2026-03-18",
-        },
-        "class_names": ["animal"],
-        "action_names": action_names,
-        "videos": videos,
-    }
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"Saved {len(videos)} clips → {output_path}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ann_dir", required=True)
-    parser.add_argument("--frame_dir", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--window_size", type=int, default=16)
-    parser.add_argument("--split", default="train")
-    args = parser.parse_args()
-    convert_animal_kingdom(args.ann_dir, args.frame_dir, args.output,
-                           args.window_size, args.split)
+```powershell
+python convert/convert_animal_kingdom_to_yoake.py `
+    --ann_dir C:/Users/utopi/YOAKE_pre-train/raw/animal_kingdom/annotation/AR `
+    --frame_dir C:/Users/utopi/YOAKE_pre-train/raw/animal_kingdom/frames `
+    --output C:/Users/utopi/YOAKE_pre-train/data/stage2/train/annotations.json `
+    --window_size 16 `
+    --split train
 ```
 
 #### 3-5. MOT17/DanceTrack/AnimalTrack → YOAKE (Stage 3)
 
-```python
-# convert_mot_to_yoake.py
-# MOT17 / DanceTrack / AnimalTrack はすべて同一のテキスト形式:
-# <frame>,<id>,<bb_left>,<bb_top>,<bb_width>,<bb_height>,<conf>,<x>,<y>,<z>
-# 実行例 (Anaconda PowerShell):
-#   python convert/convert_mot_to_yoake.py `
-#       --dataset_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/dancetrack/train `
-#       --image_root C:/Users/hayam/Desktop/YOAKE_tryal/raw/dancetrack `
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage3/train/annotations.json `
-#       --dataset_name dancetrack
-
-import argparse
-import json
-from collections import defaultdict
-from pathlib import Path
-
-
-def convert_mot_dataset(
-    dataset_root: str,
-    image_root: str,
-    output_path: str,
-    dataset_name: str = "mot",
-    class_name: str = "object",
-) -> None:
-    """
-    MOT 形式テキストアノテーションを YOAKE 形式に変換する。
-
-    dataset_root 以下の各サブディレクトリが1動画に対応することを想定:
-      dataset_root/
-        seq01/
-          gt/gt.txt
-          img1/000001.jpg ...
-        seq02/
-          ...
-    """
-    sequences = sorted(p for p in Path(dataset_root).iterdir() if p.is_dir())
-    videos = []
-
-    for seq_dir in sequences:
-        gt_path = seq_dir / "gt" / "gt.txt"
-        if not gt_path.exists():
-            # DanceTrack は annotations 以下の場合もある
-            gt_path = seq_dir / "annotations.txt"
-        if not gt_path.exists():
-            continue
-
-        # seqinfo.ini から映像情報を読む
-        seqinfo_path = seq_dir / "seqinfo.ini"
-        width, height, fps = 1920, 1080, 25.0
-        img_dir = seq_dir / "img1"
-        if seqinfo_path.exists():
-            import configparser
-            cfg = configparser.ConfigParser()
-            cfg.read(str(seqinfo_path))
-            si = cfg["Sequence"]
-            width = int(si.get("imWidth", width))
-            height = int(si.get("imHeight", height))
-            fps = float(si.get("frameRate", fps))
-            img_dir = seq_dir / si.get("imDir", "img1")
-
-        # GT アノテーションを読む
-        frame_objects = defaultdict(list)
-        with open(gt_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split(",")
-                if len(parts) < 6:
-                    continue
-                frame_id = int(parts[0])
-                track_id = int(parts[1])
-                bb_left = float(parts[2])
-                bb_top = float(parts[3])
-                bb_width = float(parts[4])
-                bb_height = float(parts[5])
-                conf = float(parts[6]) if len(parts) > 6 else 1.0
-                if conf < 0.5:
-                    continue  # visibility が低いものを除外
-                frame_objects[frame_id].append({
-                    "track_id": track_id,
-                    "bbox": [bb_left, bb_top, bb_left + bb_width, bb_top + bb_height],
-                })
-
-        if not frame_objects:
-            continue
-
-        frames = []
-        for frame_id in sorted(frame_objects.keys()):
-            img_name = f"{frame_id:06d}.jpg"
-            img_path = str(img_dir / img_name)
-            objects = []
-            for oi, obj in enumerate(frame_objects[frame_id]):
-                x1, y1, x2, y2 = obj["bbox"]
-                objects.append({
-                    "object_id": oi + 1,
-                    "bbox": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
-                    "class_id": 0,
-                    "track_id": obj["track_id"],
-                    "action_id": -1,
-                })
-            frames.append({
-                "frame_index": frame_id - 1,
-                "image_path": img_path,
-                "width": width,
-                "height": height,
-                "objects": objects,
-            })
-
-        videos.append({
-            "video_id": f"{dataset_name}_{seq_dir.name}",
-            "fps": fps,
-            "width": width,
-            "height": height,
-            "num_frames": len(frames),
-            "frames": frames,
-        })
-
-    result = {
-        "meta": {
-            "version": "1.1",
-            "description": f"{dataset_name} converted to YOAKE format",
-            "created": "2026-03-18",
-            "image_root": image_root,
-        },
-        "class_names": [class_name],
-        "action_names": ["none"],
-        "videos": videos,
-    }
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"Saved {len(videos)} sequences → {output_path}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_root", required=True)
-    parser.add_argument("--image_root", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--dataset_name", default="mot")
-    parser.add_argument("--class_name", default="object")
-    args = parser.parse_args()
-    convert_mot_dataset(args.dataset_root, args.image_root, args.output,
-                        args.dataset_name, args.class_name)
+```powershell
+python convert/convert_mot_to_yoake.py `
+    --dataset_root C:/Users/utopi/YOAKE_pre-train/raw/dancetrack/train `
+    --image_root C:/Users/utopi/YOAKE_pre-train/raw/dancetrack `
+    --output C:/Users/utopi/YOAKE_pre-train/data/stage3/train/annotations.json `
+    --dataset_name dancetrack
 ```
 
 #### 3-6. CalMS21 + 擬似 track_id 付与 → YOAKE (Stage 4)
 
-```python
-# convert_calms21_to_yoake_stage4.py
-# CalMS21 は HDF5 形式。行動ラベルと bbox (keypoints) を持つ。
-# 連続フレームの bbox から track_id を Hungarian matching で自動生成する。
-# 実行例 (Anaconda PowerShell):
-#   python convert/convert_calms21_to_yoake_stage4.py `
-#       --calms21_npy C:/Users/hayam/Desktop/YOAKE_tryal/raw/calms21/calms21_task1_train.npy `
-#       --output C:/Users/hayam/Desktop/YOAKE_tryal/data/stage4/train/annotations.json `
-#       --window_size 16
-
-import argparse
-import json
-import numpy as np
-from pathlib import Path
-from scipy.optimize import linear_sum_assignment
-
-
-# CalMS21 task1 action labels
-CALMS21_ACTIONS = ["attack", "investigation", "mount", "other"]
-
-
-def bbox_iou(b1, b2):
-    """[x1,y1,x2,y2] 形式の IoU"""
-    x1 = max(b1[0], b2[0])
-    y1 = max(b1[1], b2[1])
-    x2 = min(b1[2], b2[2])
-    y2 = min(b1[3], b2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
-    area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
-    union = area1 + area2 - inter
-    return inter / (union + 1e-6)
-
-
-def assign_track_ids(bboxes_per_frame: list) -> list:
-    """
-    各フレームの bbox リストから IoU ベースで track_id を割り当てる。
-    bboxes_per_frame: List[List[[x1,y1,x2,y2]]]
-    returns: List[List[int]] (各フレームの各 bbox に対する track_id)
-    """
-    next_id = 0
-    prev_boxes = []
-    prev_ids = []
-    all_track_ids = []
-
-    for boxes in bboxes_per_frame:
-        if not boxes:
-            all_track_ids.append([])
-            prev_boxes, prev_ids = [], []
-            continue
-
-        if not prev_boxes:
-            # 最初のフレーム: 全て新規 ID
-            ids = list(range(next_id, next_id + len(boxes)))
-            next_id += len(boxes)
-        else:
-            # IoU コスト行列
-            cost = np.zeros((len(boxes), len(prev_boxes)))
-            for i, b in enumerate(boxes):
-                for j, pb in enumerate(prev_boxes):
-                    cost[i, j] = 1.0 - bbox_iou(b, pb)
-
-            row_ind, col_ind = linear_sum_assignment(cost)
-            ids = [-1] * len(boxes)
-            for r, c in zip(row_ind, col_ind):
-                if cost[r, c] < 0.7:  # IoU > 0.3 なら同一個体
-                    ids[r] = prev_ids[c]
-                else:
-                    ids[r] = next_id
-                    next_id += 1
-            for i in range(len(boxes)):
-                if ids[i] == -1:
-                    ids[i] = next_id
-                    next_id += 1
-
-        all_track_ids.append(ids)
-        prev_boxes = boxes
-        prev_ids = ids
-
-    return all_track_ids
-
-
-def convert_calms21(npy_path: str, output_path: str, window_size: int = 16) -> None:
-    """
-    CalMS21 .npy ファイルを YOAKE Stage 4 形式に変換する。
-
-    CalMS21 task1 形式:
-      data[seq_name] = {
-        "keypoints": np.ndarray (T, 2, 7, 2),  # 2 animals, 7 keypoints, xy
-        "annotations": np.ndarray (T,),          # 0-3 behavior labels
-        "metadata": {"fps": ..., ...}
-      }
-    """
-    data = np.load(npy_path, allow_pickle=True).item()
-
-    videos = []
-    for seq_name, seq_data in data.items():
-        keypoints = seq_data["keypoints"]  # (T, 2, 7, 2) [animal, kpt, xy]
-        labels = seq_data.get("annotations", np.full(keypoints.shape[0], -1))
-        T = keypoints.shape[0]
-        n_animals = keypoints.shape[1]
-
-        # bbox をキーポイントの bounding box として計算
-        # keypoints: (T, n_animals, 7, 2) → bbox per animal per frame
-        # 座標は pixel 単位と仮定 (実際の CalMS21 は 1024x570 等)
-        W, H = 1024, 570  # CalMS21 の標準解像度
-
-        bboxes_per_frame_per_animal = []
-        for t in range(T):
-            frame_boxes = []
-            for a in range(n_animals):
-                kpts = keypoints[t, a]  # (7, 2) xy
-                x1 = float(np.min(kpts[:, 0])) - 10
-                y1 = float(np.min(kpts[:, 1])) - 10
-                x2 = float(np.max(kpts[:, 0])) + 10
-                y2 = float(np.max(kpts[:, 1])) + 10
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(W, x2), min(H, y2)
-                frame_boxes.append([x1, y1, x2, y2])
-            bboxes_per_frame_per_animal.append(frame_boxes)
-
-        # 各動物の track_id を割り当て (動物ごとに独立して処理)
-        track_ids_per_animal = []
-        for a in range(n_animals):
-            boxes_a = [bboxes_per_frame_per_animal[t][a] for t in range(T)]
-            tids = assign_track_ids([[b] for b in boxes_a])
-            track_ids_per_animal.append([t[0] if t else -1 for t in tids])
-
-        # window_size フレームずつ切り出して video を生成
-        for start in range(0, T - window_size + 1, window_size // 2):
-            end = start + window_size
-            frames = []
-            for fi, t in enumerate(range(start, end)):
-                action_id = int(labels[t]) if labels[t] >= 0 else -1
-                objects = []
-                for a in range(n_animals):
-                    x1, y1, x2, y2 = bboxes_per_frame_per_animal[t][a]
-                    objects.append({
-                        "object_id": a + 1,
-                        "bbox": [round(x1, 2), round(y1, 2),
-                                 round(x2, 2), round(y2, 2)],
-                        "class_id": 0,
-                        "track_id": track_ids_per_animal[a][t],
-                        "action_id": action_id,
-                    })
-                frames.append({
-                    "frame_index": fi,
-                    "image_path": f"calms21/{seq_name}/{t:06d}.jpg",
-                    "width": W,
-                    "height": H,
-                    "objects": objects,
-                })
-
-            videos.append({
-                "video_id": f"calms21_{seq_name}_{start}",
-                "fps": float(seq_data.get("metadata", {}).get("fps", 30.0)),
-                "width": W,
-                "height": H,
-                "num_frames": window_size,
-                "frames": frames,
-            })
-
-    result = {
-        "meta": {
-            "version": "1.1",
-            "description": "CalMS21 with pseudo track_id for Stage 4",
-            "created": "2026-03-18",
-        },
-        "class_names": ["mouse"],
-        "action_names": CALMS21_ACTIONS,
-        "videos": videos,
-    }
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"Saved {len(videos)} windows → {output_path}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--calms21_npy", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--window_size", type=int, default=16)
-    args = parser.parse_args()
-    convert_calms21(args.calms21_npy, args.output, args.window_size)
+```powershell
+python convert/convert_calms21_to_yoake_stage4.py `
+    --calms21_npy C:/Users/utopi/YOAKE_pre-train/raw/calms21/calms21_task1_train.npy `
+    --output C:/Users/utopi/YOAKE_pre-train/data/stage4/train/annotations.json `
+    --window_size 16
 ```
 
 #### 3-7. 変換実行スクリプト（全 Stage 一括）
 
+> **変換スクリプトの配置**: `convert/` ディレクトリはリポジトリに存在する。上記 3-1〜3-6 のスクリプトをそれぞれのファイル名で保存すること (`convert_coco_to_yoake.py` はすでに配置済み)。
+> なお以下の既存ツールも活用できる:
+> - `tools/convert_mot17.py` — MOT17 専用変換ツール（Stage 3 に最適）
+> - `tools/convert_annotations.py` — CSV/JSON/動画 CSV の汎用変換ツール（独自データ向け）
+
 ```powershell
 # run_all_conversions.ps1
-# C:/Users/hayam/YOAKE から実行する
+# C:/Users/utopi/YOAKE から実行する
 
-$REPO = "C:/Users/hayam/YOAKE"
-$WORK = "C:/Users/hayam/Desktop/YOAKE_tryal"
+$REPO = "C:/Users/utopi/YOAKE"
+$WORK = "C:/Users/utopi/YOAKE_pre-train"
 $PY = "python"
 
 # --- Stage 1: COCO train ---
@@ -1028,288 +388,23 @@ Write-Host "All conversions complete."
 
 各ステージの設定を YAML に書き出してから学習スクリプトに渡す方式を使う。これにより large variant の次元設定（`fpn_out_channels=512`, `hidden_dim=512` 等）が一貫して適用される。
 
-```python
-# setup_pretrain_configs.py
-# 実行: python C:/Users/hayam/YOAKE/setup_pretrain_configs.py
-# 生成先: C:/Users/hayam/Desktop/YOAKE_tryal/configs/
-
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-
-from htrtdetr.config.config import get_variant_config
-
-WORK = "C:/Users/hayam/Desktop/YOAKE_tryal"
-
-
-def make_stage1_config():
-    cfg = get_variant_config("large", stage=1, overrides={
-        "data": {
-            "train_root": f"{WORK}/data/stage1/train",
-            "val_root": f"{WORK}/data/stage1/val",
-            "batch_size": 32,
-            "num_workers": 8,
-            "image_size": [640, 640],
-            "window_size": 1,
-            "augment_train": True,
-            "pin_memory": True,
-            "persistent_workers": True,
-            "prefetch_factor": 4,
-        },
-        "train": {
-            "stage": 1,
-            "max_epochs": 24,
-            "early_stopping_patience": 10,
-            "use_amp": True,
-            "output_dir": f"{WORK}/outputs/large/stage1",
-            "log_interval": 100,
-            "val_interval": 1,
-            "save_best": True,
-            "save_last": True,
-        },
-        "optimizer": {
-            "optimizer": "adamw",
-            "lr": 1e-4,
-            "backbone_lr_factor": 0.1,
-            "weight_decay": 1e-4,
-            "grad_clip_norm": 0.1,
-        },
-        "scheduler": {
-            "scheduler": "cosine",
-            "warmup_epochs": 3,
-            "total_epochs": 24,
-            "eta_min": 1e-6,
-        },
-        "model": {
-            "training_stage": 1,
-            "detector": {
-                "head": {
-                    "num_classes": 84,   # COCO(80) + AP-10K 追加クラス
-                    "num_queries": 300,
-                },
-            },
-            "action_head": {"num_actions": 5},
-            "id_head": {"max_ids": 50},
-        },
-        "loss": {
-            "w_class": 2.0,
-            "w_bbox_l1": 5.0,
-            "w_bbox_giou": 2.0,
-            "w_action": 0.0,   # Stage 1: action loss 無効
-            "w_id_cls": 0.0,   # Stage 1: ID loss 無効
-        },
-    })
-    cfg.save_yaml(f"{WORK}/configs/large_stage1.yaml")
-    print(f"Saved: {WORK}/configs/large_stage1.yaml")
-
-
-def make_stage2_config():
-    cfg = get_variant_config("large", stage=2, overrides={
-        "data": {
-            "train_root": f"{WORK}/data/stage2/train",
-            "val_root": f"{WORK}/data/stage2/val",
-            "batch_size": 8,
-            "num_workers": 8,
-            "image_size": [640, 640],
-            "window_size": 16,
-            "window_stride": 8,
-            "augment_train": True,
-            "pin_memory": True,
-            "persistent_workers": True,
-            "prefetch_factor": 4,
-        },
-        "train": {
-            "stage": 2,
-            "max_epochs": 15,
-            "early_stopping_patience": 8,
-            "use_amp": True,
-            "output_dir": f"{WORK}/outputs/large/stage2",
-            "log_interval": 50,
-            "val_interval": 1,
-            "save_best": True,
-            "save_last": True,
-        },
-        "optimizer": {
-            "optimizer": "adamw",
-            "lr": 1e-4,
-            "backbone_lr_factor": 0.0,   # detector は freeze_module() で制御
-            "weight_decay": 1e-4,
-            "grad_clip_norm": 0.1,
-        },
-        "scheduler": {
-            "scheduler": "cosine",
-            "warmup_epochs": 2,
-            "total_epochs": 15,
-            "eta_min": 1e-6,
-        },
-        "model": {
-            "training_stage": 2,
-            "detector": {
-                "head": {
-                    "num_classes": 1,    # Stage 2: 行動学習なので汎用1クラスでよい
-                    "num_queries": 100,
-                },
-            },
-            "action_head": {
-                "num_actions": 140,      # Animal Kingdom の全行動クラス数 (実際に合わせること)
-            },
-            "id_head": {"max_ids": 50},
-        },
-        "loss": {
-            "w_class": 0.0,     # Stage 2: detection loss 無効
-            "w_bbox_l1": 0.0,
-            "w_bbox_giou": 0.0,
-            "w_action": 1.0,
-            "w_id_cls": 0.0,
-        },
-    })
-    cfg.save_yaml(f"{WORK}/configs/large_stage2.yaml")
-    print(f"Saved: {WORK}/configs/large_stage2.yaml")
-
-
-def make_stage3_config():
-    cfg = get_variant_config("large", stage=3, overrides={
-        "data": {
-            "train_root": f"{WORK}/data/stage3/train",
-            "val_root": f"{WORK}/data/stage3/val",
-            "batch_size": 8,
-            "num_workers": 8,
-            "image_size": [640, 640],
-            "window_size": 16,
-            "window_stride": 8,
-            "augment_train": True,
-            "pin_memory": True,
-            "persistent_workers": True,
-            "prefetch_factor": 4,
-        },
-        "train": {
-            "stage": 3,
-            "max_epochs": 30,
-            "early_stopping_patience": 15,
-            "use_amp": True,
-            "output_dir": f"{WORK}/outputs/large/stage3",
-            "log_interval": 50,
-            "val_interval": 1,
-            "save_best": True,
-            "save_last": True,
-        },
-        "optimizer": {
-            "optimizer": "adamw",
-            "lr": 1e-4,
-            "weight_decay": 1e-4,
-            "grad_clip_norm": 0.1,
-        },
-        "scheduler": {
-            "scheduler": "cosine",
-            "warmup_epochs": 3,
-            "total_epochs": 30,
-            "eta_min": 1e-6,
-        },
-        "model": {
-            "training_stage": 3,
-            "detector": {
-                "head": {"num_classes": 1, "num_queries": 100},
-            },
-            "action_head": {"num_actions": 5},
-            "id_head": {
-                "max_ids": 100,
-                "use_metric_loss": True,
-                "metric_loss_margin": 0.3,
-                "memory_ttl": 30,
-            },
-        },
-        "loss": {
-            "w_class": 0.0,
-            "w_bbox_l1": 0.0,
-            "w_bbox_giou": 0.0,
-            "w_action": 0.0,
-            "w_id_cls": 1.0,
-            "w_id_metric": 0.5,
-        },
-    })
-    cfg.save_yaml(f"{WORK}/configs/large_stage3.yaml")
-    print(f"Saved: {WORK}/configs/large_stage3.yaml")
-
-
-def make_stage4_config():
-    cfg = get_variant_config("large", stage=4, overrides={
-        "data": {
-            "train_root": f"{WORK}/data/stage4/train",
-            "val_root": f"{WORK}/data/stage4/val",
-            "batch_size": 4,
-            "num_workers": 8,
-            "image_size": [640, 640],
-            "window_size": 16,
-            "window_stride": 8,
-            "augment_train": True,
-            "pin_memory": True,
-            "persistent_workers": True,
-            "prefetch_factor": 4,
-        },
-        "train": {
-            "stage": 4,
-            "max_epochs": 20,
-            "early_stopping_patience": 10,
-            "use_amp": True,
-            "output_dir": f"{WORK}/outputs/large/stage4",
-            "log_interval": 50,
-            "val_interval": 1,
-            "save_best": True,
-            "save_last": True,
-        },
-        "optimizer": {
-            "optimizer": "adamw",
-            "lr": 1e-5,           # 全モジュール fine-tune: 小さい lr
-            "backbone_lr_factor": 0.1,
-            "weight_decay": 1e-4,
-            "grad_clip_norm": 0.1,
-        },
-        "scheduler": {
-            "scheduler": "cosine",
-            "warmup_epochs": 2,
-            "total_epochs": 20,
-            "eta_min": 1e-7,
-        },
-        "model": {
-            "training_stage": 4,
-            "detector": {
-                "head": {"num_classes": 1, "num_queries": 100},
-            },
-            "action_head": {"num_actions": 4},  # CalMS21 の4クラス
-            "id_head": {
-                "max_ids": 50,
-                "use_metric_loss": True,
-                "use_action_summary": True,
-                "memory_ttl": 30,
-            },
-        },
-        "loss": {
-            "w_class": 1.0,
-            "w_bbox_l1": 2.0,
-            "w_bbox_giou": 1.0,
-            "w_action": 1.0,
-            "w_id_cls": 1.0,
-            "w_id_metric": 0.5,
-            "w_temporal_smooth": 0.1,
-        },
-    })
-    cfg.save_yaml(f"{WORK}/configs/large_stage4.yaml")
-    print(f"Saved: {WORK}/configs/large_stage4.yaml")
-
-
-if __name__ == "__main__":
-    import pathlib
-    pathlib.Path(f"{WORK}/configs").mkdir(parents=True, exist_ok=True)
-    make_stage1_config()
-    make_stage2_config()
-    make_stage3_config()
-    make_stage4_config()
-    print("All configs generated.")
-```
+> **Config 生成前の確認事項**:
+> 1. `src/htrtdetr/config/config.py` の `_YOAKE_TRYAL` を自分の環境パスに変更する
+> 2. `scripts/train_stage2.py` の `_YOAKE_TRYAL` も同様に変更する
+> 3. `setup_pretrain_configs.py` の `WORK` 変数を自分のパスに変更する
+>
+> **`validate_config` / `clamp_temporal_branches` について**:
+> - `validate_config(cfg)` — config の整合性チェック（dimension の一致、window_size の妥当性など）。学習スクリプト起動前に呼び出すと設定ミスを早期発見できる
+> - `clamp_temporal_branches(cfg)` — `data.window_size` が small のとき `temporal.long_branch.num_frames` を自動クリップする。`validate_config` 前に呼ぶ
+> ```python
+> from htrtdetr.config import get_variant_config, validate_config, clamp_temporal_branches
+> cfg = get_variant_config("large", stage=2)
+> clamp_temporal_branches(cfg)   # window_size < 16 の場合に必要
+> validate_config(cfg)           # エラーがあれば ConfigValidationError
+> ```
 
 ```powershell
-# Config ファイルを生成する
-cd C:/Users/hayam/YOAKE
+cd C:/Users/utopi/YOAKE
 python setup_pretrain_configs.py
 ```
 
@@ -1349,13 +444,13 @@ cfg.model.detector.head.num_queries = 300   # large input → queries を増や�
 ##### (c) 実行コマンド
 
 ```powershell
-cd C:/Users/hayam/YOAKE
+cd C:/Users/utopi/YOAKE
 
 python scripts/train_stage1.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml `
-    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json `
-    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/val/annotations.json `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage1.yaml `
+    train_anno=C:/Users/utopi/YOAKE_pre-train/data/stage1/train/annotations.json `
+    val_anno=C:/Users/utopi/YOAKE_pre-train/data/stage1/val/annotations.json `
+    root=C:/Users/utopi/YOAKE_pre-train
 ```
 
 > **VRAM OOM 時**: `data.batch_size=24` または `data.batch_size=16` に下げてリトライ
@@ -1394,7 +489,7 @@ python scripts/train_stage1.py `
 | **データ** | Animal Kingdom + CalMS21 |
 | **評価指標** | val_loss (低いほど良い) → `stage2_best.pth` |
 
-> **注**: Stage 2 スクリプトは `optimizer_cfg` を Trainer に渡さないため、lr は `OptimizerConfig()` デフォルトの `1e-4` が使われる。
+> **注**: Stage 2 スクリプトは `clamp_temporal_branches(cfg)` を自動実行するため、`window_size` が `long_branch.num_frames` より小さい場合でも `validate_config` エラーにならない。
 
 ##### (b) RTX 8000 最適化パラメーター
 
@@ -1410,22 +505,24 @@ cfg.train.max_epochs = 15
 ##### (c) 実行コマンド
 
 ```powershell
-cd C:/Users/hayam/YOAKE
+cd C:/Users/utopi/YOAKE
 
 python scripts/train_stage2.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage2.yaml `
+    root=C:/Users/utopi/YOAKE_pre-train
 ```
 
-> Stage 2 スクリプトは `f"{root}/outputs/large/stage1/stage1_best.pth"` を自動探索する。
-> **注**: デフォルト探索パスは `{root}/outputs/stage1/stage1_best.pth` のため、Stage 1 の出力先と合わせること。
-> または `train.resume` で直接指定:
+> Stage 2 スクリプトは `_find_checkpoint()` で以下の順に自動探索する:
+> 1. `{root}/outputs/*/stage1/stage1_best.pth` (バリアント別: large / medium / small)
+> 2. `{root}/outputs/stage1/stage1_best.pth` (フラット構造・旧形式)
+>
+> 複数候補がある場合は最終更新日時が最新のものを使用する。見つからない場合やパスを明示したい場合は `train.resume` で直接指定:
 
 ```powershell
 python scripts/train_stage2.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal `
-    train.resume=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/large/stage1/stage1_best.pth
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage2.yaml `
+    root=C:/Users/utopi/YOAKE_pre-train `
+    train.resume=C:/Users/utopi/YOAKE_pre-train/outputs/large/stage1/stage1_best.pth
 ```
 
 ##### (d) 期待される loss 推移
@@ -1475,14 +572,19 @@ cfg.model.id_head.memory_ttl = 30
 ##### (c) 実行コマンド
 
 ```powershell
-cd C:/Users/hayam/YOAKE
+cd C:/Users/utopi/YOAKE
 
 python scripts/train_stage3.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage3.yaml `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage3.yaml `
+    root=C:/Users/utopi/YOAKE_pre-train
 ```
 
-> Stage 3 スクリプトは `stage2_best.pth` → `stage1_best.pth` の順でフォールバック探索する。
+> Stage 3 スクリプトの `_find_checkpoint()` は以下の順で自動探索する:
+> 1. `{root}/outputs/*/stage2/stage2_best.pth` (バリアント別優先)
+> 2. `{root}/outputs/stage2/stage2_best.pth` (フラット構造)
+> 3. 上記で見つからない場合は同じロジックで stage1 を探索
+>
+> パスを明示したい場合は `train.resume=<path>` を指定する。
 
 ##### (d) 期待される loss 推移
 
@@ -1530,14 +632,18 @@ cfg.optimizer.backbone_lr_factor = 0.1  # backbone: 1e-6
 ##### (c) 実行コマンド
 
 ```powershell
-cd C:/Users/hayam/YOAKE
+cd C:/Users/utopi/YOAKE
 
 python scripts/train_stage4.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4.yaml `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage4.yaml `
+    root=C:/Users/utopi/YOAKE_pre-train
 ```
 
-> Stage 4 スクリプトは `stage3_best.pth` → `stage2_best.pth` → `stage1_best.pth` の順で探索する。
+> Stage 4 スクリプトの `_find_checkpoint()` は stage3 → stage2 → stage1 の順でフォールバック探索する。各 stage で:
+> 1. `{root}/outputs/*/stage{N}/stage{N}_best.pth` (バリアント別優先)
+> 2. `{root}/outputs/stage{N}/stage{N}_best.pth` (フラット構造)
+>
+> パスを明示したい場合は `train.resume=<path>` を指定する。
 
 ##### (d) 期待される loss 推移
 
@@ -1559,96 +665,10 @@ python scripts/train_stage4.py `
 
 各ステージのスクリプトは `load_model_weights(path, model, strict=False)` で自動的に重みをロードする。以下は手動で重みを引き継ぐ場合のコード:
 
-```python
-# weight_transfer.py
+```powershell
 # Stage N の checkpoint から Stage N+1 モデルに重みを転送する
-# 実行例: python weight_transfer.py --src stage3_best.pth --dst stage4_init.pth
-
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-
-import argparse
-import torch
-from pathlib import Path
-
-from htrtdetr.config.config import get_variant_config
-from htrtdetr.models import build_model
-
-WORK = "C:/Users/hayam/Desktop/YOAKE_tryal"
-
-
-def transfer_weights(src_path: str, dst_stage: int, dst_path: str) -> None:
-    """
-    src_path の checkpoint を dst_stage のモデルにロードし、dst_path に保存する。
-
-    引き継ぐレイヤー / 初期化するレイヤー:
-      Stage 1 → Stage 2: detector (引き継ぎ), temporal/action head (新規初期化)
-      Stage 2 → Stage 3: detector + temporal (引き継ぎ), id_head (新規初期化)
-      Stage 3 → Stage 4: 全モジュール (引き継ぎ)
-    """
-    # 転送先モデルを作成
-    cfg = get_variant_config("large", stage=dst_stage)
-    model = build_model(cfg.model)
-
-    # 転送元 checkpoint を読み込む
-    ckpt = torch.load(src_path, map_location="cpu")
-    src_state = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-
-    # strict=False: 形状が一致しないキーはスキップ
-    missing, unexpected = model.load_state_dict(src_state, strict=False)
-    print(f"Missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing) > 5 else ''}")
-    print(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
-
-    # 保存
-    Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "stage": dst_stage,
-        "source": src_path,
-    }, dst_path)
-    print(f"Saved: {dst_path}")
-
-
-def show_transferable_keys(src_path: str, dst_stage: int) -> None:
-    """転送可能なキーと初期化されるキーを表示する"""
-    cfg = get_variant_config("large", stage=dst_stage)
-    model = build_model(cfg.model)
-
-    ckpt = torch.load(src_path, map_location="cpu")
-    src_state = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-
-    dst_keys = set(model.state_dict().keys())
-    src_keys = set(src_state.keys())
-
-    transferable = dst_keys & src_keys
-    new_keys = dst_keys - src_keys
-    removed_keys = src_keys - dst_keys
-
-    # モジュール別に集計
-    modules = ["detector", "temporal", "id_head", "action_head", "interaction",
-               "query_temporal_fusion", "det_adapter", "feature_router",
-               "geo_projector", "geo_action_adapter", "geo_id_adapter"]
-
-    print("\n=== Weight Transfer Summary ===")
-    for mod in modules:
-        t = [k for k in transferable if k.startswith(mod)]
-        n = [k for k in new_keys if k.startswith(mod)]
-        print(f"  {mod:30s}: {len(t):4d} transferred, {len(n):4d} re-initialized")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--src", required=True, help="Source checkpoint path")
-    parser.add_argument("--dst_stage", type=int, required=True, help="Destination stage (1-4)")
-    parser.add_argument("--dst", required=True, help="Destination checkpoint path")
-    parser.add_argument("--show_keys", action="store_true")
-    args = parser.parse_args()
-
-    if args.show_keys:
-        show_transferable_keys(args.src, args.dst_stage)
-    else:
-        transfer_weights(args.src, args.dst_stage, args.dst)
+cd C:/Users/utopi/YOAKE
+python weight_transfer.py --src C:/Users/utopi/YOAKE_pre-train/outputs/large/stage3/stage3_best.pth --dst_stage 4 --dst C:/Users/utopi/YOAKE_pre-train/outputs/large/stage4/stage4_init.pth
 ```
 
 **Stage 間転送の要点**:
@@ -1667,50 +687,9 @@ if __name__ == "__main__":
 
 #### 6-1. Config 設定
 
-```python
-# multi_species_pretrain_config.py
-import sys
-sys.path.insert(0, "C:/Users/hayam/YOAKE/src")
-
-from htrtdetr.config.config import get_variant_config
-
-WORK = "C:/Users/hayam/Desktop/YOAKE_tryal"
-N_SPECIES = 3  # 例: ショウジョウバエ / マウス / 魚 の3種混在
-
-cfg = get_variant_config("large", stage=4, overrides={
-    "model": {
-        "training_stage": 4,
-        "detector": {
-            "head": {
-                "num_classes": N_SPECIES,   # 種ごとにクラスを分ける
-                "num_queries": 300,
-            }
-        },
-        "id_head": {
-            "max_ids": 100,
-            "use_species_separated_pools": True,
-            "num_species": N_SPECIES,       # num_classes と一致させること
-            "use_metric_loss": True,
-        },
-        "action_head": {
-            "num_actions": 5,
-        },
-    },
-    "data": {
-        "batch_size": 4,
-        "window_size": 16,
-        "num_workers": 8,
-    },
-    "train": {
-        "stage": 4,
-        "use_amp": True,
-        "max_epochs": 20,
-        "output_dir": f"{WORK}/outputs/large/stage4_multispecies",
-    },
-})
-
-cfg.save_yaml(f"{WORK}/configs/large_stage4_multispecies.yaml")
-print("Saved multi-species config.")
+```powershell
+cd C:/Users/utopi/YOAKE
+python multi_species_pretrain_config.py
 ```
 
 #### 6-2. Pre-training 戦略
@@ -1720,15 +699,15 @@ print("Saved multi-species config.")
 ```powershell
 # Stage 1: COCO + AP-10K (多クラス) → num_classes を種数に合わせて学習
 python scripts/train_stage1.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml `
-    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json `
-    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/val/annotations.json `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage1.yaml `
+    train_anno=C:/Users/utopi/YOAKE_pre-train/data/stage1/train/annotations.json `
+    val_anno=C:/Users/utopi/YOAKE_pre-train/data/stage1/val/annotations.json `
+    root=C:/Users/utopi/YOAKE_pre-train
 
 # Stage 4: 種分離プール有効
 python scripts/train_stage4.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4_multispecies.yaml `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage4_multispecies.yaml `
+    root=C:/Users/utopi/YOAKE_pre-train
 ```
 
 > **重要**: `use_species_separated_pools=True` は**推論時のみ**動作する (`forward_inference`)。学習時 (`forward_train`) には影響しない。学習時の種分離は `num_classes=N_SPECIES` の分類ヘッドが担う。
@@ -1764,13 +743,13 @@ python scripts/train_stage4.py `
 #### 8-2. 種固有 Fine-tune コマンド
 
 ```powershell
-$WORK = "C:/Users/hayam/Desktop/YOAKE_tryal"
+$WORK = "C:/Users/utopi/YOAKE_pre-train"
 
 # --- Step 1: 種固有データを YOAKE 形式に変換 ---
 # (上記の変換スクリプトを使用)
 
 # --- Step 2: 検出 fine-tune (Stage 1) ---
-python C:/Users/hayam/YOAKE/scripts/train_stage1.py `
+python C:/Users/utopi/YOAKE/scripts/train_stage1.py `
     train_anno="$WORK/data/species/train/annotations.json" `
     val_anno="$WORK/data/species/val/annotations.json" `
     root="$WORK" `
@@ -1784,7 +763,7 @@ python C:/Users/hayam/YOAKE/scripts/train_stage1.py `
     optimizer.backbone_lr_factor=0.01
 
 # --- Step 3: 行動 fine-tune (Stage 2) ---
-python C:/Users/hayam/YOAKE/scripts/train_stage2.py `
+python C:/Users/utopi/YOAKE/scripts/train_stage2.py `
     root="$WORK" `
     train.max_epochs=30 `
     train.use_amp=true `
@@ -1792,7 +771,7 @@ python C:/Users/hayam/YOAKE/scripts/train_stage2.py `
     data.window_size=16
 
 # --- Step 4: 追跡 fine-tune (Stage 3) ---
-python C:/Users/hayam/YOAKE/scripts/train_stage3.py `
+python C:/Users/utopi/YOAKE/scripts/train_stage3.py `
     root="$WORK" `
     train.max_epochs=30 `
     train.use_amp=true `
@@ -1800,7 +779,7 @@ python C:/Users/hayam/YOAKE/scripts/train_stage3.py `
     data.window_size=16
 
 # --- Step 5: 統合 fine-tune (Stage 4) ---
-python C:/Users/hayam/YOAKE/scripts/train_stage4.py `
+python C:/Users/utopi/YOAKE/scripts/train_stage4.py `
     root="$WORK" `
     train.max_epochs=20 `
     train.use_amp=true `
@@ -1821,28 +800,37 @@ nvidia-smi
 # 対処: batch_size を半減
 # Stage 1: 32 → 16 → 8
 python scripts/train_stage1.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml `
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage1.yaml `
     train_anno=... val_anno=... `
     data.batch_size=16
 
 # Stage 2/3: 8 → 4
 python scripts/train_stage2.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal `
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage2.yaml `
+    root=C:/Users/utopi/YOAKE_pre-train `
     data.batch_size=4
 
 # Stage 4: 4 → 2 + window_size を小さく
 python scripts/train_stage4.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage4.yaml `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal `
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage4.yaml `
+    root=C:/Users/utopi/YOAKE_pre-train `
     data.batch_size=2 `
     data.window_size=8
 ```
 
-> window_size を小さくする場合は config.py の `validate_config()` のチェックに注意:
-> `model.temporal.{short,mid,long}_branch.num_frames <= data.window_size` を満たすこと。
-> large 設定では `long_branch.num_frames=16` なので `window_size` は 16 以上が必要。
-> OOM で window_size=8 にする場合は `model.temporal.long_branch.num_frames=8` も合わせて下げること。
+> window_size を小さくする場合は `model.temporal.{short,mid,long}_branch.num_frames <= data.window_size` を満たすこと。large 設定では `long_branch.num_frames=16` なので `window_size` は 16 以上が必要。
+
+> OOM で `window_size=8` にする場合は **`clamp_temporal_branches(cfg)`** を使うと branch の `num_frames` を自動的に `window_size` に合わせてクリップできる:
+>
+> ```python
+> from htrtdetr.config import get_variant_config, clamp_temporal_branches, validate_config
+> cfg = get_variant_config("large", stage=2)
+> cfg = cfg.merge({"data": {"window_size": 8}})
+> clamp_temporal_branches(cfg)   # long_branch.num_frames が 8 に自動修正される
+> validate_config(cfg)           # エラーなし
+> ```
+>
+> 手動で下げる場合は YAML の `model.temporal.long_branch.num_frames: 8` を指定する。
 
 #### 9-2. Loss 発散 (NaN / Inf)
 
@@ -1852,7 +840,7 @@ python scripts/train_stage4.py `
 
 # 対処2: learning rate を 1/10 に下げる
 python scripts/train_stage1.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage1.yaml `
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage1.yaml `
     train_anno=... val_anno=... `
     optimizer.lr=1e-5
 
@@ -1866,11 +854,11 @@ python scripts/train_stage1.py `
 
 ```python
 import sys
-sys.path.insert(0, "C:/Users/hayam/YOAKE/src")
+sys.path.insert(0, "C:/Users/utopi/YOAKE/src")
 from htrtdetr.data import SingleFrameDataset, load_annotations
 
 videos, _, _ = load_annotations(
-    "C:/Users/hayam/Desktop/YOAKE_tryal/data/stage1/train/annotations.json"
+    "C:/Users/utopi/YOAKE_pre-train/data/stage1/train/annotations.json"
 )
 ds = SingleFrameDataset(videos[:10], image_size=(640, 640))
 sample = ds[0]
@@ -1885,7 +873,7 @@ print("Labels:", sample["labels"][:3])
 
 ```python
 import json
-with open("C:/Users/hayam/Desktop/YOAKE_tryal/data/stage2/train/annotations.json") as f:
+with open("C:/Users/utopi/YOAKE_pre-train/data/stage2/train/annotations.json") as f:
     data = json.load(f)
 
 # action_id が -1 以外のフレームがあるか確認
@@ -1911,20 +899,19 @@ print(f"Annotated objects in first 10 videos: {annotated}")
 
 #### 9-6. Stage 間のパス不一致エラー
 
-Stage 2/3/4 スクリプトは **`root` 変数から探索パスを構築**する。本ドキュメントでは `large` バリアント用に `outputs/large/stage{N}/` に出力しているが、スクリプトデフォルトは `outputs/stage{N}/` を探索する:
+Stage 2/3/4 スクリプトは `_find_checkpoint()` で以下の順に自動探索する:
+1. `{root}/outputs/*/stage{N}/stage{N}_best.pth` (バリアント別: large / medium / small)
+2. `{root}/outputs/stage{N}/stage{N}_best.pth` (フラット構造・旧形式)
 
-```python
-# train_stage2.py の探索パス (スクリプト内固定)
-stage1_path = f"{root}/outputs/stage1/stage1_best.pth"
-```
+`large` バリアント用に `outputs/large/stage{N}/` に出力した場合はバリアント別パス (1) が自動検出される。複数のバリアントが同時に存在する場合は最終更新日時が最新のものが使われる。
 
-**対処**: `train.resume` で直接パスを指定する:
+チェックポイントが見つからない場合やパスを明示したい場合は `train.resume` で指定する:
 
 ```powershell
 python scripts/train_stage2.py `
-    C:/Users/hayam/Desktop/YOAKE_tryal/configs/large_stage2.yaml `
-    root=C:/Users/hayam/Desktop/YOAKE_tryal `
-    train.resume=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/large/stage1/stage1_best.pth
+    C:/Users/utopi/YOAKE_pre-train/configs/large_stage2.yaml `
+    root=C:/Users/utopi/YOAKE_pre-train `
+    train.resume=C:/Users/utopi/YOAKE_pre-train/outputs/large/stage1/stage1_best.pth
 ```
 
 ---
@@ -1947,3 +934,35 @@ python scripts/train_stage2.py `
 | `model.id_head.use_metric_loss` | False | False | **True** | **True** |
 | `loss.w_action` | 1.0 | **0.0** | **1.0/0.0** | 1.0 |
 | `loss.w_id_cls` | 1.0 | **0.0** | **0.0/1.0** | 1.0 |
+
+---
+
+## 付録: API クイックリファレンス
+
+```python
+from htrtdetr.config import (
+    get_variant_config,      # バリアント × ステージの設定を取得
+    build_model_config,      # バリアントの ModelConfig のみ取得
+    validate_config,         # 設定の整合性チェック (エラー時 ConfigValidationError)
+    clamp_temporal_branches, # window_size に合わせて temporal branch を自動クリップ
+    HTRTDETRConfig,          # トップレベル設定クラス (yaml 入出力対応)
+)
+
+# 典型的な使用フロー
+cfg = get_variant_config("large", stage=2, overrides={"data": {"batch_size": 4}})
+clamp_temporal_branches(cfg)  # OOM で window_size を小さくした場合に必要
+validate_config(cfg)          # 問題なければ何もしない
+cfg.save_yaml("configs/my_stage2.yaml")
+
+# YAML から再ロード
+cfg2 = HTRTDETRConfig.from_yaml("configs/my_stage2.yaml")
+```
+
+| 関数 | 用途 |
+|---|---|
+| `get_variant_config(variant, stage)` | `"small"/"medium"/"large"` × Stage 1-4 の完全な設定を返す |
+| `build_model_config(variant)` | `ModelConfig` だけ取得したい場合 |
+| `validate_config(cfg)` | 学習前の整合性検証。エラーがあれば `ConfigValidationError` |
+| `clamp_temporal_branches(cfg)` | `window_size < long_branch.num_frames` のとき必須。`validate_config` 前に呼ぶ |
+| `cfg.merge(overrides)` | dict で部分上書きした新しい config を返す (immutable) |
+| `cfg.save_yaml(path)` / `from_yaml(path)` | YAML ファイルとの相互変換 |
