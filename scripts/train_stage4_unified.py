@@ -37,7 +37,7 @@ from htrtdetr.data.annotation import load_annotation
 from htrtdetr.training.stage_trainers import Stage4Trainer
 from htrtdetr.utils.misc import set_seed
 
-_YOAKE_TRYAL = "C:/Users/utopi/Desktop/YOAKE_tryal"
+_YOAKE_TRYAL = str(Path(__file__).resolve().parent.parent)
 
 
 def parse_overrides(argv) -> dict:

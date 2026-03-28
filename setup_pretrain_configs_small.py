@@ -1,15 +1,17 @@
 # setup_pretrain_configs_small.py
 # yoake-small (ResNet-18 backbone, feature_dim=128) 用の設定ファイルを生成する
-# 実行: python C:/Users/utopi/YOAKE/setup_pretrain_configs_small.py
-# 生成先: C:/Users/utopi/YOAKE_small_pretrain/configs/
+# 実行: python setup_pretrain_configs_small.py
+# 生成先: <リポジトリの隣>/YOAKE_small_pretrain/configs/
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from htrtdetr.config.config import get_variant_config
 
-WORK = "C:/Users/utopi/YOAKE_small_pretrain"  # ← 自分の環境に合わせて変更
+# デフォルトはリポジトリの隣のディレクトリ。環境に合わせて変更可。
+WORK = str(Path(__file__).resolve().parent.parent / "YOAKE_small_pretrain")
 VARIANT = "small"                          # ResNet-18, feature_dim=128, ~15-20M params
 
 

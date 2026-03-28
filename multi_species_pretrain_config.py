@@ -1,10 +1,12 @@
 # multi_species_pretrain_config.py
 import sys
-sys.path.insert(0, "C:/Users/utopi/YOAKE/src")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from htrtdetr.config.config import get_variant_config
 
-WORK = "C:/Users/utopi/YOAKE_pre-train"
+# デフォルトはリポジトリの隣のディレクトリ。環境に合わせて変更可。
+WORK = str(Path(__file__).resolve().parent.parent / "YOAKE_pre-train")
 N_SPECIES = 3  # 例: ショウジョウバエ / マウス / 魚 の3種混在
 
 cfg = get_variant_config("large", stage=4, overrides={

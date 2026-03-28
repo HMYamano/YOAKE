@@ -348,13 +348,14 @@ class SimpleTrackingEvaluator:
         self._idfp = 0
         self._idfn = 0
         self._idsw = 0
-        self._prev_pred_for_gt: Dict[int, int] = {}
+        self._prev_pred_for_gt: Dict[Any, int] = {}
 
     def update(
         self,
         pred_ids: List[int],
         gt_ids: List[int],
         matched_mask: Optional[List[bool]] = None,
+        sequence_key: Optional[Any] = None,
     ) -> None:
         if matched_mask is None:
             pairs = list(zip(pred_ids, gt_ids))
@@ -372,10 +373,11 @@ class SimpleTrackingEvaluator:
             else:
                 mismatched_pairs += 1
 
-            prev_pred = self._prev_pred_for_gt.get(gt_id)
+            scoped_gt_id = (sequence_key, gt_id) if sequence_key is not None else gt_id
+            prev_pred = self._prev_pred_for_gt.get(scoped_gt_id)
             if prev_pred is not None and prev_pred != pred_id:
                 self._idsw += 1
-            self._prev_pred_for_gt[gt_id] = pred_id
+            self._prev_pred_for_gt[scoped_gt_id] = pred_id
 
         self._idfp += unmatched_pred_count + mismatched_pairs
         self._idfn += unmatched_gt_count + mismatched_pairs

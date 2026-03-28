@@ -84,7 +84,7 @@ def load_checkpoint(
     """checkpoint を読み込む。欠損 key は無視して部分 load も可能。"""
     if not Path(path).exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    ckpt = torch.load(path, map_location=map_location, weights_only=True)
     missing, unexpected = model.load_state_dict(
         ckpt["model_state"], strict=strict
     )
@@ -104,9 +104,9 @@ def load_model_weights(
     model: nn.Module,
     strict: bool = False,
     prefix_to_remove: str = "",
-) -> None:
+) -> Tuple[List[str], List[str]]:
     """model weights のみを読み込む (optimizer 等は無視)"""
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     state = ckpt.get("model_state", ckpt)  # state dict が直接の場合にも対応
     if prefix_to_remove:
         state = {
@@ -114,7 +114,12 @@ def load_model_weights(
             for k, v in state.items()
             if k.startswith(prefix_to_remove)
         }
-    model.load_state_dict(state, strict=strict)
+    missing, unexpected = model.load_state_dict(state, strict=strict)
+    if missing:
+        print(f"[WARN] Missing keys: {missing}")
+    if unexpected:
+        print(f"[WARN] Unexpected keys: {unexpected}")
+    return list(missing), list(unexpected)
 
 
 # ---------------------------------------------------------------------------
@@ -122,18 +127,20 @@ def load_model_weights(
 # ---------------------------------------------------------------------------
 
 def xyxy_to_cxcywh(boxes: torch.Tensor) -> torch.Tensor:
-    """[x1, y1, x2, y2] → [cx, cy, w, h]"""
+    """[x1, y1, x2, y2] → [cx, cy, w, h]  (w, h は 0 以上に clamp)"""
     x1, y1, x2, y2 = boxes.unbind(-1)
     cx = (x1 + x2) / 2
     cy = (y1 + y2) / 2
-    w = x2 - x1
-    h = y2 - y1
+    w = (x2 - x1).clamp(min=0)
+    h = (y2 - y1).clamp(min=0)
     return torch.stack([cx, cy, w, h], dim=-1)
 
 
 def cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
-    """[cx, cy, w, h] → [x1, y1, x2, y2]"""
+    """[cx, cy, w, h] → [x1, y1, x2, y2]  (w, h は 0 以上に clamp)"""
     cx, cy, w, h = boxes.unbind(-1)
+    w = w.clamp(min=0)
+    h = h.clamp(min=0)
     x1 = cx - w / 2
     y1 = cy - h / 2
     x2 = cx + w / 2

@@ -94,6 +94,34 @@ def find_checkpoint(root: str, stage: int) -> str:
     return str(candidates[0]) if candidates else ""
 
 
+def _load_checkpoint_payload(path: str) -> Dict[str, Any]:
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(payload, dict):
+        return payload
+    return {"model_state": payload}
+
+
+def load_runtime_config_from_checkpoint(path: str):
+    from .config.config import HTRTDETRConfig
+
+    payload = _load_checkpoint_payload(path)
+    extra = payload.get("extra", {})
+    if not isinstance(extra, dict):
+        return None
+
+    cfg_dict = extra.get("config")
+    if isinstance(cfg_dict, dict):
+        return HTRTDETRConfig.from_dict(cfg_dict)
+
+    model_cfg = extra.get("model_cfg")
+    if isinstance(model_cfg, dict):
+        return HTRTDETRConfig.from_dict({"model": model_cfg})
+
+    return None
+
+
 def _build_dataloaders(cfg, stage: int, use_dummy: bool):
     from torch.utils.data import DataLoader
 
@@ -305,6 +333,7 @@ def run_train(stage: int, argv: list) -> None:
         scheduler_cfg=cfg.scheduler,
         use_dummy=use_dummy,
         metrics_cfg=getattr(cfg, "metrics", None),
+        full_cfg=cfg,
     )
     trainer.train()
 
@@ -323,7 +352,7 @@ def run_val(stage: int, argv: list) -> None:
 
 
 def run_predict(argv: list) -> None:
-    _, overrides = parse_argv(argv)
+    config_path, overrides = parse_argv(argv)
     source = str(overrides.get("source", ""))
     weights = str(overrides.get("weights", ""))
     if not source:
@@ -338,26 +367,51 @@ def run_predict(argv: list) -> None:
     from .models import build_model
     from .utils.misc import load_model_weights
 
-    cfg = HTRTDETRConfig()
+    restored_from_checkpoint = None
+    if config_path:
+        cfg = HTRTDETRConfig.from_yaml(config_path)
+    else:
+        restored_from_checkpoint = load_runtime_config_from_checkpoint(weights)
+        cfg = restored_from_checkpoint if restored_from_checkpoint is not None else HTRTDETRConfig()
+    if overrides:
+        cfg = cfg.merge(overrides)
+
     cfg.inference.input_path = source
     cfg.inference.checkpoint = weights
-    output_dir = str(overrides.get("output_dir", "runs/predict"))
+    output_dir = str(overrides.get("output_dir", cfg.inference.output_path))
     cfg.inference.output_path = output_dir
     if "score_threshold" in overrides:
         cfg.model.detector.score_threshold = float(overrides["score_threshold"])
+    cfg.model.detector.backbone.pretrained = False
 
     model = build_model(cfg.model)
     model.set_stage(4)
-    load_model_weights(weights, model, strict=False)
+    strict_load = bool(config_path or restored_from_checkpoint is not None)
+    try:
+        missing, unexpected = load_model_weights(weights, model, strict=strict_load)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint weights do not match the active model configuration. "
+            "Pass config=... or use a checkpoint saved with config metadata."
+        ) from exc
+    if not strict_load and (missing or unexpected):
+        raise RuntimeError(
+            "Checkpoint metadata is missing, and the default predict configuration only "
+            "partially matched the checkpoint. Pass config=... to restore the training setup."
+        )
+
     img_size = (
         (cfg.data.image_size, cfg.data.image_size)
         if isinstance(cfg.data.image_size, int)
         else tuple(cfg.data.image_size)
     )
+    action_names = cfg.eval.action_names
+    if len(action_names) != cfg.model.action_head.num_actions:
+        action_names = [str(i) for i in range(cfg.model.action_head.num_actions)]
     inferencer = Inferencer(
         model=model,
         cfg=cfg.inference,
-        action_names=[str(i) for i in range(cfg.model.action_head.num_actions)],
+        action_names=action_names,
         class_names=[str(i) for i in range(cfg.model.detector.head.num_classes)],
         window_size=int(overrides.get("window_size", cfg.data.window_size)),
     )

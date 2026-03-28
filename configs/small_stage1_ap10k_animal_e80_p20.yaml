@@ -1,0 +1,185 @@
+data:
+  annotation_format: json
+  train_root: C:/Users/utopi/YOAKE_small_pretrain/data/stage1/train
+  val_root: C:/Users/utopi/YOAKE_small_pretrain/data/stage1/val
+  test_root: data/test
+
+  image_size: [640, 640]
+  batch_size: 16
+  num_workers: 4
+  window_size: 1
+  window_stride: 8
+
+  augment_train: true
+  aug_hflip: true
+  aug_vflip: false
+  aug_brightness: 0.2
+  aug_contrast: 0.2
+  aug_saturation: 0.1
+  aug_scale_range: [0.8, 1.2]
+
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+model:
+  training_stage: 1
+
+  detector:
+    backbone:
+      name: resnet18
+      pretrained: true
+      freeze_bn: false
+      out_channels: [128, 256, 512]
+      out_strides: [8, 16, 32]
+
+    fpn:
+      in_channels: [128, 256, 512]
+      out_channels: 128
+      num_levels: 3
+
+    head:
+      hidden_dim: 128
+      num_classes: 1
+      num_decoder_layers: 2
+      num_heads: 4
+      num_queries: 300
+      ffn_dim: 512
+      dropout: 0.1
+
+    cost_class: 2.0
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    score_threshold: 0.3
+    nms_threshold: 0.5
+
+  temporal:
+    feature_dim: 128
+    fusion_method: concat_proj
+    short_branch:
+      num_frames: 3
+      kernel_size: 3
+      dilation: 1
+      use_depthwise: true
+      use_residual: true
+      use_channel_attention: false
+    mid_branch:
+      num_frames: 8
+      kernel_size: 3
+      dilation: 2
+      use_depthwise: true
+      use_residual: true
+      use_channel_attention: false
+    long_branch:
+      num_frames: 16
+      kernel_size: 3
+      dilation: 4
+      use_depthwise: true
+      use_residual: true
+      use_channel_attention: false
+    output_dim: 128
+
+  interaction:
+    feature_dim: 128
+    max_neighbors: 5
+    distance_bins: 16
+    angle_bins: 8
+    output_dim: 32
+
+  action_head:
+    feature_dim: 128
+    temporal_dim: 128
+    interaction_dim: 32
+    hidden_dims: [256, 128]
+    num_actions: 5
+    dropout: 0.1
+    use_interaction: true
+    use_nn_distance: true
+    use_overlap: true
+    use_relative_angle: true
+    use_relative_velocity: true
+
+  id_head:
+    feature_dim: 128
+    embedding_dim: 64
+    memory_dim: 128
+    max_ids: 50
+    memory_ttl: 30
+    new_id_threshold: 0.5
+    metric_loss_margin: 0.3
+    num_species: 1
+    use_action_summary: false
+    use_appearance: true
+    use_geometry: true
+    use_motion: true
+    use_metric_loss: false
+    use_species_separated_pools: false
+
+loss:
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  w_class: 2.0
+  w_bbox_l1: 5.0
+  w_bbox_giou: 2.0
+  w_action: 0.0
+  w_id_cls: 0.0
+  w_id_metric: 0.5
+  w_temporal_smooth: 0.1
+
+optimizer:
+  optimizer: adamw
+  lr: 0.0001
+  backbone_lr_factor: 0.1
+  momentum: 0.9
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+
+scheduler:
+  scheduler: cosine
+  total_epochs: 80
+  warmup_epochs: 3
+  eta_min: 1.0e-06
+  step_size: 30
+  gamma: 0.1
+  milestones: [20, 26]
+
+train:
+  stage: 1
+  seed: 42
+  deterministic: false
+  max_epochs: 80
+  early_stopping_patience: 20
+  log_interval: 50
+  val_interval: 1
+  use_amp: true
+  use_wandb: false
+  wandb_project: ht-rtdetr
+  wandb_run_name: ap10k-small-animal
+  output_dir: C:/Users/utopi/YOAKE_small_pretrain/outputs/small_ap10k_stage1_e80_p20_clean
+  resume: null
+  save_best: true
+  save_last: true
+
+eval:
+  split: val
+  checkpoint: weights/full_model_best.pth
+  output_dir: C:/Users/utopi/YOAKE_small_pretrain/outputs/eval_stage1
+  iou_thresholds: [0.5, 0.75]
+  min_track_length: 5
+  save_predictions: true
+  save_visualizations: false
+  action_names: [idle, walk, groom, interact, other]
+
+inference:
+  input_path: ""
+  output_path: C:/Users/utopi/YOAKE_small_pretrain/outputs/inference
+  checkpoint: weights/full_model_best.pth
+  fps: null
+  show_bbox: true
+  show_id: true
+  show_action: true
+  show_confidence: true
+  bbox_thickness: 2
+  font_scale: 0.5
+  reset_memory_on_scene_change: true
+  scene_change_threshold: 0.5

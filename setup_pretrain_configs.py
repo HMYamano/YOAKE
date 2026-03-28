@@ -1,14 +1,16 @@
 # setup_pretrain_configs.py  ← リポジトリには含まれていない。以下の内容をコピーして作成すること。
-# 実行: python C:/Users/utopi/YOAKE/setup_pretrain_configs.py
-# 生成先: C:/Users/utopi/YOAKE_pre-train/configs/
+# 実行: python setup_pretrain_configs.py
+# 生成先: <リポジトリの隣>/YOAKE_pre-train/configs/
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from htrtdetr.config.config import get_variant_config
 
-WORK = "C:/Users/utopi/YOAKE_pre-train"  # ← 自分の環境に合わせて変更
+# デフォルトはリポジトリの隣のディレクトリ。環境に合わせて変更可。
+WORK = str(Path(__file__).resolve().parent.parent / "YOAKE_pre-train")
 
 
 def make_stage1_config():

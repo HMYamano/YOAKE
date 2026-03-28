@@ -65,12 +65,14 @@ class Trainer:
         scheduler_cfg=None,
         use_dummy: bool = False,
         metrics_cfg=None,
+        full_cfg: Optional[Any] = None,
     ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.cfg = train_cfg
         self.use_dummy = use_dummy
+        self.full_cfg = full_cfg
 
         # デバイス
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -180,10 +182,25 @@ class Trainer:
         self._higher_is_better = _hib
         self._best_metric_name = _mn
         self.no_improve_count = 0
+        self._last_act_eval: Optional[Dict[str, Any]] = None
+        self._last_trk_eval: Optional[Dict[str, Any]] = None
 
         # resume
         if train_cfg.resume:
             self._resume(train_cfg.resume)
+
+    def _checkpoint_extra(self) -> Dict[str, Any]:
+        import dataclasses
+
+        extra: Dict[str, Any] = {}
+        if self.ema is not None:
+            extra["ema_state"] = self.ema.state_dict()
+        model_cfg = getattr(self.model, "cfg", None)
+        if dataclasses.is_dataclass(model_cfg):
+            extra["model_cfg"] = dataclasses.asdict(model_cfg)
+        if self.full_cfg is not None and dataclasses.is_dataclass(self.full_cfg):
+            extra["config"] = dataclasses.asdict(self.full_cfg)
+        return extra
 
     def _resume(self, path: str) -> None:
         self.logger.info(f"Resuming from {path}")
@@ -365,13 +382,13 @@ class Trainer:
             self.logger.info(f"Epoch {epoch}/{self.cfg.max_epochs}  [{train_str}]  [{val_str}]")
 
             # --- Checkpoint ---
-            _ema_extra = {"ema_state": self.ema.state_dict()} if self.ema is not None else {}
+            _ckpt_extra = self._checkpoint_extra()
             _out = Path(self.cfg.output_dir)
             if self.cfg.save_last:
                 save_checkpoint(
                     str(_out / "weights" / "last.pth"),
                     self.model, self.optimizer, self.scheduler,
-                    epoch=epoch, metrics=all_metrics, extra=_ema_extra,
+                    epoch=epoch, metrics=all_metrics, extra=_ckpt_extra,
                 )
 
             # --- val/epoch_NNN.json ---
@@ -426,7 +443,7 @@ class Trainer:
                     higher_is_better=higher,
                     class_counts=getattr(self, "_class_counts", None),
                     imbalance_strategy=getattr(
-                        self.criterion.loss_cfg, "imbalance_strategy", None),
+                        self.criterion.cfg, "imbalance_strategy", None),
                 )
 
             # --- History plots (5 エポックごと + 最終エポック) ---
@@ -444,7 +461,7 @@ class Trainer:
                 save_checkpoint(
                     str(_out / "weights" / "best.pth"),
                     _save_model, self.optimizer, self.scheduler,
-                    epoch=epoch, metrics=all_metrics, extra=_ema_extra,
+                    epoch=epoch, metrics=all_metrics, extra=_ckpt_extra,
                 )
                 self.no_improve_count = 0
                 self.logger.info(
@@ -664,46 +681,66 @@ class Trainer:
                     )
 
             # ── Action / ID evaluation (Stage 2, 3, 4) ────────────────────
-            if (act_eval is not None or trk_eval is not None) and output.pred_boxes is not None:
-                N_q = output.pred_boxes.shape[1]  # クエリ数 / 画像
+            if act_eval is not None or trk_eval is not None:
+                det_results = output.det_results or [
+                    {"boxes": images.new_zeros((0, 4))} for _ in range(bs)
+                ]
+                action_batches = (
+                    output.split_flattened_tensor(output.action_logits)
+                    if output.det_results is not None
+                    else [None] * bs
+                )
+                id_batches = (
+                    output.split_flattened_tensor(output.id_logits)
+                    if output.det_results is not None
+                    else [None] * bs
+                )
 
                 for b in range(bs):
-                    pred_boxes_b = output.pred_boxes[b]  # (N_q, 4) cxcywh
+                    det_b = det_results[b] if b < len(det_results) else {"boxes": images.new_zeros((0, 4))}
+                    pred_boxes_b = det_b.get("boxes", images.new_zeros((0, 4)))
                     tgt_b = last_targets[b]
 
-                    # IoU で予測クエリ → GT ボックスをマッチング
+                    # IoU で valid detections → GT ボックスをマッチング
                     asgn = assign_gt_to_detections(pred_boxes_b, tgt_b, iou_threshold=0.5)
-                    matched = asgn["matched_gt_idx"] >= 0  # (N_q,) bool
+                    matched = asgn["matched_gt_idx"] >= 0
+                    n_det = int(pred_boxes_b.shape[0])
 
                     # Action
-                    if act_eval is not None and output.action_logits is not None:
-                        al = output.action_logits[b * N_q: (b + 1) * N_q]  # (N_q, C_act)
-                        pred_acts = al.argmax(dim=-1)  # (N_q,)
-                        gt_acts = asgn.get(
-                            "matched_action_ids",
-                            torch.full((N_q,), -1, dtype=torch.long, device=al.device),
-                        )
-                        valid = matched & (gt_acts >= 0)
-                        if valid.any():
-                            act_eval.update(
-                                pred_acts[valid].cpu().tolist(),
-                                gt_acts[valid].cpu().tolist(),
+                    if act_eval is not None and b < len(action_batches):
+                        al = action_batches[b]
+                        if al is not None:
+                            pred_acts = al.argmax(dim=-1)
+                            gt_acts = asgn.get(
+                                "matched_action_ids",
+                                torch.full((n_det,), -1, dtype=torch.long, device=al.device),
                             )
+                            valid = matched & (gt_acts >= 0)
+                            if valid.any():
+                                act_eval.update(
+                                    pred_acts[valid].cpu().tolist(),
+                                    gt_acts[valid].cpu().tolist(),
+                                )
 
                     # Tracking ID
-                    if trk_eval is not None and output.id_logits is not None:
-                        il = output.id_logits[b * N_q: (b + 1) * N_q]  # (N_q, max_ids+1)
-                        pred_ids = il.argmax(dim=-1)  # (N_q,)
-                        gt_ids = asgn.get(
-                            "matched_track_ids",
-                            torch.full((N_q,), -1, dtype=torch.long, device=il.device),
-                        )
-                        valid = matched & (gt_ids >= 0)
-                        if valid.any():
-                            trk_eval.update(
-                                pred_ids[valid].cpu().tolist(),
-                                gt_ids[valid].cpu().tolist(),
+                    if trk_eval is not None and b < len(id_batches):
+                        il = id_batches[b]
+                        if il is not None:
+                            pred_ids = il.argmax(dim=-1)
+                            gt_ids = asgn.get(
+                                "matched_track_ids",
+                                torch.full((n_det,), -1, dtype=torch.long, device=il.device),
                             )
+                            valid = matched & (gt_ids >= 0)
+                            if valid.any():
+                                sequence_key = None
+                                if "meta" in batch and b < len(batch["meta"]):
+                                    sequence_key = batch["meta"][b].get("video_id")
+                                trk_eval.update(
+                                    pred_ids[valid].cpu().tolist(),
+                                    gt_ids[valid].cpu().tolist(),
+                                    sequence_key=sequence_key,
+                                )
 
             val_bar.set_postfix({"val_loss": f"{total_loss.avg:.4f}"})
 
@@ -744,7 +781,7 @@ class Trainer:
         """
         from .losses import ActionLoss
 
-        strategy = getattr(self.criterion.loss_cfg, "imbalance_strategy", "none")
+        strategy = getattr(self.criterion.cfg, "imbalance_strategy", "none")
 
         # sampler は未実装 → class_weight に fallback
         if strategy == "sampler":
@@ -753,7 +790,7 @@ class Trainer:
                 " 'class_weight' に fallback します。"
             )
             strategy = "class_weight"
-            self.criterion.loss_cfg.imbalance_strategy = "class_weight"
+            self.criterion.cfg.imbalance_strategy = "class_weight"
 
         if strategy != "class_weight":
             self.logger.info(f"imbalance_strategy={strategy!r} — class weight 計算をスキップ")
@@ -792,9 +829,9 @@ class Trainer:
             )
             return
 
-        smoothing = getattr(self.criterion.loss_cfg, "class_weight_smoothing", 1.0)
-        clip_min  = getattr(self.criterion.loss_cfg, "class_weight_clip_min",  0.1)
-        clip_max  = getattr(self.criterion.loss_cfg, "class_weight_clip_max", 10.0)
+        smoothing = getattr(self.criterion.cfg, "class_weight_smoothing", 1.0)
+        clip_min  = getattr(self.criterion.cfg, "class_weight_clip_min",  0.1)
+        clip_max  = getattr(self.criterion.cfg, "class_weight_clip_max", 10.0)
 
         weights = ActionLoss.compute_class_weights(counts, smoothing, clip_min, clip_max)
         action_loss_mod.set_class_weights(weights)

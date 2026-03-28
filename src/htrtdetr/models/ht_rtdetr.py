@@ -89,6 +89,33 @@ class HTRTDETROutput:
         self.det_results = det_results
         self.aux_outputs = aux_outputs
 
+    def iter_detection_batches(self):
+        """
+        Yield `(slice, det_result)` pairs for the valid detections of each image.
+        """
+        if self.det_results is None:
+            return
+
+        ptr = 0
+        for det in self.det_results:
+            boxes = det.get("boxes") if isinstance(det, dict) else None
+            n_det = int(boxes.shape[0]) if isinstance(boxes, torch.Tensor) else 0
+            yield slice(ptr, ptr + n_det), det
+            ptr += n_det
+
+    def split_flattened_tensor(
+        self,
+        tensor: Optional[torch.Tensor],
+    ) -> List[Optional[torch.Tensor]]:
+        """
+        Split a flat `(sum_i N_i, ...)` tensor into per-image chunks.
+        """
+        if self.det_results is None:
+            return []
+        if tensor is None:
+            return [None for _ in self.det_results]
+        return [tensor[slc] for slc, _ in self.iter_detection_batches()]
+
 
 # ---------------------------------------------------------------------------
 # YOAKE: Unified Model
