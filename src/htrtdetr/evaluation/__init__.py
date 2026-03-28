@@ -1,6 +1,7 @@
 from .evaluator import (
     DetectionEvaluator,
     TrackingEvaluator,
+    SimpleTrackingEvaluator,
     ActionEvaluator,
     RuntimeEvaluator,
     HTRTDETREvaluator,
@@ -9,6 +10,7 @@ from .evaluator import (
 __all__ = [
     "DetectionEvaluator",
     "TrackingEvaluator",
+    "SimpleTrackingEvaluator",
     "ActionEvaluator",
     "RuntimeEvaluator",
     "HTRTDETREvaluator",

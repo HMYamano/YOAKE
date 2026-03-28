@@ -1,5 +1,12 @@
 """
-train_stage3.py — Stage 3: ID Head Pretraining
+train_stage3.py — Stage 3: ID Head Pretraining  [DEPRECATED]
+
+.. deprecated::
+   このスクリプトは非推奨です。代わりに yoake CLI を使用してください:
+
+     yoake train stage=3
+
+   出力は runs/train/stage3/ に保存されます。
 
 使い方:
     python scripts/train_stage3.py [config.yaml] [key=value ...]
@@ -20,7 +27,16 @@ from htrtdetr.models import build_model
 from htrtdetr.training import Trainer
 from htrtdetr.utils import set_seed, get_logger, load_model_weights
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+def _ask_confirm(message: str) -> bool:
+    try:
+        resp = input(f"{message} [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return resp in ("y", "yes")
 
 
 def parse_argv(argv):
@@ -57,22 +73,24 @@ def _find_checkpoint(root: str, stage: int) -> str:
     """
     fname = f"stage{stage}_best.pth"
     candidates = sorted(
-        Path(root).glob(f"outputs/*/stage{stage}/{fname}"),
+        [
+            *Path(root).glob(f"runs/train/*/stage{stage}/{fname}"),
+            *Path(root).glob(f"runs/train/stage{stage}/{fname}"),
+            *Path(root).glob(f"outputs/*/stage{stage}/{fname}"),  # legacy
+            *Path(root).glob(f"outputs/stage{stage}/{fname}"),    # legacy
+        ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     if candidates:
         return str(candidates[0])
-    flat = Path(root) / "outputs" / f"stage{stage}" / fname
-    if flat.exists():
-        return str(flat)
     return ""
 
 
 def main() -> None:
     config_path, overrides = parse_argv(sys.argv)
 
-    root = overrides.pop("root", _YOAKE_TRYAL)
+    root = overrides.pop("root", _DEFAULT_ROOT)
 
     if config_path:
         cfg = HTRTDETRConfig.from_yaml(config_path)
@@ -82,7 +100,7 @@ def main() -> None:
         cfg = get_stage3_config(overrides if overrides else None)
 
     if not overrides.get("train", {}).get("output_dir"):
-        cfg.train.output_dir = f"{root}/outputs/stage3"
+        cfg.train.output_dir = f"{root}/runs/train/stage3"
 
     # window_size が small な場合に temporal branch の num_frames を自動クリップ
     clamp_temporal_branches(cfg)
@@ -98,7 +116,14 @@ def main() -> None:
     )
 
     if use_dummy:
-        logger.warning("Using DummyDataset (sequence mode)")
+        logger.warning(
+            f"Train data not found: {cfg.data.train_root}\n"
+            f"  指定方法: python scripts/train_stage3.py data.train_root=<path/to/train>"
+        )
+        if not _ask_confirm("Continue with DummyDataset for smoke-test?"):
+            logger.error("Aborted. Please specify: data.train_root=<path/to/train>")
+            sys.exit(1)
+        logger.warning("Using DummyDataset (sequence mode). メトリクスは意味を持ちません。")
         train_dataset = DummyDataset(
             n_samples=100, window_size=cfg.data.window_size,
             image_size=tuple(cfg.data.image_size),
@@ -172,6 +197,7 @@ def main() -> None:
         max_ids=cfg.model.id_head.max_ids,
         optimizer_cfg=cfg.optimizer,
         scheduler_cfg=cfg.scheduler,
+        use_dummy=use_dummy,
     )
     trainer.train()
     logger.info(f"Stage 3 complete. Best: {cfg.train.output_dir}/stage3_best.pth")

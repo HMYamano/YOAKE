@@ -11,7 +11,7 @@ Stage 4 (unified) で detection 出力に GT action / track ID を割り当て�
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import torch
 
@@ -59,11 +59,25 @@ def assign_gt_to_detections(
     gt_xyxy = gt_boxes.to(device)             # (N_gt, 4) already xyxy
 
     iou = box_iou(pred_xyxy, gt_xyxy)         # (N_pred, N_gt)
-    max_iou, gt_idx = iou.max(dim=1)          # (N_pred,)
+    matched_gt_idx = torch.full((N_pred,), -1, dtype=torch.long, device=device)
 
-    # マッチング: IoU >= threshold のみ有効
-    matched_gt_idx = gt_idx.clone()
-    matched_gt_idx[max_iou < iou_threshold] = -1
+    # Greedy one-to-one matching by descending IoU.
+    # Each GT can be consumed at most once.
+    if iou.numel() > 0:
+        pairs = torch.nonzero(iou >= iou_threshold, as_tuple=False)
+        if pairs.numel() > 0:
+            scores = iou[pairs[:, 0], pairs[:, 1]]
+            order = scores.argsort(descending=True)
+            used_pred = set()
+            used_gt = set()
+            for idx in order.tolist():
+                pred_idx = int(pairs[idx, 0].item())
+                gt_match_idx = int(pairs[idx, 1].item())
+                if pred_idx in used_pred or gt_match_idx in used_gt:
+                    continue
+                matched_gt_idx[pred_idx] = gt_match_idx
+                used_pred.add(pred_idx)
+                used_gt.add(gt_match_idx)
     result["matched_gt_idx"] = matched_gt_idx
 
     # 各種 GT 属性を割り当て

@@ -1,5 +1,12 @@
 """
-eval_unified.py — Unified Evaluation: Detection + Tracking + Action
+eval_unified.py — Unified Evaluation: Detection + Tracking + Action  [DEPRECATED]
+
+.. deprecated::
+   このスクリプトは非推奨です。代わりに yoake CLI を使用してください:
+
+     yoake val stage=4 data.val_root=data/test
+
+   出力は runs/val/stage4/ に保存されます。
 
 AP50, IDF1, Action F1 をまとめて計算する。
 Stage 4 の統合モデル評価用。
@@ -29,7 +36,7 @@ from htrtdetr.evaluation.evaluator import DetectionEvaluator, ActionEvaluator, T
 from htrtdetr.utils.misc import load_checkpoint, cxcywh_to_xyxy
 
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
 def parse_overrides(argv) -> dict:
@@ -46,9 +53,9 @@ def main():
     overrides = parse_overrides(sys.argv[1:])
 
     anno_path = overrides.get("anno", "data/sample/annotations_val.json")
-    root = overrides.pop("root", _YOAKE_TRYAL)
-    checkpoint_path = overrides.get("checkpoint", f"{root}/outputs/stage4/checkpoint_best.pth")
-    output_dir = Path(overrides.get("output_dir", f"{root}/outputs/eval_unified"))
+    root = overrides.pop("root", _DEFAULT_ROOT)
+    checkpoint_path = overrides.get("checkpoint", f"{root}/runs/train/stage4/stage4_best.pth")
+    output_dir = Path(overrides.get("output_dir", f"{root}/runs/val/stage4"))
     score_threshold = float(overrides.get("score_threshold", "0.3"))
     output_dir.mkdir(parents=True, exist_ok=True)
 

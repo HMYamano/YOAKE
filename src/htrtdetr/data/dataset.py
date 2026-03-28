@@ -217,6 +217,61 @@ class FrameAugmentation:
 # 単フレーム Dataset (Stage 1: detection 学習用)
 # ---------------------------------------------------------------------------
 
+def validate_image_paths(
+    videos: List["VideoAnnotation"],
+    data_root: str,
+    split: str = "data",
+    check_n: int = 20,
+    fail_threshold: float = 0.5,
+) -> Tuple[int, int, List[str]]:
+    """
+    アノテーション内の画像パスが実在するかを先頭 check_n 件チェックする。
+
+    Args:
+        videos:         VideoAnnotation のリスト
+        data_root:      画像ルートディレクトリ (空文字列の場合はパスをそのまま使う)
+        split:          ログ表示用ラベル ("train" / "val" 等)
+        check_n:        先頭から何件チェックするか
+        fail_threshold: missing 率がこの値以上のときに RuntimeError を送出する
+
+    Returns:
+        (n_found, n_checked, missing_paths)
+
+    Raises:
+        RuntimeError: missing 率 >= fail_threshold のとき
+    """
+    all_frames = [frame for video in videos for frame in video.frames]
+    check_frames = all_frames[:check_n]
+    if not check_frames:
+        return 0, 0, []
+
+    root = Path(data_root) if data_root else None
+    missing: List[str] = []
+    for frame in check_frames:
+        if root is not None and not Path(frame.image_path).is_absolute():
+            full_path = root / frame.image_path
+        else:
+            full_path = Path(frame.image_path)
+        if not full_path.exists():
+            missing.append(str(full_path))
+
+    n_checked = len(check_frames)
+    n_missing = len(missing)
+    n_found = n_checked - n_missing
+
+    if n_missing > 0 and n_checked > 0 and (n_missing / n_checked) >= fail_threshold:
+        sample_lines = "\n  ".join(missing[:5])
+        extra = f"\n  ... and {n_missing - 5} more" if n_missing > 5 else ""
+        raise RuntimeError(
+            f"[{split}] Too many missing images: {n_missing}/{n_checked} "
+            f"({n_missing/n_checked*100:.0f}% >= threshold {fail_threshold*100:.0f}%).\n"
+            f"  data_root='{data_root}'\n"
+            f"  Sample missing paths:\n  {sample_lines}{extra}\n"
+            f"  Check data.train_root / data.val_root in config."
+        )
+    return n_found, n_checked, missing
+
+
 class SingleFrameDataset(Dataset):
     """
     1 フレームを 1 サンプルとして返す Dataset。
@@ -230,10 +285,17 @@ class SingleFrameDataset(Dataset):
         augment: bool = True,
         augment_cfg: Optional[Dict] = None,
         data_root: str = "",
+        strict: bool = False,
     ):
+        """
+        Args:
+            strict: True のとき画像ロード失敗で RuntimeError を送出する。
+                    False のときはゼロ画像にフォールバックする (従来の挙動)。
+        """
         self.image_size = image_size  # (H, W)
         self.data_root = Path(data_root)
         self.augment = augment
+        self.strict = strict
 
         aug_cfg = augment_cfg or {}
         self.augmentation = FrameAugmentation(**aug_cfg) if augment else None
@@ -253,8 +315,15 @@ class SingleFrameDataset(Dataset):
         # 画像読み込み
         try:
             image = load_image(image_path)
-        except Exception:
-            # ダミー画像 (テスト用フォールバック)
+        except Exception as e:
+            if self.strict:
+                raise RuntimeError(
+                    f"Failed to load image: '{image_path}'\n"
+                    f"  data_root='{self.data_root}', "
+                    f"frame.image_path='{frame.image_path}'\n"
+                    f"  Original error: {e}"
+                ) from e
+            # ダミー画像 (非 strict モード / テスト用フォールバック)
             image = np.zeros((*self.image_size, 3), dtype=np.uint8)
 
         h_orig, w_orig = image.shape[:2]
@@ -353,6 +422,7 @@ class SlidingWindowDataset(Dataset):
         data_root: str = "",
         require_action: bool = False,  # action annotation が必須かどうか
         require_track: bool = False,   # track annotation が必須かどうか
+        strict: bool = False,
     ):
         self.window_size = window_size
         self.stride = stride
@@ -361,6 +431,7 @@ class SlidingWindowDataset(Dataset):
         self.augment = augment
         self.require_action = require_action
         self.require_track = require_track
+        self.strict = strict
 
         aug_cfg = augment_cfg or {}
         self.augmentation = FrameAugmentation(**aug_cfg) if augment else None
@@ -428,7 +499,14 @@ class SlidingWindowDataset(Dataset):
 
             try:
                 image = load_image(image_path)
-            except Exception:
+            except Exception as e:
+                if self.strict:
+                    raise RuntimeError(
+                        f"Failed to load image: '{image_path}'\n"
+                        f"  data_root='{self.data_root}', "
+                        f"frame.image_path='{frame.image_path}'\n"
+                        f"  Original error: {e}"
+                    ) from e
                 image = np.zeros((*self.image_size, 3), dtype=np.uint8)
 
             boxes = np.array([obj.bbox for obj in frame.objects], dtype=np.float32) \

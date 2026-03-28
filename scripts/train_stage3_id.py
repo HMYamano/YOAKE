@@ -1,18 +1,29 @@
 """
-train_stage3_id.py — Stage 3: ID Head Training (Detector Frozen)
+train_stage3_id.py — Stage 3: ID Head Training (Detector Frozen)  [DEPRECATED]
 
-使い方:
-  python scripts/train_stage3_id.py \
-      train_anno=data/sample/annotations_train.json \
-      val_anno=data/sample/annotations_val.json \
-      stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-      output_dir=outputs/stage3 \
-      num_epochs=30
+.. deprecated::
+   このスクリプトは stage_trainers.py の Stage3Trainer を使う旧系統です。
+   正式な学習経路は以下を使用してください:
 
-Stage 3 では detector を freeze し、
-per-track の geometric features から
-Hierarchical Temporal Module と Memory-based ID Head を学習する。
-各動画内の track を local ID (0..N-1) に remapping して分類問題として解く。
+     yoake train stage=3 [key=value ...]
+     # または
+     python scripts/train_stage3.py [key=value ...]
+
+   このファイルは互換性のために残してありますが、今後削除される予定です。
+"""
+
+import warnings
+warnings.warn(
+    "train_stage3_id.py は非推奨です。"
+    "代わりに 'yoake train stage=3' または 'python scripts/train_stage3.py' を使用してください。",
+    DeprecationWarning,
+    stacklevel=1,
+)
+# --- original docstring content preserved below for reference ---
+# Stage 3 では detector を freeze し、
+# per-track の geometric features から
+# Hierarchical Temporal Module と Memory-based ID Head を学習する。
+# 各動画内の track を local ID (0..N-1) に remapping して分類問題として解く。
 """
 
 from __future__ import annotations
@@ -30,7 +41,7 @@ from htrtdetr.data.annotation import load_annotation
 from htrtdetr.training.stage_trainers import Stage3Trainer
 from htrtdetr.utils.misc import set_seed, load_model_weights
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_YOAKE_TRYAL = "C:/Users/utopi/Desktop/YOAKE_tryal"
 
 
 def parse_overrides(argv) -> dict:

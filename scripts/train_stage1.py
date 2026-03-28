@@ -1,5 +1,12 @@
 """
-train_stage1.py — Stage 1: Detector Pretraining / Finetuning
+train_stage1.py — Stage 1: Detector Pretraining / Finetuning  [DEPRECATED]
+
+.. deprecated::
+   このスクリプトは非推奨です。代わりに yoake CLI を使用してください:
+
+     yoake train stage=1 data.train_root=data/train data.val_root=data/val
+
+   出力は runs/train/stage1/ に保存されます。
 
 使い方:
     # デフォルト設定で学習 (YOAKE_tryal のデータを自動検出)
@@ -7,8 +14,8 @@ train_stage1.py — Stage 1: Detector Pretraining / Finetuning
 
     # アノテーションファイルを直接指定
     python scripts/train_stage1.py \
-        train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/train/annotations.json \
-        val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/val/annotations.json
+        train_anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/train/annotations.json \
+        val_anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/val/annotations.json
 
     # その他のパラメータを上書き
     python scripts/train_stage1.py \
@@ -29,7 +36,10 @@ from typing import Dict, Any, Optional
 from torch.utils.data import DataLoader
 
 from htrtdetr.config import get_stage1_config, HTRTDETRConfig
-from htrtdetr.data import DummyDataset, SingleFrameDataset, load_annotations, get_collate_fn
+from htrtdetr.data import (
+    DummyDataset, SingleFrameDataset, load_annotations,
+    validate_image_paths, get_collate_fn,
+)
 from htrtdetr.models import build_model
 from htrtdetr.training import Trainer
 from htrtdetr.utils import set_seed, get_logger
@@ -39,7 +49,62 @@ from htrtdetr.utils import set_seed, get_logger
 # デフォルトデータパス
 # ---------------------------------------------------------------------------
 
-_DEFAULT_ROOT = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+# ---------------------------------------------------------------------------
+# ユーティリティ
+# ---------------------------------------------------------------------------
+
+def _ask_confirm(message: str) -> bool:
+    """
+    コマンドプロンプトで Yes / No をユーザーに尋ねる。
+    y / yes のときのみ True を返す。EOF / Ctrl-C は No 扱い。
+    """
+    try:
+        resp = input(f"{message} [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return resp in ("y", "yes")
+
+
+def _resolve_anno_path(
+    explicit: Optional[str],
+    candidates: list,
+    split: str,
+    logger,
+) -> Optional[str]:
+    """
+    アノテーションパスを解決する。
+
+    1. explicit が指定されていればそのまま返す (存在チェックあり)
+    2. candidates を順番に試して最初に見つかったものを返す
+    3. 見つからなければ None を返す
+
+    Args:
+        explicit:   CLI で明示されたパス (None のとき候補を探す)
+        candidates: 自動探索するパス候補のリスト
+        split:      "train" / "val" 等のラベル (ログ用)
+        logger:     ロガー
+
+    Returns:
+        解決されたパス、または None
+    """
+    if explicit is not None:
+        p = Path(explicit)
+        if p.exists():
+            logger.info(f"[{split}] annotation: {explicit}")
+            return explicit
+        logger.warning(f"[{split}] Specified annotation not found: {explicit}")
+        return None
+
+    for candidate in candidates:
+        if Path(candidate).exists():
+            logger.info(f"[{split}] annotation (auto-detected): {candidate}")
+            return candidate
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +173,10 @@ def main() -> None:
         cfg = get_stage1_config(overrides if overrides else None)
 
     # output_dir が overrides で明示されていなければ root から構築
+    # ただし config_path が指定されている場合は yaml の値を優先する
     if not overrides.get("train", {}).get("output_dir"):
-        cfg.train.output_dir = f"{root}/outputs/stage1"
+        if not config_path or not cfg.train.output_dir:
+            cfg.train.output_dir = f"{root}/runs/train/stage1"
 
     logger = get_logger(
         "stage1",
@@ -122,15 +189,51 @@ def main() -> None:
     set_seed(cfg.train.seed, cfg.train.deterministic)
 
     # ----- アノテーションパスの解決 -----
-    # 優先順位: コマンドライン引数 > root 配下のデフォルトパス > DummyDataset
-    if train_anno_path is None:
-        _default = f"{root}/data/train/annotations.json"
-        if Path(_default).exists():
-            train_anno_path = _default
-    if val_anno_path is None:
-        _default = f"{root}/data/val/annotations.json"
-        if Path(_default).exists():
-            val_anno_path = _default
+    # 優先順位: コマンドライン引数 > root 配下のデフォルトパス > cfg.data.*_root 配下
+    # どこにも見つからない場合はユーザーに確認を求める
+
+    train_anno_path = _resolve_anno_path(
+        explicit=train_anno_path,
+        candidates=[
+            f"{root}/data/train/annotations.json",
+            str(Path(cfg.data.train_root) / "annotations.json"),
+        ],
+        split="train",
+        logger=logger,
+    )
+    val_anno_path = _resolve_anno_path(
+        explicit=val_anno_path,
+        candidates=[
+            f"{root}/data/val/annotations.json",
+            str(Path(cfg.data.val_root) / "annotations.json"),
+        ],
+        split="val",
+        logger=logger,
+    )
+
+    # ----- DummyDataset 確認 -----
+    use_dummy = train_anno_path is None
+
+    if use_dummy:
+        logger.warning(
+            f"Train annotation not found.\n"
+            f"  Tried: {root}/data/train/annotations.json\n"
+            f"         {Path(cfg.data.train_root) / 'annotations.json'}\n"
+            f"  指定方法: python scripts/train_stage1.py train_anno=<path/to/train.json>"
+        )
+        if not _ask_confirm("Continue with DummyDataset for smoke-test?"):
+            logger.error("Aborted. Please specify: train_anno=<path/to/annotations.json>")
+            sys.exit(1)
+
+    if val_anno_path is None and not use_dummy:
+        logger.warning(
+            f"Val annotation not found.\n"
+            f"  Tried: {root}/data/val/annotations.json\n"
+            f"         {Path(cfg.data.val_root) / 'annotations.json'}"
+        )
+        if not _ask_confirm("Continue without val annotation (use train data as val)?"):
+            logger.error("Aborted. Please specify: val_anno=<path/to/annotations.json>")
+            sys.exit(1)
 
     # ----- Dataset -----
     _img_size = cfg.data.image_size
@@ -139,13 +242,8 @@ def main() -> None:
     else:
         _img_size = tuple(_img_size)
 
-    use_dummy = train_anno_path is None or not Path(train_anno_path).exists()
-
     if use_dummy:
-        logger.warning(
-            "Train annotation not found. Using DummyDataset for smoke-test.\n"
-            f"  指定方法: python scripts/train_stage1.py train_anno=<path/to/train.json>"
-        )
+        logger.warning("Using DummyDataset (smoke-test mode). AP50 は意味を持ちません。")
         train_dataset = DummyDataset(
             n_samples=100,
             window_size=1,
@@ -163,33 +261,72 @@ def main() -> None:
             mode="single",
         )
     else:
-        logger.info(f"Train annotation: {train_anno_path}")
-
         train_videos, _, _ = load_annotations(train_anno_path)
 
-        # val アノテーションがなければ train を流用 (過学習確認用)
-        if val_anno_path and Path(val_anno_path).exists():
-            logger.info(f"Val   annotation: {val_anno_path}")
+        # val アノテーション: 見つかれば読込、なければ train を流用 (確認済み)
+        _val_uses_train_data = False
+        if val_anno_path is not None:
             val_videos, _, _ = load_annotations(val_anno_path)
         else:
             logger.warning("Val annotation not found. Using train data as val.")
             val_videos = train_videos
+            _val_uses_train_data = True
 
-        # アノテーション内の image_path が絶対パスの場合は data_root="" でよい
-        first_path = train_videos[0].frames[0].image_path if train_videos else ""
-        data_root = "" if Path(first_path).is_absolute() else cfg.data.train_root
+        # ----- data_root の解決 (train / val それぞれ独立して決める) -----
+        # アノテーション内の image_path が絶対パスなら data_root="" でよい
+        first_train_path = train_videos[0].frames[0].image_path if train_videos else ""
+        train_data_root = (
+            "" if Path(first_train_path).is_absolute() else cfg.data.train_root
+        )
+
+        if _val_uses_train_data:
+            # val が train データを流用している場合は train の root を使う
+            val_data_root = train_data_root
+        else:
+            first_val_path = val_videos[0].frames[0].image_path if val_videos else ""
+            val_data_root = (
+                "" if Path(first_val_path).is_absolute() else cfg.data.val_root
+            )
+
+        logger.info(f"train_data_root: '{train_data_root}'")
+        logger.info(f"val_data_root  : '{val_data_root}'")
+
+        # ----- 画像パスの事前検証 -----
+        _FAIL_THRESH = 0.5   # 50% 以上欠損でエラー
+        _CHECK_N     = 30    # 先頭 30 件チェック
+
+        logger.info("[train] Validating image paths ...")
+        n_found, n_checked, missing = validate_image_paths(
+            train_videos, train_data_root, split="train",
+            check_n=_CHECK_N, fail_threshold=_FAIL_THRESH,
+        )
+        logger.info(f"[train] {n_found}/{n_checked} images found")
+        if missing:
+            logger.warning(f"[train] {len(missing)} missing (first: {missing[0]})")
+
+        if not _val_uses_train_data:
+            logger.info("[val] Validating image paths ...")
+            n_found_v, n_checked_v, missing_v = validate_image_paths(
+                val_videos, val_data_root, split="val",
+                check_n=_CHECK_N, fail_threshold=_FAIL_THRESH,
+            )
+            logger.info(f"[val] {n_found_v}/{n_checked_v} images found")
+            if missing_v:
+                logger.warning(f"[val] {len(missing_v)} missing (first: {missing_v[0]})")
 
         train_dataset = SingleFrameDataset(
             train_videos,
             image_size=_img_size,
             augment=cfg.data.augment_train,
-            data_root=data_root,
+            data_root=train_data_root,
+            strict=True,
         )
         val_dataset = SingleFrameDataset(
             val_videos,
             image_size=_img_size,
             augment=False,
-            data_root=data_root,
+            data_root=val_data_root,
+            strict=True,
         )
 
     collate_fn = get_collate_fn("single")
@@ -237,6 +374,7 @@ def main() -> None:
         max_ids=cfg.model.id_head.max_ids,
         optimizer_cfg=cfg.optimizer,
         scheduler_cfg=cfg.scheduler,
+        use_dummy=use_dummy,
     )
 
     trainer.train()

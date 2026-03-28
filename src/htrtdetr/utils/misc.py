@@ -11,9 +11,11 @@ misc.py — 汎用ユーティリティ
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -337,6 +339,54 @@ def unfreeze_module(module: nn.Module) -> None:
     """モジュールのすべてのパラメータを unfreeze する"""
     for p in module.parameters():
         p.requires_grad_(True)
+
+
+# ---------------------------------------------------------------------------
+# Model EMA (YOLOv5 スタイル)
+# ---------------------------------------------------------------------------
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model weights.
+
+    YOLOv5 と同じ実装:
+      decay(t) = d * (1 - exp(-t / tau))
+    で更新ステップ数 t に応じて decay を徐々に大きくし、
+    学習初期は強めに更新・後期は安定化させる。
+
+    val では self.ema を使うことで AP50 の振動を大幅に抑制できる。
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.9999,
+        tau: float = 2000,
+    ) -> None:
+        self.ema = deepcopy(model).eval()
+        self.updates = 0
+        self.decay_fn = lambda x: decay * (1 - math.exp(-x / tau))
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    def update(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            self.updates += 1
+            d = self.decay_fn(self.updates)
+            msd = model.state_dict()
+            for k, v in self.ema.state_dict().items():
+                if v.dtype.is_floating_point:
+                    v.mul_(d).add_((1.0 - d) * msd[k].detach())
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "ema_state": self.ema.state_dict(),
+            "updates": self.updates,
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.ema.load_state_dict(state["ema_state"])
+        self.updates = state.get("updates", 0)
 
 
 def get_device(prefer_gpu: bool = True) -> torch.device:

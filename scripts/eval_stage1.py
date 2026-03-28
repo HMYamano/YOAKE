@@ -1,5 +1,12 @@
 """
-eval_stage1.py — Stage 1 Evaluation: Detection Metrics
+eval_stage1.py — Stage 1 Evaluation: Detection Metrics  [DEPRECATED]
+
+.. deprecated::
+   このスクリプトは非推奨です。代わりに yoake CLI を使用してください:
+
+     yoake val stage=1 data.val_root=data/val
+
+   出力は runs/val/stage1/ に保存されます。
 
 AP50, AP75, recall@50, mean center error を計算する。
 
@@ -9,7 +16,7 @@ AP50, AP75, recall@50, mean center error を計算する。
 
   # 直接指定
   python scripts/eval_stage1.py \
-      anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/val/annotations.json \
+      anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/val/annotations.json \
       checkpoint=outputs/stage1/stage1_best.pth \
       output_dir=outputs/eval_stage1
 """
@@ -32,8 +39,8 @@ from htrtdetr.evaluation.evaluator import DetectionEvaluator
 from htrtdetr.utils.misc import load_checkpoint, cxcywh_to_xyxy
 
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
-DEFAULT_ANNO  = f"{_YOAKE_TRYAL}/data/val/annotations.json"
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
+DEFAULT_ANNO  = str(Path(_DEFAULT_ROOT) / "data/val/annotations.json")
 
 
 def parse_overrides(argv) -> dict:
@@ -49,10 +56,10 @@ def parse_overrides(argv) -> dict:
 def main():
     overrides = parse_overrides(sys.argv[1:])
 
-    root            = overrides.pop("root", _YOAKE_TRYAL)
+    root            = overrides.pop("root", _DEFAULT_ROOT)
     anno_path       = overrides.get("anno",        f"{root}/data/val/annotations.json")
-    checkpoint_path = overrides.get("checkpoint",  f"{root}/outputs/stage1/stage1_best.pth")
-    output_dir      = Path(overrides.get("output_dir", f"{root}/outputs/eval_stage1"))
+    checkpoint_path = overrides.get("checkpoint",  f"{root}/runs/train/stage1/stage1_best.pth")
+    output_dir      = Path(overrides.get("output_dir", f"{root}/runs/val/stage1"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

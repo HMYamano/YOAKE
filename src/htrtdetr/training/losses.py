@@ -16,6 +16,7 @@ losses.py — 損失関数群
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -331,12 +332,67 @@ class DetectionLoss(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ActionLoss(nn.Module):
-    """行動分類の損失 (focal cross-entropy)"""
+    """
+    行動分類の損失。
+
+    imbalance_strategy:
+      "none"         — 重み無し softmax focal loss
+      "class_weight" — Laplace 平滑化逆頻度重みを適用した cross-entropy
+      "focal"        — softmax focal loss (gamma でクラス不均衡を緩和)
+    """
 
     def __init__(self, cfg: LossConfig, num_actions: int = 5):
         super().__init__()
         self.cfg = cfg
         self.num_actions = num_actions
+        # class_weight モード用: set_class_weights() で設定
+        self._class_weights: Optional[torch.Tensor] = None
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def set_class_weights(self, class_weights: torch.Tensor) -> None:
+        """外部から逆頻度重みを注入する。compute_class_weights() で生成するのが典型。"""
+        self._class_weights = class_weights
+
+    @contextmanager
+    def temporarily_disable_class_weights(self):
+        """Temporarily disable class weights, e.g. for validation-time loss."""
+        prev = self._class_weights
+        self._class_weights = None
+        try:
+            yield
+        finally:
+            self._class_weights = prev
+
+    @staticmethod
+    def compute_class_weights(
+        counts: List[int],
+        smoothing: float = 1.0,
+        clip_min: float = 0.1,
+        clip_max: float = 10.0,
+    ) -> torch.Tensor:
+        """
+        Laplace 平滑化逆頻度重みを計算する。
+
+        Args:
+            counts: クラスごとのサンプル数 (長さ = num_actions)
+            smoothing: Laplace 平滑化係数 (デフォルト 1.0)
+            clip_min / clip_max: 重みのクリップ範囲
+
+        Returns:
+            Tensor of shape (num_actions,)
+        """
+        counts_t = torch.tensor(counts, dtype=torch.float32)
+        total = counts_t.sum() + smoothing * len(counts)
+        weights = total / (counts_t + smoothing)
+        weights = weights / weights.mean()  # 平均 1.0 に正規化
+        return weights.clamp(clip_min, clip_max)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -346,12 +402,27 @@ class ActionLoss(nn.Module):
         if action_logits.shape[0] == 0:
             return action_logits.sum() * 0.0
 
-        loss = softmax_focal_loss(
-            action_logits,
-            gt_action_ids,
-            gamma=self.cfg.focal_gamma,
-            ignore_index=-1,
-        )
+        strategy = getattr(self.cfg, "imbalance_strategy", "none")
+
+        if strategy == "class_weight" and self._class_weights is not None:
+            # 重み付き cross-entropy (-1 は ignore のまま保持する)
+            w = self._class_weights.to(action_logits.device)
+            loss = F.cross_entropy(
+                action_logits,
+                gt_action_ids,
+                weight=w,
+                ignore_index=-1,
+            )
+        else:
+            # focal loss (strategy=="focal" または "none" または fallback)
+            gamma = self.cfg.focal_gamma if strategy in ("focal", "none") else 0.0
+            loss = softmax_focal_loss(
+                action_logits,
+                gt_action_ids,
+                gamma=gamma,
+                ignore_index=-1,
+            )
+
         return loss * self.cfg.w_action
 
 
@@ -585,35 +656,25 @@ class CombinedLoss(nn.Module):
         return losses
 
     def _collect_gt_actions(self, targets, model_output) -> Optional[torch.Tensor]:
-        """det_results と GT annotation を照合して action_id を収集する"""
-        # 簡略実装: det_results のインデックスと GT の対応を確認
+        """det_results の各 bbox と GT annotation を IoU マッチングして action_id を収集する。
+
+        matching.py の collect_matched_gt を利用して greedy IoU ベースの割り当てを行う。
+        IoU < threshold の未マッチ検出は -1 (ActionLoss で ignore される)。
+        """
         if model_output.det_results is None:
             return None
-
-        gt_list = []
-        for b, det in enumerate(model_output.det_results):
-            n = det["features"].shape[0]
-            if n == 0:
-                continue
-            # 実際には matcher で対応をとる必要があるが、
-            # ここでは -1 (ignore) を返して注意を促す
-            # TODO: proper GT matching
-            gt_list.append(torch.full((n,), -1, dtype=torch.long,
-                                      device=det["features"].device))
-
-        return torch.cat(gt_list) if gt_list else None
+        from .matching import collect_matched_gt
+        gt = collect_matched_gt(model_output.det_results, targets, key="action_ids")
+        return gt if gt.numel() > 0 else None
 
     def _collect_gt_track_ids(self, targets, model_output) -> Optional[torch.Tensor]:
-        """det_results と GT annotation を照合して track_id を収集する"""
+        """det_results の各 bbox と GT annotation を IoU マッチングして track_id を収集する。
+
+        matching.py の collect_matched_gt を利用して greedy IoU ベースの割り当てを行う。
+        IoU < threshold の未マッチ検出は -1 (IDLoss で ignore される)。
+        """
         if model_output.det_results is None:
             return None
-
-        gt_list = []
-        for b, det in enumerate(model_output.det_results):
-            n = det["features"].shape[0]
-            if n == 0:
-                continue
-            gt_list.append(torch.full((n,), -1, dtype=torch.long,
-                                      device=det["features"].device))
-
-        return torch.cat(gt_list) if gt_list else None
+        from .matching import collect_matched_gt
+        gt = collect_matched_gt(model_output.det_results, targets, key="track_ids")
+        return gt if gt.numel() > 0 else None

@@ -10,7 +10,7 @@ visualize_stage1_train.py — Stage 1 モデルで train データを解析・�
 
   # 直接指定
   python scripts/visualize_stage1_train.py \
-      anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/train/annotations.json \
+      anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/train/annotations.json \
       checkpoint=outputs/stage1/stage1_best.pth \
       output_dir=outputs/eval_stage1_train \
       score_thresh=0.3 \
@@ -37,7 +37,7 @@ from htrtdetr.evaluation.evaluator import DetectionEvaluator
 from htrtdetr.utils.misc import load_checkpoint, cxcywh_to_xyxy
 
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 # 描画色 (RGB)
 COLOR_GT   = (220, 50,  50)   # 赤: GT
@@ -116,10 +116,10 @@ def draw_boxes_on_image(
 def main():
     overrides = parse_overrides(sys.argv[1:])
 
-    root            = overrides.pop("root", _YOAKE_TRYAL)
+    root            = overrides.pop("root", _DEFAULT_ROOT)
     anno_path       = overrides.get("anno",       f"{root}/data/train/annotations.json")
     checkpoint_path = overrides.get("checkpoint", None)
-    output_dir      = Path(overrides.get("output_dir", f"{root}/outputs/eval_stage1_train"))
+    output_dir      = Path(overrides.get("output_dir", f"{root}/runs/visualize/stage1_train"))
     score_thresh    = float(overrides.get("score_thresh", "0.05"))
     max_images      = int(overrides.get("max_images", "200"))  # 保存する最大画像数
 

@@ -29,6 +29,7 @@ dependencies = [
 ]
 
 [project.scripts]
+yoake = "htrtdetr.cli:main"
 annotate = "htrtdetr.annotator:main"
 
 [project.optional-dependencies]

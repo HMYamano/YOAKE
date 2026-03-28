@@ -74,10 +74,16 @@ def build_optimizer(
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
     cfg: SchedulerConfig,
+    skip_warmup: bool = False,
 ) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
-    """Scheduler を構築する。warmup は LambdaLR で実装。"""
+    """Scheduler を構築する。warmup は LambdaLR で実装。
+
+    Args:
+        skip_warmup: True のとき warmup を無効化する。
+                     Trainer がステップ単位 warmup を自前で行う場合に使用。
+    """
     name = cfg.scheduler.lower()
-    warmup_epochs = cfg.warmup_epochs
+    warmup_epochs = 0 if skip_warmup else cfg.warmup_epochs
 
     def warmup_lambda(epoch: int) -> float:
         if epoch < warmup_epochs:

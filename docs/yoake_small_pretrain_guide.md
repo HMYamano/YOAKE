@@ -119,7 +119,7 @@ Anaconda PowerShell Prompt で実行する。
 
 ```powershell
 # 作業ルートを変数に設定
-$WORK = "C:\Users\utopi\YOAKE_pre-train"
+$WORK = "C:\Users\utopi\YOAKE_small_pretrain"
 
 # 生データ格納ディレクトリ
 New-Item -ItemType Directory -Force -Path "$WORK\raw\coco\images\train2017"
@@ -161,7 +161,7 @@ Write-Host "ディレクトリ作成完了"
 [cocodataset.org](https://cocodataset.org/#download) からダウンロードして展開する。
 
 ```powershell
-$WORK = "C:\Users\utopi\YOAKE_pre-train"
+$WORK = "C:\Users\utopi\YOAKE_small_pretrain"
 
 # 公式サイトからダウンロードした zip を展開する例:
 # train2017.zip → $WORK\raw\coco\images\train2017\
@@ -245,10 +245,10 @@ python setup_pretrain_configs_small.py
 
 期待される出力:
 ```
-Saved: C:/Users/utopi/YOAKE_pre-train/configs/small_stage1.yaml
-Saved: C:/Users/utopi/YOAKE_pre-train/configs/small_stage2.yaml
-Saved: C:/Users/utopi/YOAKE_pre-train/configs/small_stage3.yaml
-Saved: C:/Users/utopi/YOAKE_pre-train/configs/small_stage4.yaml
+Saved: C:/Users/utopi/YOAKE_small_pretrain/configs/small_stage1.yaml
+Saved: C:/Users/utopi/YOAKE_small_pretrain/configs/small_stage2.yaml
+Saved: C:/Users/utopi/YOAKE_small_pretrain/configs/small_stage3.yaml
+Saved: C:/Users/utopi/YOAKE_small_pretrain/configs/small_stage4.yaml
 
 All yoake-small configs generated.
 ```
@@ -260,7 +260,7 @@ All yoake-small configs generated.
 ### 6.1 COCO → YOAKE 形式に変換
 
 ```powershell
-$WORK = "C:\Users\utopi\YOAKE_pre-train"
+$WORK = "C:\Users\utopi\YOAKE_small_pretrain"
 cd C:\Users\utopi\YOAKE
 
 # train セット
@@ -351,6 +351,29 @@ python scripts/train_stage1.py `
     val_anno="$WORK\data\stage1\val\annotations.json"
 ```
 
+**起動直後に確認すべきログ項目**:
+
+学習が正常に開始されると、以下のようなログが出力される。
+特に `train_data_root` / `val_data_root` の値と画像パス検証の結果を必ず確認すること。
+
+```
+INFO  - [train] annotation: .../stage1/train/annotations.json
+INFO  - [val]   annotation: .../stage1/val/annotations.json
+INFO  - train_data_root: 'C:/Users/utopi/YOAKE_small_pretrain/data/stage1/train'
+INFO  - val_data_root  : 'C:/Users/utopi/YOAKE_small_pretrain/data/stage1/val'
+INFO  - [train] Validating image paths ...
+INFO  - [train] 30/30 images found
+INFO  - [val]   Validating image paths ...
+INFO  - [val]   30/30 images found
+INFO  - Train samples: XXXXX | Val samples: YYYYY
+```
+
+> **重要**: `train_data_root` と `val_data_root` が**別のパス**を指していることを確認する。
+> 同じパスになっている場合、val が train 画像で評価されているため AP50 が正確に計測されない。
+>
+> `[train] N/30 images found` の N が 0 や極端に少ない場合は学習開始前にエラーで停止する。
+> その場合は後述の「[画像パスの検証エラー](#画像パスの検証エラー)」を参照。
+
 **ログ確認**:
 
 ```powershell
@@ -369,7 +392,7 @@ Get-Content "$WORK\outputs\small\stage1\stage1.log" -Wait -Tail 20
 
 完了後:
 ```
-C:\Users\utopi\YOAKE_pre-train\outputs\small\stage1\
+C:\Users\utopi\YOAKE_small_pretrain\outputs\small\stage1\
   stage1_best.pth   ← このファイルが次のステージに引き継がれる
   stage1_last.pth
   stage1.log
@@ -507,7 +530,7 @@ Get-Content "$WORK\outputs\small\stage2\stage2.log" -Wait -Tail 20
 
 完了後:
 ```
-C:\Users\utopi\YOAKE_pre-train\outputs\small\stage2\
+C:\Users\utopi\YOAKE_small_pretrain\outputs\small\stage2\
   stage2_best.pth
   stage2_last.pth
   stage2.log
@@ -611,7 +634,7 @@ Get-Content "$WORK\outputs\small\stage3\stage3.log" -Wait -Tail 20
 
 完了後:
 ```
-C:\Users\utopi\YOAKE_pre-train\outputs\small\stage3\
+C:\Users\utopi\YOAKE_small_pretrain\outputs\small\stage3\
   stage3_best.pth
   stage3_last.pth
   stage3.log
@@ -704,7 +727,7 @@ Get-Content "$WORK\outputs\small\stage4\stage4.log" -Wait -Tail 20
 
 完了後:
 ```
-C:\Users\utopi\YOAKE_pre-train\outputs\small\stage4\
+C:\Users\utopi\YOAKE_small_pretrain\outputs\small\stage4\
   stage4_best.pth   ← これが最終 pre-trained モデル
   stage4_last.pth
   stage4.log
@@ -723,7 +746,7 @@ conda activate yoake
 python -c "
 import torch
 ckpt = torch.load(
-    r'C:/Users/utopi/YOAKE_pre-train/outputs/small/stage4/stage4_best.pth',
+    r'C:/Users/utopi/YOAKE_small_pretrain/outputs/small/stage4/stage4_best.pth',
     map_location='cpu'
 )
 print('Keys:', list(ckpt.keys()))
@@ -757,7 +780,7 @@ from htrtdetr.utils import load_model_weights
 cfg = get_variant_config('small', stage=4)
 model = build_model(cfg.model)
 load_model_weights(
-    'C:/Users/utopi/YOAKE_pre-train/outputs/small/stage4/stage4_best.pth',
+    'C:/Users/utopi/YOAKE_small_pretrain/outputs/small/stage4/stage4_best.pth',
     model,
     strict=False
 )
@@ -776,7 +799,7 @@ print('Forward pass OK')
 ### 10.3 各ステージのチェックポイントを一覧確認
 
 ```powershell
-$WORK = "C:\Users\utopi\YOAKE_pre-train"
+$WORK = "C:\Users\utopi\YOAKE_small_pretrain"
 Get-ChildItem "$WORK\outputs\small" -Recurse -Filter "*.pth" | `
     Select-Object FullName, Length, LastWriteTime | `
     Format-Table -AutoSize
@@ -901,7 +924,7 @@ python weight_transfer.py `
 最終的に以下のファイルが得られる:
 
 ```
-C:\Users\utopi\YOAKE_pre-train\outputs\small\
+C:\Users\utopi\YOAKE_small_pretrain\outputs\small\
   stage1\stage1_best.pth   ← 検出器 pre-trained
   stage2\stage2_best.pth   ← + 行動認識
   stage3\stage3_best.pth   ← + トラッキング

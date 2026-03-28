@@ -1,5 +1,12 @@
 """
-eval_stage3.py — Stage 3 Evaluation: ID / Tracking Metrics
+eval_stage3.py — Stage 3 Evaluation: ID / Tracking Metrics  [DEPRECATED]
+
+.. deprecated::
+   このスクリプトは非推奨です。代わりに yoake CLI を使用してください:
+
+     yoake val stage=3 data.val_root=data/val
+
+   出力は runs/val/stage3/ に保存されます。
 
 embedding の分離度 (within-class vs between-class cosine similarity)、
 ID classification accuracy を計算する。
@@ -28,7 +35,7 @@ from htrtdetr.data.annotation import load_annotation
 from htrtdetr.utils.misc import load_checkpoint
 
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
 def parse_overrides(argv) -> dict:
@@ -45,9 +52,9 @@ def main():
     overrides = parse_overrides(sys.argv[1:])
 
     anno_path = overrides.get("anno", "data/sample/annotations_val.json")
-    root = overrides.pop("root", _YOAKE_TRYAL)
-    checkpoint_path = overrides.get("checkpoint", f"{root}/outputs/stage3/stage3_best.pth")
-    output_dir = Path(overrides.get("output_dir", f"{root}/outputs/eval_stage3"))
+    root = overrides.pop("root", _DEFAULT_ROOT)
+    checkpoint_path = overrides.get("checkpoint", f"{root}/runs/train/stage3/stage3_best.pth")
+    output_dir = Path(overrides.get("output_dir", f"{root}/runs/val/stage3"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

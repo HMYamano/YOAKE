@@ -117,6 +117,15 @@ For a minimal install without visualization or experiment tracking:
 pip install -e .
 ```
 
+For development and tests:
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+If your shell cannot find `python` or `pytest`, use the repository CI workflow as the reference environment.
+
 ---
 
 ## Quick Start
@@ -289,6 +298,8 @@ python scripts/train_stage4_unified.py \
 ## Evaluation
 
 ### Stage 1 — Detection metrics (AP50, AP75)
+
+These are class-aware aggregate detection metrics. The current evaluator does not emit per-class AP tables.
 
 ```bash
 python scripts/eval_stage1.py \

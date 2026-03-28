@@ -1,7 +1,7 @@
 # アノテーションの構造確認
 import json
 
-with open(r"C:\Users\hayam\Desktop\YOAKE_tryal/data\val\annotations.json") as f:
+with open(r"C:\Users\utopi\Desktop\YOAKE_tryal/data\val\annotations.json") as f:
     ann = json.load(f)
 
 if isinstance(ann, dict):

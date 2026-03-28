@@ -1,5 +1,12 @@
 """
-eval_stage2.py — Stage 2 Evaluation: Action Classification Metrics
+eval_stage2.py — Stage 2 Evaluation: Action Classification Metrics  [DEPRECATED]
+
+.. deprecated::
+   このスクリプトは非推奨です。代わりに yoake CLI を使用してください:
+
+     yoake val stage=2 data.val_root=data/val
+
+   出力は runs/val/stage2/ に保存されます。
 
 accuracy, per-class F1, macro F1, confusion matrix を計算する。
 
@@ -27,7 +34,7 @@ from htrtdetr.evaluation.evaluator import ActionEvaluator
 from htrtdetr.utils.misc import load_checkpoint
 
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
 def parse_overrides(argv) -> dict:
@@ -44,9 +51,9 @@ def main():
     overrides = parse_overrides(sys.argv[1:])
 
     anno_path = overrides.get("anno", "data/sample/annotations_val.json")
-    root = overrides.pop("root", _YOAKE_TRYAL)
-    checkpoint_path = overrides.get("checkpoint", f"{root}/outputs/stage2/checkpoint_best.pth")
-    output_dir = Path(overrides.get("output_dir", f"{root}/outputs/eval_stage2"))
+    root = overrides.pop("root", _DEFAULT_ROOT)
+    checkpoint_path = overrides.get("checkpoint", f"{root}/runs/train/stage2/stage2_best.pth")
+    output_dir = Path(overrides.get("output_dir", f"{root}/runs/val/stage2"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

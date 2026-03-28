@@ -12,6 +12,20 @@ import json
 from pathlib import Path
 from datetime import datetime
 
+try:
+    from htrtdetr.gui_cli import (
+        _yoake as _shared_yoake,
+        build_yoake_command as _shared_build_yoake_command,
+    )
+except ImportError:
+    _SRC = Path(__file__).resolve().parent.parent / "src"
+    if str(_SRC) not in sys.path:
+        sys.path.insert(0, str(_SRC))
+    from htrtdetr.gui_cli import (
+        _yoake as _shared_yoake,
+        build_yoake_command as _shared_build_yoake_command,
+    )
+
 # tkinter for file dialogs only
 import tkinter as tk
 from tkinter import filedialog
@@ -21,7 +35,31 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 TOOLS = ROOT / "tools"
 CONFIGS = ROOT / "configs"
-OUTPUTS = ROOT / "outputs"
+RUNS = ROOT / "runs"           # 新しい出力ルート
+OUTPUTS = ROOT / "outputs"     # legacy (参照用のみ)
+
+
+def _yoake(*args: str) -> list:
+    """yoake CLI コマンドリストを返す (run_command に渡す形式)。
+
+    run_command は先頭に sys.executable を追加するため、
+    "-m htrtdetr.cli" 形式で渡す。
+    """
+    return ["-m", "htrtdetr.cli"] + list(args)
+
+
+def build_yoake_command(command: str, *args: str, **kwargs) -> list:
+    parts = [command, *args]
+    for key, value in kwargs.items():
+        if value in ("", None):
+            continue
+        parts.append(f"{key}={value}")
+    return _yoake(*parts)
+
+
+# Keep the legacy local names, but route them through the shared helper module.
+_yoake = _shared_yoake
+build_yoake_command = _shared_build_yoake_command
 
 STEPS = [
     "Dataset",
@@ -119,6 +157,10 @@ def run_command(cmd: list[str], cwd=None):
             msg = "完了 ✓" if code == 0 else f"エラー (code={code})"
             append_log(f"--- {msg} ---")
             dpg.configure_item("status_bar", default_value=msg)
+        except FileNotFoundError as e:
+            append_log(f"[ERROR] コマンドが見つかりません: {e}")
+            append_log("  ヒント: pip install -e . で yoake をインストールしてください")
+            dpg.configure_item("status_bar", default_value="エラー: コマンド未発見")
         except Exception as e:
             append_log(f"[ERROR] {e}")
             dpg.configure_item("status_bar", default_value="エラー")
@@ -352,7 +394,7 @@ def panel_stage1(parent):
                               "s1_val_anno",
                               _tk_pick_file("Val JSON", [("JSON", "*.json")])))
                 field_row("出力ディレクトリ", "s1_output",
-                          default=str(OUTPUTS / "stage1"),
+                          default=str(RUNS / "train" / "stage1"),
                           btn_cb=lambda: dpg.set_value(
                               "s1_output", _tk_pick_dir("出力ディレクトリ")))
                 dpg.add_spacer(height=4)
@@ -364,15 +406,15 @@ def panel_stage1(parent):
                 dpg.add_button(
                     label="Stage 1 学習開始",
                     height=36,
-                    callback=lambda: run_command([
-                        SCRIPTS / "train_stage1_detector.py",
-                        f"train_anno={dpg.get_value('s1_train_anno')}",
-                        f"val_anno={dpg.get_value('s1_val_anno')}",
-                        f"output_dir={dpg.get_value('s1_output')}",
-                        f"num_epochs={dpg.get_value('s1_epochs')}",
-                        f"batch_size={dpg.get_value('s1_batch')}",
+                    callback=lambda: run_command(_yoake(
+                        "train", "stage=1",
+                        f"data.train_root={dpg.get_value('s1_train_anno')}",
+                        f"data.val_root={dpg.get_value('s1_val_anno')}",
+                        f"train.output_dir={dpg.get_value('s1_output')}",
+                        f"train.max_epochs={dpg.get_value('s1_epochs')}",
+                        f"data.batch_size={dpg.get_value('s1_batch')}",
                         f"optimizer.lr={dpg.get_value('s1_lr')}",
-                    ]),
+                    )),
                 )
 
             with dpg.tab(label="評価"):
@@ -388,19 +430,19 @@ def panel_stage1(parent):
                               "s1_ckpt",
                               _tk_pick_file("チェックポイント", [("PyTorch", "*.pt *.pth")])))
                 field_row("出力ディレクトリ", "s1_eval_out",
-                          default=str(OUTPUTS / "eval_stage1"),
+                          default=str(RUNS / "val" / "stage1"),
                           btn_cb=lambda: dpg.set_value(
                               "s1_eval_out", _tk_pick_dir()))
                 dpg.add_spacer(height=8)
                 dpg.add_button(
                     label="Stage 1 評価実行",
                     height=36,
-                    callback=lambda: run_command([
-                        SCRIPTS / "eval_stage1.py",
-                        f"anno={dpg.get_value('s1_eval_anno')}",
+                    callback=lambda: run_command(_yoake(
+                        "val", "stage=1",
                         f"checkpoint={dpg.get_value('s1_ckpt')}",
+                        f"data.val_root={dpg.get_value('s1_eval_anno')}",
                         f"output_dir={dpg.get_value('s1_eval_out')}",
-                    ]),
+                    )),
                 )
 
 
@@ -429,7 +471,7 @@ def panel_stage2(parent):
                           btn_cb=lambda: dpg.set_value(
                               "s2_s1_ckpt", _tk_pick_file("Stage1 .pt", [("PyTorch", "*.pt *.pth")])))
                 field_row("出力ディレクトリ", "s2_output",
-                          default=str(OUTPUTS / "stage2"),
+                          default=str(RUNS / "train" / "stage2"),
                           btn_cb=lambda: dpg.set_value(
                               "s2_output", _tk_pick_dir()))
                 dpg.add_spacer(height=4)
@@ -437,20 +479,26 @@ def panel_stage2(parent):
                 int_row("Epochs", "s2_epochs", 30)
                 int_row("Batch Size", "s2_batch", 8)
                 float_row("Learning Rate", "s2_lr", 5e-5)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("クラス不均衡対策:", indent=4)
+                    dpg.add_combo(
+                        ["none", "class_weight", "focal"],
+                        tag="s2_imbalance", default_value="class_weight", width=140,
+                    )
                 dpg.add_spacer(height=8)
                 dpg.add_button(
                     label="Stage 2 学習開始",
                     height=36,
-                    callback=lambda: run_command([
-                        SCRIPTS / "train_stage2_action.py",
-                        f"train_anno={dpg.get_value('s2_train_anno')}",
-                        f"val_anno={dpg.get_value('s2_val_anno')}",
-                        f"stage1_ckpt={dpg.get_value('s2_s1_ckpt')}",
-                        f"output_dir={dpg.get_value('s2_output')}",
-                        f"num_epochs={dpg.get_value('s2_epochs')}",
-                        f"batch_size={dpg.get_value('s2_batch')}",
+                    callback=lambda: run_command(_yoake(
+                        "train", "stage=2",
+                        f"data.train_root={dpg.get_value('s2_train_anno')}",
+                        f"data.val_root={dpg.get_value('s2_val_anno')}",
+                        f"train.output_dir={dpg.get_value('s2_output')}",
+                        f"train.max_epochs={dpg.get_value('s2_epochs')}",
+                        f"data.batch_size={dpg.get_value('s2_batch')}",
                         f"optimizer.lr={dpg.get_value('s2_lr')}",
-                    ]),
+                        f"loss.imbalance_strategy={dpg.get_value('s2_imbalance')}",
+                    )),
                 )
 
             with dpg.tab(label="評価"):
@@ -462,18 +510,18 @@ def panel_stage2(parent):
                           btn_cb=lambda: dpg.set_value(
                               "s2_ckpt", _tk_pick_file("PT", [("PyTorch", "*.pt *.pth")])))
                 field_row("出力ディレクトリ", "s2_eval_out",
-                          default=str(OUTPUTS / "eval_stage2"),
+                          default=str(RUNS / "val" / "stage2"),
                           btn_cb=lambda: dpg.set_value("s2_eval_out", _tk_pick_dir()))
                 dpg.add_spacer(height=8)
                 dpg.add_button(
                     label="Stage 2 評価実行",
                     height=36,
-                    callback=lambda: run_command([
-                        SCRIPTS / "eval_stage2.py",
-                        f"anno={dpg.get_value('s2_eval_anno')}",
+                    callback=lambda: run_command(_yoake(
+                        "val", "stage=2",
                         f"checkpoint={dpg.get_value('s2_ckpt')}",
+                        f"data.val_root={dpg.get_value('s2_eval_anno')}",
                         f"output_dir={dpg.get_value('s2_eval_out')}",
-                    ]),
+                    )),
                 )
 
 
@@ -502,7 +550,7 @@ def panel_stage3(parent):
                           btn_cb=lambda: dpg.set_value(
                               "s3_s1_ckpt", _tk_pick_file("Stage1 .pt", [("PyTorch", "*.pt *.pth")])))
                 field_row("出力ディレクトリ", "s3_output",
-                          default=str(OUTPUTS / "stage3"),
+                          default=str(RUNS / "train" / "stage3"),
                           btn_cb=lambda: dpg.set_value("s3_output", _tk_pick_dir()))
                 dpg.add_spacer(height=4)
                 section("ハイパーパラメータ")
@@ -513,16 +561,15 @@ def panel_stage3(parent):
                 dpg.add_button(
                     label="Stage 3 学習開始",
                     height=36,
-                    callback=lambda: run_command([
-                        SCRIPTS / "train_stage3_id.py",
-                        f"train_anno={dpg.get_value('s3_train_anno')}",
-                        f"val_anno={dpg.get_value('s3_val_anno')}",
-                        f"stage1_ckpt={dpg.get_value('s3_s1_ckpt')}",
-                        f"output_dir={dpg.get_value('s3_output')}",
-                        f"num_epochs={dpg.get_value('s3_epochs')}",
-                        f"batch_size={dpg.get_value('s3_batch')}",
+                    callback=lambda: run_command(_yoake(
+                        "train", "stage=3",
+                        f"data.train_root={dpg.get_value('s3_train_anno')}",
+                        f"data.val_root={dpg.get_value('s3_val_anno')}",
+                        f"train.output_dir={dpg.get_value('s3_output')}",
+                        f"train.max_epochs={dpg.get_value('s3_epochs')}",
+                        f"data.batch_size={dpg.get_value('s3_batch')}",
                         f"optimizer.lr={dpg.get_value('s3_lr')}",
-                    ]),
+                    )),
                 )
 
             with dpg.tab(label="評価"):
@@ -534,18 +581,18 @@ def panel_stage3(parent):
                           btn_cb=lambda: dpg.set_value(
                               "s3_ckpt", _tk_pick_file("PT", [("PyTorch", "*.pt *.pth")])))
                 field_row("出力ディレクトリ", "s3_eval_out",
-                          default=str(OUTPUTS / "eval_stage3"),
+                          default=str(RUNS / "val" / "stage3"),
                           btn_cb=lambda: dpg.set_value("s3_eval_out", _tk_pick_dir()))
                 dpg.add_spacer(height=8)
                 dpg.add_button(
                     label="Stage 3 評価実行",
                     height=36,
-                    callback=lambda: run_command([
-                        SCRIPTS / "eval_stage3.py",
-                        f"anno={dpg.get_value('s3_eval_anno')}",
+                    callback=lambda: run_command(_yoake(
+                        "val", "stage=3",
                         f"checkpoint={dpg.get_value('s3_ckpt')}",
+                        f"data.val_root={dpg.get_value('s3_eval_anno')}",
                         f"output_dir={dpg.get_value('s3_eval_out')}",
-                    ]),
+                    )),
                 )
 
 
@@ -579,7 +626,7 @@ def panel_stage4(parent):
                           btn_cb=lambda: dpg.set_value(
                               "s4_s3_ckpt", _tk_pick_file("Stage3", [("PyTorch", "*.pt *.pth")])))
                 field_row("出力ディレクトリ", "s4_output",
-                          default=str(OUTPUTS / "stage4"),
+                          default=str(RUNS / "train" / "stage4"),
                           btn_cb=lambda: dpg.set_value("s4_output", _tk_pick_dir()))
                 dpg.add_spacer(height=4)
                 section("ハイパーパラメータ")
@@ -590,18 +637,15 @@ def panel_stage4(parent):
                 dpg.add_button(
                     label="Stage 4 学習開始",
                     height=36,
-                    callback=lambda: run_command([
-                        SCRIPTS / "train_stage4_unified.py",
-                        f"train_anno={dpg.get_value('s4_train_anno')}",
-                        f"val_anno={dpg.get_value('s4_val_anno')}",
-                        f"stage1_ckpt={dpg.get_value('s4_s1_ckpt')}",
-                        f"stage2_ckpt={dpg.get_value('s4_s2_ckpt')}",
-                        f"stage3_ckpt={dpg.get_value('s4_s3_ckpt')}",
-                        f"output_dir={dpg.get_value('s4_output')}",
-                        f"num_epochs={dpg.get_value('s4_epochs')}",
-                        f"batch_size={dpg.get_value('s4_batch')}",
+                    callback=lambda: run_command(_yoake(
+                        "train", "stage=4",
+                        f"data.train_root={dpg.get_value('s4_train_anno')}",
+                        f"data.val_root={dpg.get_value('s4_val_anno')}",
+                        f"train.output_dir={dpg.get_value('s4_output')}",
+                        f"train.max_epochs={dpg.get_value('s4_epochs')}",
+                        f"data.batch_size={dpg.get_value('s4_batch')}",
                         f"optimizer.lr={dpg.get_value('s4_lr')}",
-                    ]),
+                    )),
                 )
 
             with dpg.tab(label="評価"):
@@ -613,18 +657,18 @@ def panel_stage4(parent):
                           btn_cb=lambda: dpg.set_value(
                               "s4_ckpt", _tk_pick_file("PT", [("PyTorch", "*.pt *.pth")])))
                 field_row("出力ディレクトリ", "s4_eval_out",
-                          default=str(OUTPUTS / "eval_unified"),
+                          default=str(RUNS / "val" / "stage4"),
                           btn_cb=lambda: dpg.set_value("s4_eval_out", _tk_pick_dir()))
                 dpg.add_spacer(height=8)
                 dpg.add_button(
                     label="Unified 評価実行",
                     height=36,
-                    callback=lambda: run_command([
-                        SCRIPTS / "eval_unified.py",
-                        f"anno={dpg.get_value('s4_eval_anno')}",
+                    callback=lambda: run_command(_yoake(
+                        "val", "stage=4",
                         f"checkpoint={dpg.get_value('s4_ckpt')}",
+                        f"data.val_root={dpg.get_value('s4_eval_anno')}",
                         f"output_dir={dpg.get_value('s4_eval_out')}",
-                    ]),
+                    )),
                 )
 
 
@@ -647,7 +691,7 @@ def panel_inference(parent):
                   btn_cb=lambda: dpg.set_value(
                       "inf_ckpt", _tk_pick_file("チェックポイント", [("PyTorch", "*.pt *.pth")])))
         field_row("出力ディレクトリ", "inf_output",
-                  default=str(OUTPUTS / "inference"),
+                  default=str(RUNS / "predict"),
                   btn_cb=lambda: dpg.set_value("inf_output", _tk_pick_dir()))
 
         dpg.add_spacer(height=4)
@@ -662,15 +706,15 @@ def panel_inference(parent):
         dpg.add_button(
             label="推論実行",
             height=36,
-            callback=lambda: run_command([
-                TOOLS / "infer_video.py",
-                f"input={dpg.get_value('inf_input')}",
-                f"checkpoint={dpg.get_value('inf_ckpt')}",
+            callback=lambda: run_command(_yoake(
+                "predict",
+                f"source={dpg.get_value('inf_input')}",
+                f"weights={dpg.get_value('inf_ckpt')}",
                 f"output_dir={dpg.get_value('inf_output')}",
                 f"score_threshold={dpg.get_value('inf_thresh')}",
                 f"window_size={dpg.get_value('inf_window')}",
                 f"visualize={dpg.get_value('inf_vis')}",
-            ]),
+            )),
         )
 
 
@@ -691,7 +735,7 @@ def panel_analysis(parent):
                   btn_cb=lambda: dpg.set_value(
                       "ana_gt", _tk_pick_file("GT JSON", [("JSON", "*.json")])))
         field_row("出力ディレクトリ", "ana_output",
-                  default=str(OUTPUTS / "analysis"),
+                  default=str(RUNS / "analyze"),
                   btn_cb=lambda: dpg.set_value("ana_output", _tk_pick_dir()))
 
         dpg.add_spacer(height=4)
@@ -699,8 +743,8 @@ def panel_analysis(parent):
         with dpg.group(horizontal=True):
             dpg.add_text("モード:", indent=4)
             dpg.add_combo(
-                ["timeline", "distribution", "id_switches", "confidence", "all"],
-                tag="ana_mode", default_value="all", width=160,
+                ["timeline", "distribution", "id_switches", "confidence"],
+                tag="ana_mode", default_value="timeline", width=160,
             )
         dpg.add_spacer(height=8)
 
@@ -708,13 +752,14 @@ def panel_analysis(parent):
             dpg.add_button(
                 label="解析実行",
                 height=36,
-                callback=lambda: run_command([
-                    TOOLS / "analyze.py",
-                    f"mode={dpg.get_value('ana_mode')}",
-                    f"predictions={dpg.get_value('ana_pred')}",
-                    f"output_dir={dpg.get_value('ana_output')}",
-                ] + ([f"ground_truth={dpg.get_value('ana_gt')}"]
-                     if dpg.get_value("ana_gt") else []),
+                callback=lambda: run_command(
+                    _yoake(
+                        "analyze",
+                        f"mode={dpg.get_value('ana_mode')}",
+                        f"predictions={dpg.get_value('ana_pred')}",
+                        f"output_dir={dpg.get_value('ana_output')}",
+                    ) + ([f"annotation={dpg.get_value('ana_gt')}"]
+                         if dpg.get_value("ana_gt") else [])
                 ),
             )
             dpg.add_spacer(width=8)
@@ -820,6 +865,9 @@ def main():
 
     dpg.show_viewport()
     append_log("YOAKE GUI を起動しました。左のメニューからステップを選択してください。")
+    append_log(f"  ROOT: {ROOT}")
+    append_log(f"  出力先: {RUNS}")
+    append_log("  学習・評価は yoake CLI (python -m htrtdetr.cli) 経由で実行されます。")
 
     while dpg.is_dearpygui_running():
         dpg.render_dearpygui_frame()

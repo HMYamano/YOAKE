@@ -8,7 +8,7 @@ visualize_dataset.py — YOAKE アノテーション データビジュアライ
   python tools/visualize_dataset.py
 
   # 直接パス指定
-  python tools/visualize_dataset.py anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/train/annotations.json
+  python tools/visualize_dataset.py anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/train/annotations.json
 
 キーボード:
   ← / → : フレーム移動

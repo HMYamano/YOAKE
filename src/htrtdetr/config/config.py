@@ -15,8 +15,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# データ格納先ルート (出力もここに集約する)
-_YOAKE_TRYAL = "C:/Users/utopi/YOAKE_pre-train"
+# デフォルト出力ルート。実行ディレクトリ直下の runs/ に出力する。
+# スクリプト側で root= や train.output_dir= を渡せばここは使われない。
+_YOAKE_TRYAL = "runs"
 
 # yaml は optional 依存 (pyyaml)
 try:
@@ -251,6 +252,39 @@ class LossConfig:
     # focal loss gamma (0 で cross-entropy に退化)
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
+    # Action class imbalance handling
+    imbalance_strategy: str = "class_weight"  # none | class_weight | focal
+    class_weight_smoothing: float = 1.0       # ラプラス平滑化係数
+    class_weight_clip_min: float = 0.1        # 極端な重みを防ぐ下限
+    class_weight_clip_max: float = 10.0       # 極端な重みを防ぐ上限
+
+
+# ---------------------------------------------------------------------------
+# Metrics (best model selection & composite score)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MetricsConfig:
+    """stage ごとの best model 判定指標と composite score の重み"""
+    stage2_primary: str = "macro_f1"    # macro_f1 | val_loss
+    stage3_primary: str = "idf1"        # idf1 | val_loss
+    stage4_primary: str = "composite"   # composite | ap50 | val_loss
+    # Stage 4 composite score の重み (合計 1.0 推奨)
+    composite_ap50: float = 0.4
+    composite_macro_f1: float = 0.3
+    composite_idf1: float = 0.3
+
+
+# ---------------------------------------------------------------------------
+# Outputs (run directory structure)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OutputsConfig:
+    """run 出力の設定"""
+    save_plots: bool = True
+    save_confusion_matrix: bool = True   # Stage 2: confusion matrix PNG
+    save_epoch_metrics_json: bool = True  # val/epoch_NNN.json を毎 epoch 保存
 
 
 # ---------------------------------------------------------------------------
@@ -262,12 +296,12 @@ class OptimizerConfig:
     """Optimizer の設定"""
     optimizer: str = "adamw"         # "adam" | "adamw" | "sgd"
     lr: float = 1e-4
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-3
     momentum: float = 0.9            # SGD のみ使用
     # Backbone の lr は全体より小さくする
     backbone_lr_factor: float = 0.1
     # Gradient clipping
-    grad_clip_norm: float = 0.1
+    grad_clip_norm: float = 1.0
 
 
 @dataclass
@@ -293,13 +327,16 @@ class SchedulerConfig:
 class TrainConfig:
     """学習全体の設定"""
     stage: int = 1                   # 1 | 2 | 3 | 4
-    output_dir: str = f"{_YOAKE_TRYAL}/outputs/stage1"
+    output_dir: str = "runs/train/stage1"
     resume: Optional[str] = None     # checkpoint path
     # Epochs
     max_epochs: int = 100
     early_stopping_patience: int = 50
     # AMP (Automatic Mixed Precision)
     use_amp: bool = True
+    # EMA (Exponential Moving Average) — val の AP50 安定化に重要
+    use_ema: bool = True
+    ema_decay: float = 0.9999
     # 再現性
     seed: int = 42
     deterministic: bool = False
@@ -322,7 +359,7 @@ class TrainConfig:
 class EvalConfig:
     """評価の設定"""
     checkpoint: str = "weights/full_model_best.pth"
-    output_dir: str = f"{_YOAKE_TRYAL}/outputs/eval"
+    output_dir: str = "runs/val"
     split: str = "val"               # "val" | "test"
     # Detection
     iou_thresholds: List[float] = field(
@@ -347,7 +384,7 @@ class InferenceConfig:
     """推論の設定"""
     checkpoint: str = "weights/full_model_best.pth"
     input_path: str = ""             # 動画 or 画像ディレクトリ
-    output_path: str = f"{_YOAKE_TRYAL}/outputs/inference"
+    output_path: str = "runs/predict"
     # Video
     fps: Optional[float] = None      # None → 元動画の fps を使用
     # Visualization overlay
@@ -377,6 +414,8 @@ class HTRTDETRConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+    metrics: MetricsConfig = field(default_factory=MetricsConfig)
+    outputs: OutputsConfig = field(default_factory=OutputsConfig)
 
     # ------------------------------------------------------------------ #
     # yaml ↔ dataclass 変換
@@ -467,7 +506,7 @@ def get_stage1_config(overrides: Optional[Dict] = None) -> HTRTDETRConfig:
     """Stage 1: Detector pretraining / finetuning"""
     cfg = HTRTDETRConfig()
     cfg.train.stage = 1
-    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/stage1"
+    cfg.train.output_dir = "runs/train/stage1"
     cfg.train.max_epochs = 500
     cfg.train.early_stopping_patience = 200
     cfg.optimizer.lr = 1e-4
@@ -480,7 +519,7 @@ def get_stage2_config(overrides: Optional[Dict] = None) -> HTRTDETRConfig:
     """Stage 2: Action head pretraining"""
     cfg = HTRTDETRConfig()
     cfg.train.stage = 2
-    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/stage2"
+    cfg.train.output_dir = "runs/train/stage2"
     cfg.train.max_epochs = 80
     cfg.optimizer.lr = 5e-5
     # Stage 2 では detector の重みを freeze する
@@ -494,7 +533,7 @@ def get_stage3_config(overrides: Optional[Dict] = None) -> HTRTDETRConfig:
     """Stage 3: ID head pretraining"""
     cfg = HTRTDETRConfig()
     cfg.train.stage = 3
-    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/stage3"
+    cfg.train.output_dir = "runs/train/stage3"
     cfg.train.max_epochs = 80
     cfg.optimizer.lr = 5e-5
     cfg.model.id_head.use_metric_loss = True
@@ -631,7 +670,7 @@ def get_stage4_config(overrides: Optional[Dict] = None) -> HTRTDETRConfig:
     """Stage 4: Unified fine-tuning"""
     cfg = HTRTDETRConfig()
     cfg.train.stage = 4
-    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/stage4"
+    cfg.train.output_dir = "runs/train/stage4"
     cfg.train.max_epochs = 50
     cfg.optimizer.lr = 1e-5           # 小さい lr で fine-tune
     cfg.model.id_head.use_action_summary = True
@@ -844,7 +883,7 @@ def get_variant_config(
 
     cfg = _stage_builders[stage]()
     cfg.model = build_model_config(variant)
-    cfg.train.output_dir = f"{_YOAKE_TRYAL}/outputs/{variant}/stage{stage}"
+    cfg.train.output_dir = f"runs/train/{variant}/stage{stage}"
 
     if overrides:
         cfg = cfg.merge(overrides)

@@ -17,6 +17,8 @@ from .config import (
     TrainConfig,
     EvalConfig,
     InferenceConfig,
+    MetricsConfig,
+    OutputsConfig,
     get_stage1_config,
     get_stage2_config,
     get_stage3_config,
@@ -62,6 +64,8 @@ __all__ = [
     "TrainConfig",
     "EvalConfig",
     "InferenceConfig",
+    "MetricsConfig",
+    "OutputsConfig",
     # Stage configs
     "get_stage1_config",
     "get_stage2_config",

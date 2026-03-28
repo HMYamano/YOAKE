@@ -12,15 +12,19 @@
       "Read(//c/Users/utopi/YOAKE/**)",
       "Bash(python3 -c \":*)",
       "Bash(python -c \":*)",
-      "Bash(find /c/Users/hayam/Desktop/YOAKE_tryal -type f -name *.py)",
+      "Bash(find /c/Users/utopi/Desktop/YOAKE_tryal -type f -name *.py)",
       "Bash(conda run -n yoake python -c \":*)",
       "Bash(source activate:*)",
-      "Bash(dir \"C:\\\\Users\\\\hayam\\\\Desktop\\\\YOAKE_tryal\\\\outputs\\\\stage1\")",
-      "Bash(C:/Users/hayam/miniconda3/envs/yoake/python.exe -c \":*)",
-      "Bash(find /c/Users/hayam/YOAKE/outputs -type f -name *.json -o -name *.csv -o -name *.pth)",
-      "Bash(python3 -c \"import json; f=open\\(''''/c/Users/hayam/YOAKE/outputs/test_splits/split_summary.json''''\\); data=json.load\\(f\\); print\\(json.dumps\\(data, indent=2\\)\\)\")",
-      "Bash(wc -l /c/Users/hayam/YOAKE/src/htrtdetr/**/*.py)",
-      "Bash(find C:/Users/hayam/Desktop/YOAKE_tryal/data/ -name *.json)"
+      "Bash(dir \"C:\\\\Users\\\\utopi\\\\Desktop\\\\YOAKE_tryal\\\\outputs\\\\stage1\")",
+      "Bash(C:/Users/utopi/miniconda3/envs/yoake/python.exe -c \":*)",
+      "Bash(find /c/Users/utopi/YOAKE/outputs -type f -name *.json -o -name *.csv -o -name *.pth)",
+      "Bash(python3 -c \"import json; f=open\\(''''/c/Users/utopi/YOAKE/outputs/test_splits/split_summary.json''''\\); data=json.load\\(f\\); print\\(json.dumps\\(data, indent=2\\)\\)\")",
+      "Bash(wc -l /c/Users/utopi/YOAKE/src/htrtdetr/**/*.py)",
+      "Bash(find C:/Users/utopi/Desktop/YOAKE_tryal/data/ -name *.json)",
+      "Bash(/c/Users/utopi/miniconda3/envs/YOAKE/python.exe -m pytest tests/test_metrics.py tests/test_losses.py tests/test_matching.py -v --tb=short)",
+      "Bash(/c/Users/utopi/miniconda3/envs/YOAKE/python.exe -m pytest tests/test_metrics.py tests/test_losses.py tests/test_matching.py tests/test_cli_smoke.py -v --tb=short)",
+      "Bash(grep -n '\\\\u2014\\\\|\\\\\\\\\\\\\\\\u2014\\\\|—' src/htrtdetr/cli.py)",
+      "Bash(/c/Users/utopi/miniconda3/envs/YOAKE/python.exe -m pytest tests/ -q --tb=short)"
     ]
   }
 }

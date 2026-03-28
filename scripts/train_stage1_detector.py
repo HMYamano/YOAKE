@@ -1,18 +1,33 @@
 """
-train_stage1_detector.py — Stage 1: Spatial Detector Training
+train_stage1_detector.py — Stage 1: Spatial Detector Training  [DEPRECATED]
 
-使い方:
+.. deprecated::
+   このスクリプトは stage_trainers.py の Stage1Trainer を使う旧系統です。
+   正式な学習経路は以下を使用してください:
+
+     yoake train stage=1 [key=value ...]
+     # または
+     python scripts/train_stage1.py [key=value ...]
+
+   このファイルは互換性のために残してありますが、今後削除される予定です。
+
+使い方 (旧):
   python scripts/train_stage1_detector.py \
       train_anno=data/sample/annotations_train.json \
       val_anno=data/sample/annotations_val.json \
-      output_dir=outputs/stage1 \
+      output_dir=runs/train/stage1 \
       num_epochs=50 \
       batch_size=8 \
-      resume=outputs/stage1/checkpoint_last.pth
-
-すべての設定は dataclass (HTRTDETRConfig) で管理する。
-コマンドライン引数は key=value 形式で config を上書きできる。
+      resume=runs/train/stage1/checkpoint_last.pth
 """
+
+import warnings
+warnings.warn(
+    "train_stage1_detector.py は非推奨です。"
+    "代わりに 'yoake train stage=1' または 'python scripts/train_stage1.py' を使用してください。",
+    DeprecationWarning,
+    stacklevel=1,
+)
 
 from __future__ import annotations
 
@@ -30,7 +45,7 @@ from htrtdetr.data.annotation import load_annotation
 from htrtdetr.training.stage_trainers import Stage1Trainer
 from htrtdetr.utils.misc import set_seed
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_YOAKE_TRYAL = "C:/Users/utopi/Desktop/YOAKE_tryal"
 
 
 def parse_overrides(argv) -> dict:

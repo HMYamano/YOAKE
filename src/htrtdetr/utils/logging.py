@@ -25,26 +25,33 @@ def get_logger(
     logger = logging.getLogger(name)
     logger.setLevel(level)
 
-    # 重複ハンドラを防ぐ
-    if logger.handlers:
-        return logger
-
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # stdout handler
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
+    # stdout handler（重複を防ぐ）
+    has_stdout = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
+    )
+    if not has_stdout:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
 
-    # file handler (optional)
+    # file handler（同じパスが未登録の場合のみ追加）
     if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        log_path = Path(log_file)
+        has_file = any(
+            isinstance(h, logging.FileHandler) and Path(h.baseFilename) == log_path.resolve()
+            for h in logger.handlers
+        )
+        if not has_file:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
 
     return logger
 

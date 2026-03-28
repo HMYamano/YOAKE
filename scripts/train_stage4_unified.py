@@ -1,18 +1,24 @@
 """
-train_stage4_unified.py — Stage 4: Unified Fine-tuning (All Modules)
+train_stage4_unified.py — Stage 4: Unified Fine-tuning (All Modules)  [DEPRECATED]
 
-使い方:
-  python scripts/train_stage4_unified.py \
-      train_anno=data/sample/annotations_train.json \
-      val_anno=data/sample/annotations_val.json \
-      stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-      stage2_ckpt=outputs/stage2/checkpoint_best.pth \
-      stage3_ckpt=outputs/stage3/checkpoint_best.pth \
-      output_dir=outputs/stage4 \
-      num_epochs=30
+.. deprecated::
+   このスクリプトは stage_trainers.py の Stage4Trainer を使う旧系統です。
+   正式な学習経路は以下を使用してください:
 
-Stage 4 では全モジュールを fine-tune する。
-前 stage の checkpoint から各モジュールの重みを初期化してから学習を開始する。
+     yoake train stage=4 [key=value ...]
+     # または
+     python scripts/train_stage4.py [key=value ...]
+
+   このファイルは互換性のために残してありますが、今後削除される予定です。
+"""
+
+import warnings
+warnings.warn(
+    "train_stage4_unified.py は非推奨です。"
+    "代わりに 'yoake train stage=4' または 'python scripts/train_stage4.py' を使用してください。",
+    DeprecationWarning,
+    stacklevel=1,
+)
 入力は full-scene シーケンス (T フレームの visual + geo features)。
 """
 
@@ -31,7 +37,7 @@ from htrtdetr.data.annotation import load_annotation
 from htrtdetr.training.stage_trainers import Stage4Trainer
 from htrtdetr.utils.misc import set_seed
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_YOAKE_TRYAL = "C:/Users/utopi/Desktop/YOAKE_tryal"
 
 
 def parse_overrides(argv) -> dict:

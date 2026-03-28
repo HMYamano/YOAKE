@@ -1,5 +1,19 @@
 """
-stage_trainers.py — Stage-specific Training Loops
+stage_trainers.py — Stage-specific Training Loops  [DEPRECATED]
+
+.. deprecated::
+   このモジュールは旧来の段階別 Trainer 実装です。
+   正式な Trainer は ``src/htrtdetr/training/trainer.py`` の ``Trainer`` クラスです。
+
+   新しいコードでは以下を使用してください:
+
+     from htrtdetr.training import Trainer
+
+   または CLI から:
+
+     yoake train stage=<1-4>
+
+   このモジュールは互換性のために残してありますが、今後削除される予定です。
 
 各 stage に特化した trainer クラス。
 実際に gradient が流れ、checkpoint が保存される形で実装。

@@ -284,72 +284,101 @@ print(validate_annotation(anno))
 
 Training proceeds in four stages. Stages 2 and 3 are independent and can run on separate GPUs simultaneously.
 
-### Stage 1: Spatial Detector
+### Quick Start — `yoake` CLI (recommended)
+
+After installing (`pip install -e .`), use the single `yoake` command:
 
 ```bash
-python scripts/train_stage1_detector.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    output_dir=outputs/stage1 \
-    num_epochs=100 \
-    batch_size=4
+# Stage 1: Spatial Detector
+yoake train stage=1 data.train_root=data/train data.val_root=data/val
+
+# Stage 2: Action Head  (loads stage1 checkpoint automatically)
+yoake train stage=2
+
+# Stage 3: ID Head  (can run in parallel with Stage 2 on a separate GPU)
+yoake train stage=3
+
+# Stage 4: Unified Fine-Tuning
+yoake train stage=4
 ```
 
+Outputs go to `runs/train/stage{N}/` by default.
+
+Override any config value with `key=value`:
+
+```bash
+yoake train stage=1 train.max_epochs=100 data.batch_size=8 model.variant=small
+```
+
+### Stage 1: Spatial Detector
+
 **Goal:** Learn to detect and localize animals in single frames.
-**Typical epochs:** 50–100 | **Time/epoch:** ~8 min (RTX 8000)
+**Typical epochs:** 50–500 | **Time/epoch:** ~8 min (RTX 8000)
+
+```bash
+yoake train stage=1 \
+    data.train_root=data/train \
+    data.val_root=data/val \
+    train.max_epochs=100 \
+    data.batch_size=4
+```
 
 ### Stage 2: Action Head
 
-```bash
-python scripts/train_stage2_action.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    output_dir=outputs/stage2 \
-    num_epochs=30
-```
-
 **Goal:** Learn to classify behavior from temporal query features.
-**Typical epochs:** 20–40 | **Time/epoch:** ~3 min
+**Typical epochs:** 20–80 | **Time/epoch:** ~3 min
+
+```bash
+yoake train stage=2 \
+    data.train_root=data/train \
+    data.val_root=data/val
+```
 
 ### Stage 3: ID Head
 
-```bash
-python scripts/train_stage3_id.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    output_dir=outputs/stage3 \
-    num_epochs=30
-```
-
 **Goal:** Learn persistent identity embeddings for re-identification.
-**Typical epochs:** 20–40 | **Time/epoch:** ~3 min
+**Typical epochs:** 20–80 | **Time/epoch:** ~3 min
 *(Can run in parallel with Stage 2 on a separate GPU)*
+
+```bash
+yoake train stage=3
+```
 
 ### Stage 4: Unified Fine-Tuning
 
-```bash
-python scripts/train_stage4_unified.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    stage2_ckpt=outputs/stage2/checkpoint_best.pth \
-    stage3_ckpt=outputs/stage3/checkpoint_best.pth \
-    output_dir=outputs/stage4 \
-    num_epochs=30
-```
-
 **Goal:** Joint fine-tuning of all modules with combined loss.
-**Typical epochs:** 20–40 | **Time/epoch:** ~10 min
+**Typical epochs:** 20–50 | **Time/epoch:** ~10 min
+
+```bash
+yoake train stage=4
+```
 
 ### Base Directory (`root=`)
 
-All training and evaluation scripts accept a `root=<path>` argument to set the data and output base directory. The default is `C:/Users/hayam/Desktop/YOAKE_tryal`. Example:
+Scripts accept `root=<path>` to set the working root. The default is the repository root (auto-detected). Checkpoints from previous stages are searched under `{root}/runs/train/`.
 
 ```bash
-python scripts/train_stage1_detector.py root=/data/myproject ...
+yoake train stage=2 root=/data/myproject
 ```
+
+### Using a config file
+
+```bash
+yoake train stage=1 config=configs/stage1_small.yaml train.max_epochs=200
+```
+
+### Legacy script interface (deprecated)
+
+The old per-stage scripts still work but are deprecated:
+
+```bash
+python scripts/train_stage1.py data.train_root=data/train
+python scripts/train_stage2.py
+python scripts/train_stage3.py
+python scripts/train_stage4.py
+```
+
+> ⚠️ `scripts/train_stage1_detector.py`, `train_stage2_action.py`, `train_stage3_id.py`, `train_stage4_unified.py` use the deprecated `stage_trainers.py` backend. Prefer the scripts above or the `yoake` CLI.
 
 ### Key Hyperparameters
 
@@ -386,67 +415,91 @@ python scripts/train_stage1_detector.py root=/data/myproject ...
 
 ## Evaluation
 
+### `yoake val` CLI (recommended)
+
+```bash
+yoake val stage=1
+yoake val stage=2
+yoake val stage=3
+yoake val stage=4
+```
+
+If `checkpoint=` is omitted, `runs/train/stage{N}/weights/best.pth` is searched automatically.
+
+### Primary Metrics per Stage
+
+| Stage | Primary metric | Direction | Notes |
+|-------|----------------|-----------|-------|
+| Stage 1 | AP50 | higher | COCO-style detection AP at IoU=0.5 |
+| Stage 2 | macro_F1 | higher | Unweighted mean of per-class F1 |
+| Stage 3 | IDF1 | higher | Identity F1 (harmonic mean of IDP / IDR) |
+| Stage 4 | composite | higher | `0.4*AP50 + 0.3*macro_F1 + 0.3*IDF1` |
+
 ### Stage 1: Detection
 
 ```bash
-python scripts/eval_stage1.py \
-    anno=data/val/annotations.json \
-    checkpoint=outputs/stage1/stage1_best.pth \
-    output_dir=outputs/eval_stage1\
-    score_thresh=0.05
+yoake val stage=1 \
+    data.val_root=data/val \
+    checkpoint=runs/train/stage1/weights/best.pth
 ```
 
-Metrics: **AP50**, **AP75**, per-class AP
+Outputs: `runs/val/stage1/val_results.json`, `metrics_latest.json`
 
-> **Note:** `eval_stage1.py` also generates `score_distribution.json` in the output directory. The `score_thresh` argument (default `0.05`) controls the minimum detection confidence used during evaluation.
+Metrics: **AP50**, **AP75**, class-aware aggregate AP / recall. The current evaluator is not a per-class AP table exporter.
 
 ### Stage 2: Action Classification
 
 ```bash
-python scripts/eval_stage2.py \
-    anno=data/val/annotations.json \
-    checkpoint=outputs/stage2/checkpoint_best.pth \
-    output_dir=outputs/eval_stage2
+yoake val stage=2 \
+    data.val_root=data/val \
+    checkpoint=runs/train/stage2/weights/best.pth
 ```
 
-Metrics: **macro F1**, per-class F1 / precision / recall, confusion matrix
+Outputs: `runs/val/stage2/val_results.json`, `confusion_matrix.png`, `per_class_metrics.json`, `per_class_metrics.csv`
+
+Metrics: **macro F1**, weighted F1, per-class F1 / precision / recall, confusion matrix
 
 ### Stage 3: Identity Tracking
 
 ```bash
-python scripts/eval_stage3.py \
-    anno=data/val/annotations.json \
-    checkpoint=outputs/stage3/checkpoint_best.pth \
-    output_dir=outputs/eval_stage3
+yoake val stage=3 \
+    data.val_root=data/val \
+    checkpoint=runs/train/stage3/weights/best.pth
 ```
 
-Metrics: **IDF1**, ID switch count, **MOTA**, track fragmentation
+Metrics: **IDF1**, **IDP**, **IDR**, ID switch count (IDSW). These are lightweight matched-track validation metrics used consistently across Stage 3 / 4.
 
-### Unified Evaluation
+### Unified Evaluation (Stage 4)
 
 ```bash
-python scripts/eval_unified.py \
-    anno=data/test/annotations.json \
-    checkpoint=outputs/stage4/checkpoint_best.pth \
-    output_dir=outputs/eval_unified \
-    score_threshold=0.3
+yoake val stage=4 \
+    data.val_root=data/test \
+    checkpoint=runs/train/stage4/weights/best.pth
 ```
 
-Produces `results_unified.json` combining all metrics.
+Outputs: `runs/val/stage4/val_results.json`, `confusion_matrix.png`, `per_class_metrics.json`
+
+Metrics: **composite** (AP50 + macro_F1 + IDF1 weighted sum), plus all individual stage metrics.
 
 ---
 
 ## Inference
 
 ```bash
-python tools/infer_video.py \
-    input=path/to/video.mp4 \
-    checkpoint=outputs/stage4/checkpoint_best.pth \
-    output=outputs/inference \
-    score_threshold=0.3 \
-    show_bbox=true \
-    show_id=true \
-    show_action=true
+yoake predict \
+    source=path/to/video.mp4 \
+    weights=runs/train/stage4/weights/best.pth \
+    score_threshold=0.3
+```
+
+Output goes to `runs/predict/` by default. Override with `output_dir=`.
+
+```bash
+# Run on a directory of videos
+yoake predict \
+    source=data/videos/ \
+    weights=runs/train/stage4/weights/best.pth \
+    output_dir=runs/predict/myexp
 ```
 
 ### Inference Output
@@ -536,19 +589,140 @@ train:
   use_wandb: false               # W&B experiment tracking
 ```
 
+### Class Imbalance (Stage 2 / 4)
+
+```yaml
+loss:
+  imbalance_strategy: class_weight   # none | class_weight | focal
+  # class_weight: scans up to 200 training batches, computes Laplace-smoothed
+  #               inverse-frequency weights, calls ActionLoss.set_class_weights()
+  # focal:        uses focal loss (gamma=2.0) without per-class weighting
+  # none:         plain cross-entropy
+```
+
+CLI override:
+
+```bash
+yoake train stage=2 loss.imbalance_strategy=class_weight
+```
+
+> **Note:** `imbalance_strategy=sampler` is not implemented and will fall back to `class_weight` with a warning.
+
+Computed class weights and per-class sample counts are saved to `args.yaml` after the first scan.
+
+### Metrics Configuration
+
+```yaml
+metrics:
+  stage2_primary: macro_f1        # macro_f1 | val_loss
+  stage3_primary: idf1            # idf1 | val_loss
+  stage4_primary: composite       # composite | ap50 | val_loss
+  composite_ap50: 0.4             # weight for AP50 in Stage 4 composite score
+  composite_macro_f1: 0.3         # weight for macro_F1
+  composite_idf1: 0.3             # weight for IDF1
+```
+
+CLI overrides:
+
+```bash
+yoake train stage=4 metrics.stage4_primary=composite
+yoake train stage=4 metrics.composite_ap50=0.5 metrics.composite_macro_f1=0.25 metrics.composite_idf1=0.25
+```
+
 ---
 
 ## Output Formats
 
-### Checkpoint Directory
+### Run Directory Structure
 
 ```
-outputs/stage1/
-  checkpoint_best.pth     # Best checkpoint (by val metric)
-  checkpoint_last.pth     # Latest checkpoint
-  train_log.csv           # Per-epoch: epoch, loss, val_loss, val_ap50, lr
-  config.yaml             # Configuration snapshot
+runs/
+  train/stage{N}/
+    weights/
+      best.pth            # Best checkpoint by primary metric (EMA weights when available)
+      last.pth            # Checkpoint from last epoch
+    args.yaml             # Full config snapshot with class_counts, class_weights
+    results.csv           # Per-epoch metrics (unified columns across all stages)
+    val/
+      epoch_NNN.json      # Per-epoch detailed evaluation results
+    plots/
+      loss_history.png    # Train/val loss curve
+      f1_history.png      # macro_F1 over epochs (Stage 2/4)
+      idf1_history.png    # IDF1 over epochs (Stage 3/4)
+      composite_history.png  # Composite score over epochs (Stage 4)
+      confusion_matrix.png   # Confusion matrix PNG (Stage 2/4, requires matplotlib)
+      confusion_matrix.json  # Confusion matrix JSON (always saved)
+    metrics_latest.json   # Latest val metrics + best-so-far tracking info
+    train.log
+  val/stage{N}/
+    val_results.json
+    confusion_matrix.png  # Stage 2/4
+    per_class_metrics.json
+    per_class_metrics.csv
+    metrics_latest.json
+  predict/                # Inference results
+  analyze/                # Analysis results
+
 ```
+
+### results.csv Columns
+
+All stages share a unified column set; columns not applicable to a stage are empty strings.
+`val_loss` is stored as an unweighted validation objective so runs stay comparable even when train-time class weighting is enabled.
+
+| Column | Stage | Description |
+|--------|-------|-------------|
+| `epoch` | all | Epoch number |
+| `train_loss` | all | Training loss |
+| `val_loss` | all | Unweighted validation loss |
+| `val_loss_kind` | all | Current validation loss definition (`unweighted`) |
+| `ap50` | 1, 4 | AP @ IoU=0.5 |
+| `macro_f1` | 2, 4 | Macro-averaged F1 |
+| `weighted_f1` | 2, 4 | Sample-weighted F1 |
+| `idf1` | 3, 4 | Identity F1 |
+| `idp` | 3, 4 | Identity Precision |
+| `idr` | 3, 4 | Identity Recall |
+| `idsw` | 3, 4 | ID switch count |
+| `composite_score` | 4 | 0.4*AP50 + 0.3*macro_F1 + 0.3*IDF1 |
+| `lr` | all | Learning rate at epoch end |
+| `primary_metric` | all | Name of the primary metric for this stage |
+| `primary_metric_value` | all | Value of the primary metric |
+| `best_so_far` | all | Best primary metric value seen so far |
+
+### Validation Metric JSONs
+
+`val/epoch_NNN.json` and `metrics_latest.json` share the same core validation keys:
+
+- `val_loss`, `val_loss_kind`
+- `val_AP50` when detection metrics are active
+- `macro_f1`, `weighted_f1` when action metrics are active
+- `idf1`, `idp`, `idr`, `IDSW` when tracking metrics are active
+- `primary_metric`, `primary_metric_value`, `best_so_far`
+
+For Stage 3 / 4, `idp` / `idr` come from the same lightweight validation-time tracking proxy as `idf1`.
+
+---
+
+## Testing and CI
+
+Development/test dependencies:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+Run the test suite:
+
+```bash
+pytest -q
+```
+
+CI:
+
+- GitHub Actions workflow: `.github/workflows/tests.yml`
+- Python: 3.10
+- Install step: `pip install -r requirements-dev.txt`
+- Test step: `pytest -q`
 
 ### Inference JSON
 
@@ -866,72 +1040,93 @@ print(validate_annotation(anno))
 
 学習は4段階で進めます。Stage 2 と Stage 3 は互いに独立しており、別々のGPUで並列実行できます。
 
-### Stage 1: 空間検出器
+### クイックスタート — `yoake` CLI（推奨）
+
+`pip install -e .` インストール後、`yoake` コマンド一本で実行できます：
 
 ```bash
-python scripts/train_stage1_detector.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    output_dir=outputs/stage1 \
-    num_epochs=100 \
-    batch_size=4
+# Stage 1: 空間検出器
+yoake train stage=1 data.train_root=data/train data.val_root=data/val
+
+# Stage 2: 行動ヘッド（Stage 1 のチェックポイントを自動ロード）
+yoake train stage=2
+
+# Stage 3: IDヘッド（Stage 2 と別GPUで並列実行可能）
+yoake train stage=3
+
+# Stage 4: 統合微調整
+yoake train stage=4
 ```
 
+出力は `runs/train/stage{N}/` に保存されます。
+
+`key=value` でパラメータを自由に上書きできます：
+
+```bash
+yoake train stage=1 train.max_epochs=100 data.batch_size=8 model.variant=small
+```
+
+### Stage 1: 空間検出器
+
 **目的:** 単一フレームで動物を検出・局在化する能力を学習する。
-**推奨エポック数:** 50〜100 | **1エポック所要時間:** 約8分（RTX 8000）
+**推奨エポック数:** 50〜500 | **1エポック所要時間:** 約8分（RTX 8000）
+
+```bash
+yoake train stage=1 \
+    data.train_root=data/train \
+    data.val_root=data/val \
+    train.max_epochs=100 \
+    data.batch_size=4
+```
 
 ### Stage 2: 行動ヘッド
 
-```bash
-python scripts/train_stage2_action.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    output_dir=outputs/stage2 \
-    num_epochs=30
-```
-
 **目的:** 時間的クエリ特徴量から行動を分類する能力を学習する。
-**推奨エポック数:** 20〜40 | **1エポック所要時間:** 約3分
+**推奨エポック数:** 20〜80 | **1エポック所要時間:** 約3分
+
+```bash
+yoake train stage=2 data.train_root=data/train data.val_root=data/val
+```
 
 ### Stage 3: IDヘッド
 
-```bash
-python scripts/train_stage3_id.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    output_dir=outputs/stage3 \
-    num_epochs=30
-```
-
 **目的:** 個体再識別のための持続的ID埋め込みを学習する。
-**推奨エポック数:** 20〜40 | **1エポック所要時間:** 約3分
+**推奨エポック数:** 20〜80 | **1エポック所要時間:** 約3分
 *（Stage 2 と別のGPUで並列実行可能）*
+
+```bash
+yoake train stage=3
+```
 
 ### Stage 4: 統合微調整
 
-```bash
-python scripts/train_stage4_unified.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    stage2_ckpt=outputs/stage2/checkpoint_best.pth \
-    stage3_ckpt=outputs/stage3/checkpoint_best.pth \
-    output_dir=outputs/stage4 \
-    num_epochs=30
-```
-
 **目的:** 全モジュールを複合損失で共同微調整する。
-**推奨エポック数:** 20〜40 | **1エポック所要時間:** 約10分
+**推奨エポック数:** 20〜50 | **1エポック所要時間:** 約10分
+
+```bash
+yoake train stage=4
+```
 
 ### ベースディレクトリ（`root=`）
 
-すべての学習・評価スクリプトは `root=<path>` 引数でデータ/出力のベースディレクトリを指定できます。デフォルトは `C:/Users/hayam/Desktop/YOAKE_tryal` です。例:
+スクリプト・CLIとも `root=<path>` でワーキングルートを指定できます。デフォルトはリポジトリルート（自動検出）です。前ステージのチェックポイントは `{root}/runs/train/` から自動探索されます。
 
 ```bash
-python scripts/train_stage1_detector.py root=/data/myproject ...
+yoake train stage=2 root=/data/myproject
 ```
+
+### 旧スクリプトインターフェース（非推奨）
+
+従来のスクリプトも引き続き動作しますが非推奨です：
+
+```bash
+python scripts/train_stage1.py data.train_root=data/train
+python scripts/train_stage2.py
+python scripts/train_stage3.py
+python scripts/train_stage4.py
+```
+
+> ⚠️ `scripts/train_stage1_detector.py` 等 `_detector/_action/_id/_unified` の付くスクリプトは旧 `stage_trainers.py` 系統です。上記 CLI またはスクリプトを推奨します。
 
 ### 主要ハイパーパラメータ
 
@@ -968,67 +1163,91 @@ python scripts/train_stage1_detector.py root=/data/myproject ...
 
 ## 評価
 
+### `yoake val` CLI（推奨）
+
+```bash
+yoake val stage=1
+yoake val stage=2
+yoake val stage=3
+yoake val stage=4
+```
+
+`checkpoint=` を省略すると `runs/train/stage{N}/weights/best.pth` が自動で探索されます。
+
+### ステージ別プライマリ指標
+
+| Stage | プライマリ指標 | 方向 | 説明 |
+|-------|-------------|------|------|
+| Stage 1 | AP50 | 高いほど良い | IoU=0.5 の COCO スタイル検出 AP |
+| Stage 2 | macro_F1 | 高いほど良い | クラス非加重平均 F1 |
+| Stage 3 | IDF1 | 高いほど良い | Identity F1 (IDP・IDR の調和平均) |
+| Stage 4 | composite | 高いほど良い | `0.4*AP50 + 0.3*macro_F1 + 0.3*IDF1` |
+
 ### Stage 1: 検出評価
 
 ```bash
-python scripts/eval_stage1.py \
-    anno=data/val/annotations.json \
-    checkpoint=outputs/stage1/stage1_best.pth \
-    output_dir=outputs/eval_stage1 \
-    score_thresh=0.05
+yoake val stage=1 \
+    data.val_root=data/val \
+    checkpoint=runs/train/stage1/weights/best.pth
 ```
 
-メトリクス: **AP50**、**AP75**、クラス別 AP
+出力: `runs/val/stage1/val_results.json`、`metrics_latest.json`
 
-> **注意:** `eval_stage1.py` は出力ディレクトリに `score_distribution.json` も生成します。`score_thresh` 引数（デフォルト `0.05`）で評価時の最小検出信頼度を設定できます。
+メトリクス: **AP50**、**AP75**、class-aware の集約 AP / recall です。現状はクラス別 AP 表の出力ではありません。
 
 ### Stage 2: 行動分類評価
 
 ```bash
-python scripts/eval_stage2.py \
-    anno=data/val/annotations.json \
-    checkpoint=outputs/stage2/checkpoint_best.pth \
-    output_dir=outputs/eval_stage2
+yoake val stage=2 \
+    data.val_root=data/val \
+    checkpoint=runs/train/stage2/weights/best.pth
 ```
 
-メトリクス: **Macro F1**、クラス別 F1 / Precision / Recall、混同行列
+出力: `runs/val/stage2/val_results.json`、`confusion_matrix.png`、`per_class_metrics.json`、`per_class_metrics.csv`
+
+メトリクス: **Macro F1**、Weighted F1、クラス別 F1 / Precision / Recall、混同行列
 
 ### Stage 3: ID追跡評価
 
 ```bash
-python scripts/eval_stage3.py \
-    anno=data/val/annotations.json \
-    checkpoint=outputs/stage3/checkpoint_best.pth \
-    output_dir=outputs/eval_stage3
+yoake val stage=3 \
+    data.val_root=data/val \
+    checkpoint=runs/train/stage3/weights/best.pth
 ```
 
-メトリクス: **IDF1**、IDスイッチ数、**MOTA**、トラック断絶数
+メトリクス: **IDF1**、**IDP**、**IDR**、ID スイッチ数（IDSW）です。Stage 3 / 4 では同じ lightweight validation proxy で一貫して算出されます。
 
-### 統合評価
+### 統合評価（Stage 4）
 
 ```bash
-python scripts/eval_unified.py \
-    anno=data/test/annotations.json \
-    checkpoint=outputs/stage4/checkpoint_best.pth \
-    output_dir=outputs/eval_unified \
-    score_threshold=0.3
+yoake val stage=4 \
+    data.val_root=data/test \
+    checkpoint=runs/train/stage4/weights/best.pth
 ```
 
-全メトリクスをまとめた `results_unified.json` を出力します。
+出力: `runs/val/stage4/val_results.json`、`confusion_matrix.png`、`per_class_metrics.json`
+
+メトリクス: **composite**（AP50 + macro_F1 + IDF1 の加重和）、各ステージの個別指標も含む。
 
 ---
 
 ## 推論
 
 ```bash
-python tools/infer_video.py \
-    input=path/to/video.mp4 \
-    checkpoint=outputs/stage4/checkpoint_best.pth \
-    output=outputs/inference \
-    score_threshold=0.3 \
-    show_bbox=true \
-    show_id=true \
-    show_action=true
+yoake predict \
+    source=path/to/video.mp4 \
+    weights=runs/train/stage4/weights/best.pth \
+    score_threshold=0.3
+```
+
+出力は `runs/predict/` に保存されます。`output_dir=` で変更できます。
+
+```bash
+# ディレクトリ内の全動画を処理
+yoake predict \
+    source=data/videos/ \
+    weights=runs/train/stage4/weights/best.pth \
+    output_dir=runs/predict/myexp
 ```
 
 ### 推論出力ファイル
@@ -1118,18 +1337,79 @@ train:
   use_wandb: false               # W&B 実験追跡
 ```
 
+### クラス不均衡対策（Stage 2 / 4）
+
+```yaml
+loss:
+  imbalance_strategy: class_weight   # none | class_weight | focal
+  # class_weight: 最大200バッチをスキャンし、ラプラス平滑化した逆頻度重みを計算
+  #               ActionLoss.set_class_weights() に自動で渡される
+  # focal:        Focal損失（gamma=2.0）を使用、クラスごとの重みなし
+  # none:         通常のクロスエントロピー
+```
+
+CLI での指定:
+
+```bash
+yoake train stage=2 loss.imbalance_strategy=class_weight
+```
+
+> **注意:** `imbalance_strategy=sampler` は未実装です。`class_weight` にフォールバックし、警告を出力します。
+
+計算されたクラス重みとクラスごとのサンプル数は、最初のスキャン後に `args.yaml` に保存されます。
+
+### メトリクス設定
+
+```yaml
+metrics:
+  stage2_primary: macro_f1        # macro_f1 | val_loss
+  stage3_primary: idf1            # idf1 | val_loss
+  stage4_primary: composite       # composite | ap50 | val_loss
+  composite_ap50: 0.4             # Stage 4 複合スコアにおける AP50 の重み
+  composite_macro_f1: 0.3         # macro_F1 の重み
+  composite_idf1: 0.3             # IDF1 の重み
+```
+
+CLI での指定:
+
+```bash
+yoake train stage=4 metrics.stage4_primary=composite
+yoake train stage=4 metrics.composite_ap50=0.5 metrics.composite_macro_f1=0.25 metrics.composite_idf1=0.25
+```
+
 ---
 
 ## 出力形式
 
-### チェックポイントディレクトリ
+### 実行ディレクトリ構成
 
 ```
-outputs/stage1/
-  checkpoint_best.pth     # 最良チェックポイント（検証メトリクス基準）
-  checkpoint_last.pth     # 最新チェックポイント
-  train_log.csv           # エポックごと: epoch, loss, val_loss, val_ap50, lr
-  config.yaml             # 設定のスナップショット
+runs/
+  train/stage{N}/
+    weights/
+      best.pth            # プライマリ指標が最良のチェックポイント（EMA重みを優先）
+      last.pth            # 最終エポックのチェックポイント
+    args.yaml             # 実行時設定の完全スナップショット（class_counts・class_weights含む）
+    results.csv           # エポック別メトリクス（全ステージ共通列）
+    val/
+      epoch_NNN.json      # エポック別詳細評価結果
+    plots/
+      loss_history.png    # Train/val ロス推移グラフ
+      f1_history.png      # macro_F1 推移（Stage 2/4）
+      idf1_history.png    # IDF1 推移（Stage 3/4）
+      composite_history.png  # 複合スコア推移（Stage 4）
+      confusion_matrix.png   # 混同行列 PNG（Stage 2/4、matplotlib が必要）
+      confusion_matrix.json  # 混同行列 JSON（常に保存）
+    metrics_latest.json   # 最新バリデーション指標 + ベスト追跡情報
+    train.log
+  val/stage{N}/
+    val_results.json
+    confusion_matrix.png  # Stage 2/4
+    per_class_metrics.json
+    per_class_metrics.csv
+    metrics_latest.json
+  predict/                # 推論結果
+  analyze/                # 解析結果
 ```
 
 ### 推論結果 JSON
@@ -1191,4 +1471,4 @@ outputs/stage1/
 
 ---
 
-*YOAKE Manual — last updated 2026-03-18*
+*YOAKE Manual — last updated 2026-03-28*

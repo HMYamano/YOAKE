@@ -10,9 +10,9 @@ visualize_stage1_val.py — Stage 1 モデルで validation データを解析�
 
   # 直接指定
   python scripts/visualize_stage1_val.py \
-      anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/val/annotations.json \
-      checkpoint=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage1/stage1_best.pth \
-      output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/eval_stage1_vis \
+      anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/val/annotations.json \
+      checkpoint=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage1/stage1_best.pth \
+      output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/eval_stage1_vis \
       score_thresh=0.3 \
       max_images=50
 """
@@ -37,7 +37,7 @@ from htrtdetr.evaluation.evaluator import DetectionEvaluator
 from htrtdetr.utils.misc import load_checkpoint, cxcywh_to_xyxy
 
 
-_YOAKE_TRYAL = "C:/Users/hayam/Desktop/YOAKE_tryal"
+_DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 # 描画色 (RGB)
 COLOR_GT   = (220, 50,  50)   # 赤: GT
@@ -102,17 +102,18 @@ def draw_boxes_on_image(
 def main():
     overrides = parse_overrides(sys.argv[1:])
 
-    root            = overrides.pop("root", _YOAKE_TRYAL)
+    root            = overrides.pop("root", _DEFAULT_ROOT)
     anno_path       = overrides.get("anno",       f"{root}/data/val/annotations.json")
     checkpoint_path = overrides.get("checkpoint", None)
-    output_dir      = Path(overrides.get("output_dir", f"{root}/outputs/eval_stage1_vis"))
+    output_dir      = Path(overrides.get("output_dir", f"{root}/runs/visualize/stage1_val"))
     score_thresh    = float(overrides.get("score_thresh", "0.05"))
     max_images      = int(overrides.get("max_images", "200"))
 
     if checkpoint_path is None:
         checkpoint_path = find_checkpoint([
-            f"{root}/outputs/stage1/stage1_best.pth",
-            f"{root}/outputs/stage1/last.pth",
+            f"{root}/runs/train/stage1/stage1_best.pth",
+            f"{root}/runs/train/stage1/last.pth",
+            f"{root}/outputs/stage1/stage1_best.pth",  # legacy
         ])
 
     # 絶対パスに解決してから表示・作成する

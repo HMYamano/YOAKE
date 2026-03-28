@@ -1,7 +1,7 @@
 # setup_pretrain_configs_small.py
 # yoake-small (ResNet-18 backbone, feature_dim=128) 用の設定ファイルを生成する
 # 実行: python C:/Users/utopi/YOAKE/setup_pretrain_configs_small.py
-# 生成先: C:/Users/utopi/YOAKE_pre-train/configs/
+# 生成先: C:/Users/utopi/YOAKE_small_pretrain/configs/
 
 import sys
 import os
@@ -9,11 +9,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from htrtdetr.config.config import get_variant_config
 
-WORK = "C:/Users/utopi/YOAKE_pre-train"  # ← 自分の環境に合わせて変更
+WORK = "C:/Users/utopi/YOAKE_small_pretrain"  # ← 自分の環境に合わせて変更
 VARIANT = "small"                          # ResNet-18, feature_dim=128, ~15-20M params
 
 
-def make_stage1_config(num_classes: int = 84):
+def make_stage1_config(num_classes: int = 125):
     """
     Stage 1: 物体検出事前学習
       - データ: COCO (330K) + AP-10K (10K) を YOAKE 形式にマージしたもの
@@ -24,7 +24,7 @@ def make_stage1_config(num_classes: int = 84):
 
     num_classes: マージ後の実際のクラス数。
                  merge_stage1_annotations.py 実行後に確認して更新すること。
-                 python -c "import json; d=json.load(open(r'C:/Users/utopi/YOAKE_pre-train/data/stage1/train/annotations.json')); print(len(d['class_names']))"
+                 python -c "import json; d=json.load(open(r'C:/Users/utopi/YOAKE_small_pretrain/data/stage1/train/annotations.json')); print(len(d['class_names']))"
     """
     cfg = get_variant_config(VARIANT, stage=1, overrides={
         "data": {
@@ -97,7 +97,7 @@ def make_stage2_config(num_actions: int = 140):
 
     num_actions: Animal Kingdom の実際のアクションクラス数。
                  convert 後に確認すること。
-                 python -c "import json; d=json.load(open(r'C:/Users/utopi/YOAKE_pre-train/data/stage2/train/annotations.json')); print(len(d['action_names']))"
+                 python -c "import json; d=json.load(open(r'C:/Users/utopi/YOAKE_small_pretrain/data/stage2/train/annotations.json')); print(len(d['action_names']))"
     """
     cfg = get_variant_config(VARIANT, stage=2, overrides={
         "data": {

@@ -2,8 +2,8 @@
 
 > **対象GPU**: NVIDIA RTX 8000（VRAM 48GB）
 > **モデルバリアント**: large（ResNet-50 backbone, hidden_dim=512）
-> **リポジトリ**: `c:/Users/hayam/YOAKE`
-> **データ・出力先**: `c:/Users/hayam/Desktop/YOAKE_tryal`
+> **リポジトリ**: `c:/Users/utopi/YOAKE`
+> **データ・出力先**: `c:/Users/utopi/Desktop/YOAKE_tryal`
 
 ---
 
@@ -69,7 +69,7 @@
 
 ```bash
 # カレントディレクトリを YOAKE に設定
-cd c:/Users/hayam/YOAKE
+cd c:/Users/utopi/YOAKE
 
 # PyTorch (CUDA 12.x 向け。環境に合わせて変更)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
@@ -91,7 +91,7 @@ pip install -e .
 ### 2-2. ディレクトリ構成の作成
 
 ```bash
-YOAKE_TRYAL="C:/Users/hayam/Desktop/YOAKE_tryal"
+YOAKE_TRYAL="C:/Users/utopi/Desktop/YOAKE_tryal"
 
 mkdir -p "${YOAKE_TRYAL}/data/train"
 mkdir -p "${YOAKE_TRYAL}/data/val"
@@ -150,14 +150,14 @@ annotations.json
   "videos": [
     {
       "video_id": "video_001",
-      "video_path": "C:/Users/hayam/Desktop/YOAKE_tryal/videos/video_001.mp4",
+      "video_path": "C:/Users/utopi/Desktop/YOAKE_tryal/videos/video_001.mp4",
       "fps": 30.0,
       "width": 1280,
       "height": 720,
       "frames": [
         {
           "frame_id": 0,
-          "image_path": "C:/Users/hayam/Desktop/YOAKE_tryal/frames/video_001/frame_000000.jpg",
+          "image_path": "C:/Users/utopi/Desktop/YOAKE_tryal/frames/video_001/frame_000000.jpg",
           "annotations": [
             {"track_id": 0, "class_id": 0, "bbox": [0.3, 0.4, 0.05, 0.08], "action_id": 0},
             {"track_id": 1, "class_id": 0, "bbox": [0.6, 0.5, 0.06, 0.09], "action_id": 1}
@@ -165,7 +165,7 @@ annotations.json
         },
         {
           "frame_id": 1,
-          "image_path": "C:/Users/hayam/Desktop/YOAKE_tryal/frames/video_001/frame_000001.jpg",
+          "image_path": "C:/Users/utopi/Desktop/YOAKE_tryal/frames/video_001/frame_000001.jpg",
           "annotations": [
             {"track_id": 0, "class_id": 0, "bbox": [0.31, 0.41, 0.05, 0.08], "action_id": 0},
             {"track_id": 1, "class_id": 0, "bbox": [0.61, 0.51, 0.06, 0.09], "action_id": 2}
@@ -173,7 +173,7 @@ annotations.json
         },
         {
           "frame_id": 2,
-          "image_path": "C:/Users/hayam/Desktop/YOAKE_tryal/frames/video_001/frame_000002.jpg",
+          "image_path": "C:/Users/utopi/Desktop/YOAKE_tryal/frames/video_001/frame_000002.jpg",
           "annotations": [
             {"track_id": 0, "class_id": 0, "bbox": [0.32, 0.42, 0.05, 0.08], "action_id": 0},
             {"track_id": 1, "class_id": 0, "bbox": [0.62, 0.52, 0.06, 0.09], "action_id": 3}
@@ -197,7 +197,7 @@ import json
 from pathlib import Path
 from htrtdetr.data import load_annotations
 
-ROOT = "C:/Users/hayam/Desktop/YOAKE_tryal"
+ROOT = "C:/Users/utopi/Desktop/YOAKE_tryal"
 
 def check_split(split: str):
     anno_path = f"{ROOT}/data/{split}/annotations.json"
@@ -254,11 +254,11 @@ for split in ["train", "val", "test"]:
 #### (b) 実行コマンド（RTX 8000向け最適化）
 
 ```bash
-cd c:/Users/hayam/YOAKE
+cd c:/Users/utopi/YOAKE
 
 python scripts/train_stage1.py \
-    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/train/annotations.json \
-    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/val/annotations.json \
+    train_anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/train/annotations.json \
+    val_anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/val/annotations.json \
     train.max_epochs=500 \
     train.use_amp=true \
     data.batch_size=64 \
@@ -359,7 +359,7 @@ validate_config(cfg)
 print("Config validation: OK")
 
 # YAML に保存
-cfg.save_yaml("C:/Users/hayam/Desktop/YOAKE_tryal/configs/stage1_large.yaml")
+cfg.save_yaml("C:/Users/utopi/Desktop/YOAKE_tryal/configs/stage1_large.yaml")
 ```
 
 **RTX 8000 向けパラメーター一覧（Stage 1）:**
@@ -399,7 +399,7 @@ import torch
 from htrtdetr.config.config import get_variant_config
 from htrtdetr.models import build_model
 
-ckpt_path = "C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage1/stage1_best.pth"
+ckpt_path = "C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage1/stage1_best.pth"
 cfg = get_variant_config("large", stage=1)
 model = build_model(cfg.model)
 
@@ -421,9 +421,9 @@ print(f"Unexpected keys: {len(unexpected)}")
 
 ```bash
 python scripts/eval_stage1.py \
-    anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/val/annotations.json \
-    checkpoint=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage1/stage1_best.pth \
-    output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/eval_stage1
+    anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/val/annotations.json \
+    checkpoint=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage1/stage1_best.pth \
+    output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/eval_stage1
 ```
 
 期待される出力:
@@ -433,7 +433,7 @@ AP50             : 0.887
 AP75             : 0.762
 Recall@50        : 0.921
 Mean center error: 3.42 px  (at 640×640)
-Results saved to: C:/Users/hayam/Desktop/YOAKE_tryal/outputs/eval_stage1/
+Results saved to: C:/Users/utopi/Desktop/YOAKE_tryal/outputs/eval_stage1/
 ```
 
 ---
@@ -455,10 +455,10 @@ Results saved to: C:/Users/hayam/Desktop/YOAKE_tryal/outputs/eval_stage1/
 #### (b) 実行コマンド
 
 ```bash
-cd c:/Users/hayam/YOAKE
+cd c:/Users/utopi/YOAKE
 
 python scripts/train_stage2.py \
-    train.resume=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage1/stage1_best.pth \
+    train.resume=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage1/stage1_best.pth \
     train.max_epochs=80 \
     train.use_amp=true \
     data.batch_size=16 \
@@ -576,7 +576,7 @@ import torch
 from htrtdetr.config.config import get_variant_config
 from htrtdetr.models import build_model
 
-ckpt_path = "C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage2/stage2_best.pth"
+ckpt_path = "C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage2/stage2_best.pth"
 cfg = get_variant_config("large", stage=2)
 model = build_model(cfg.model)
 model.set_stage(2)
@@ -593,8 +593,8 @@ print(f"Missing keys (ID head 等は正常): {missing[:5]}")
 
 ```bash
 python scripts/eval_stage2.py \
-    checkpoint=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage2/stage2_best.pth \
-    output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/eval_stage2
+    checkpoint=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage2/stage2_best.pth \
+    output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/eval_stage2
 ```
 
 ```
@@ -628,7 +628,7 @@ Per-class F1:
 #### (b) 実行コマンド
 
 ```bash
-cd c:/Users/hayam/YOAKE
+cd c:/Users/utopi/YOAKE
 
 python scripts/train_stage3.py \
     train.max_epochs=80 \
@@ -750,7 +750,7 @@ import torch
 from htrtdetr.config.config import get_variant_config
 from htrtdetr.models import build_model
 
-ckpt_path = "C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage3/stage3_best.pth"
+ckpt_path = "C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage3/stage3_best.pth"
 cfg = get_variant_config("large", stage=3)
 model = build_model(cfg.model)
 model.set_stage(3)
@@ -765,8 +765,8 @@ print("Weights loaded OK")
 
 ```bash
 python scripts/eval_stage3.py \
-    checkpoint=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage3/stage3_best.pth \
-    output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/eval_stage3
+    checkpoint=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage3/stage3_best.pth \
+    output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/eval_stage3
 ```
 
 ```
@@ -793,7 +793,7 @@ Stage 2/3 で独立して学習した各ヘッドを統合し、相互に最適�
 #### (b) 実行コマンド
 
 ```bash
-cd c:/Users/hayam/YOAKE
+cd c:/Users/utopi/YOAKE
 
 python scripts/train_stage4.py \
     train.max_epochs=50 \
@@ -918,7 +918,7 @@ import torch
 from htrtdetr.config.config import get_variant_config
 from htrtdetr.models import build_model
 
-ckpt_path = "C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage4/stage4_best.pth"
+ckpt_path = "C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage4/stage4_best.pth"
 cfg = get_variant_config("large", stage=4)
 model = build_model(cfg.model)
 model.set_stage(4)
@@ -937,8 +937,8 @@ print(f"Stage 4 checkpoint fully loaded. Epoch: {ckpt['epoch']}")
 
 ```bash
 python scripts/eval_stage4.py \
-    checkpoint=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage4/stage4_best.pth \
-    output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/eval_stage4
+    checkpoint=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage4/stage4_best.pth \
+    output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/eval_stage4
 ```
 
 ```
@@ -965,7 +965,7 @@ from htrtdetr.config.config import get_variant_config
 from htrtdetr.models import build_model
 from htrtdetr.utils import load_model_weights
 
-ROOT = "C:/Users/hayam/Desktop/YOAKE_tryal"
+ROOT = "C:/Users/utopi/Desktop/YOAKE_tryal"
 
 def load_stage_weights(target_stage: int, variant: str = "large") -> None:
     """指定ステージのモデルに前ステージの重みをロードする"""
@@ -1071,7 +1071,7 @@ print(f"num_species              : {cfg.model.id_head.num_species}")            
 ### 実行コマンド（複数種混在）
 
 ```bash
-cd c:/Users/hayam/YOAKE
+cd c:/Users/utopi/YOAKE
 
 python scripts/train_stage4.py \
     train.max_epochs=50 \
@@ -1204,9 +1204,9 @@ from htrtdetr.models import build_model
 from htrtdetr.models.id_head import IdentityMemory
 
 # ===== 設定 =====
-CHECKPOINT  = "C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage4/stage4_best.pth"
-INPUT_VIDEO = "C:/Users/hayam/Desktop/YOAKE_tryal/videos/test_video.mp4"
-OUTPUT_VIDEO= "C:/Users/hayam/Desktop/YOAKE_tryal/outputs/inference/result.mp4"
+CHECKPOINT  = "C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage4/stage4_best.pth"
+INPUT_VIDEO = "C:/Users/utopi/Desktop/YOAKE_tryal/videos/test_video.mp4"
+OUTPUT_VIDEO= "C:/Users/utopi/Desktop/YOAKE_tryal/outputs/inference/result.mp4"
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE    = (640, 640)   # (H, W)
 SCORE_THR   = 0.3
@@ -1368,7 +1368,7 @@ print(f"Saved: {OUTPUT_VIDEO}")
 #    - annotations_trainval2017.zip
 
 # 解凍先の想定ディレクトリ構成:
-# C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/coco/
+# C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/coco/
 #   images/train2017/
 #   images/val2017/
 #   annotations/instances_train2017.json
@@ -1388,8 +1388,8 @@ import json
 from pathlib import Path
 from tqdm import tqdm
 
-COCO_ROOT  = "C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/coco"
-OUT_ROOT   = "C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/coco_yoake"
+COCO_ROOT  = "C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/coco"
+OUT_ROOT   = "C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/coco_yoake"
 
 
 def convert_split(split: str, max_images: int = None):
@@ -1483,17 +1483,17 @@ if __name__ == "__main__":
 **変換後の COCO pre-train 実行:**
 
 ```bash
-cd c:/Users/hayam/YOAKE
+cd c:/Users/utopi/YOAKE
 
 python scripts/train_stage1.py \
-    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/coco_yoake/data/train/annotations.json \
-    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/coco_yoake/data/val/annotations.json \
+    train_anno=C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/coco_yoake/data/train/annotations.json \
+    val_anno=C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/coco_yoake/data/val/annotations.json \
     train.max_epochs=100 \
     train.use_amp=true \
     data.batch_size=64 \
     data.num_workers=12 \
     optimizer.lr=1e-4 \
-    train.output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/pretrain_coco
+    train.output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/pretrain_coco
 ```
 
 ---
@@ -1505,7 +1505,7 @@ python scripts/train_stage1.py \
 #   https://motchallenge.net/data/MOT17/ から MOT17.zip を取得
 #
 # 解凍後の想定ディレクトリ構成:
-# C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/MOT17/
+# C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/MOT17/
 #   train/
 #     MOT17-02-DPM/
 #       img1/          ← フレーム画像 (000001.jpg, ...)
@@ -1529,8 +1529,8 @@ from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
 
-MOT17_ROOT = "C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/MOT17"
-OUT_ROOT   = "C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/mot17_yoake"
+MOT17_ROOT = "C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/MOT17"
+OUT_ROOT   = "C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/mot17_yoake"
 
 
 def parse_gt(gt_path: Path, img_dir: Path, seq_name: str):
@@ -1653,7 +1653,7 @@ if __name__ == "__main__":
 # --- 変換後の内容確認 ---
 # python -c "
 # import json
-# with open('C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/mot17_yoake/data/train/annotations.json') as f:
+# with open('C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/mot17_yoake/data/train/annotations.json') as f:
 #     d = json.load(f)
 # print(f'sequences : {len(d[\"videos\"])}')
 # print(f'frames    : {sum(len(v[\"frames\"]) for v in d[\"videos\"])}')
@@ -1666,13 +1666,13 @@ if __name__ == "__main__":
 ```bash
 # Step 1: MOT17 で Stage 1 pre-train
 python scripts/train_stage1.py \
-    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/mot17_yoake/data/train/annotations.json \
-    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/pretrain_data/mot17_yoake/data/train/annotations.json \
+    train_anno=C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/mot17_yoake/data/train/annotations.json \
+    val_anno=C:/Users/utopi/Desktop/YOAKE_tryal/pretrain_data/mot17_yoake/data/train/annotations.json \
     train.max_epochs=150 \
     train.use_amp=true \
     data.batch_size=64 \
     data.num_workers=12 \
-    train.output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage1
+    train.output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage1
 
 # Step 2: MOT17 で Stage 3 pre-train (上記の重みを使用)
 python scripts/train_stage3.py \
@@ -1681,8 +1681,8 @@ python scripts/train_stage3.py \
     data.batch_size=16 \
     data.num_workers=12 \
     data.window_size=16 \
-    train.resume=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage1/stage1_best.pth \
-    train.output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage3
+    train.resume=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage1/stage1_best.pth \
+    train.output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage3
 ```
 
 ---
@@ -1716,7 +1716,7 @@ from htrtdetr.config.config import get_variant_config
 from htrtdetr.models import build_model
 from htrtdetr.utils import load_model_weights
 
-PRETRAIN_CKPT = "C:/Users/hayam/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage1/stage1_best.pth"
+PRETRAIN_CKPT = "C:/Users/utopi/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage1/stage1_best.pth"
 
 cfg = get_variant_config("large", stage=1, overrides={
     "train": {
@@ -1739,16 +1739,16 @@ print("Pre-train weights loaded. Starting fine-tune on fly data...")
 ```bash
 # コマンドラインから直接 resume して fine-tune する例
 python scripts/train_stage1.py \
-    train_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/train/annotations.json \
-    val_anno=C:/Users/hayam/Desktop/YOAKE_tryal/data/val/annotations.json \
-    train.resume=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage1/stage1_best.pth \
+    train_anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/train/annotations.json \
+    val_anno=C:/Users/utopi/Desktop/YOAKE_tryal/data/val/annotations.json \
+    train.resume=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/pretrain_mot17_stage1/stage1_best.pth \
     train.max_epochs=200 \
     train.use_amp=true \
     data.batch_size=64 \
     data.num_workers=12 \
     optimizer.lr=5e-5 \
     optimizer.backbone_lr_factor=0.1 \
-    train.output_dir=C:/Users/hayam/Desktop/YOAKE_tryal/outputs/stage1
+    train.output_dir=C:/Users/utopi/Desktop/YOAKE_tryal/outputs/stage1
 ```
 
 ---
