@@ -12,6 +12,9 @@ numpy>=1.24.0
 # Config
 pyyaml>=6.0
 
+# Progress bars
+tqdm>=4.65.0
+
 # Matching
 scipy>=1.10.0
 
