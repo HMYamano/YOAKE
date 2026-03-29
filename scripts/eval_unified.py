@@ -74,7 +74,7 @@ def main():
     model.set_stage(4)
 
     if Path(checkpoint_path).exists():
-        load_checkpoint(model, checkpoint_path, device=device)
+        load_checkpoint(checkpoint_path, model)
         print(f"Loaded checkpoint: {checkpoint_path}")
     else:
         print(f"Warning: checkpoint not found: {checkpoint_path}")
@@ -85,7 +85,7 @@ def main():
         num_classes=cfg.model.detector.head.num_classes,
         iou_thresholds=[0.5, 0.75],
     )
-    act_evaluator = ActionEvaluator(num_classes=cfg.model.action_head.num_actions)
+    act_evaluator = ActionEvaluator(cfg.model.action_head.num_actions)
     trk_evaluator = TrackingEvaluator()
 
     memory_list = None
@@ -135,9 +135,8 @@ def main():
                     # Truncate to min length (rough alignment)
                     min_n = min(N_b, len(gt_actions))
                     act_evaluator.update(
-                        pred_labels=preds_b[:min_n],
-                        gt_labels=gt_actions[:min_n].cpu(),
-                        pred_scores=scores_b[:min_n],
+                        preds_b[:min_n].tolist(),
+                        gt_actions[:min_n].cpu().tolist(),
                     )
                 ptr += N_b
 

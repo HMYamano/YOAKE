@@ -12,6 +12,8 @@ train_stage3_id.py — Stage 3: ID Head Training (Detector Frozen)  [DEPRECATED]
    このファイルは互換性のために残してありますが、今後削除される予定です。
 """
 
+from __future__ import annotations
+
 import warnings
 warnings.warn(
     "train_stage3_id.py は非推奨です。"
@@ -19,14 +21,10 @@ warnings.warn(
     DeprecationWarning,
     stacklevel=1,
 )
-# --- original docstring content preserved below for reference ---
 # Stage 3 では detector を freeze し、
 # per-track の geometric features から
 # Hierarchical Temporal Module と Memory-based ID Head を学習する。
 # 各動画内の track を local ID (0..N-1) に remapping して分類問題として解く。
-"""
-
-from __future__ import annotations
 
 import sys
 from pathlib import Path
@@ -107,7 +105,7 @@ def main():
     model.to(device)
 
     if stage1_ckpt and Path(stage1_ckpt).exists():
-        load_model_weights(model, stage1_ckpt, strict=False)
+        load_model_weights(stage1_ckpt, model, strict=False)
         print(f"Loaded stage1 weights: {stage1_ckpt}")
     else:
         if stage1_ckpt:

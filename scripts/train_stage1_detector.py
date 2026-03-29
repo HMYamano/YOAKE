@@ -21,6 +21,8 @@ train_stage1_detector.py — Stage 1: Spatial Detector Training  [DEPRECATED]
       resume=runs/train/stage1/checkpoint_last.pth
 """
 
+from __future__ import annotations
+
 import warnings
 warnings.warn(
     "train_stage1_detector.py は非推奨です。"
@@ -28,8 +30,6 @@ warnings.warn(
     DeprecationWarning,
     stacklevel=1,
 )
-
-from __future__ import annotations
 
 import sys
 from pathlib import Path

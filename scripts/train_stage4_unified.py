@@ -12,6 +12,8 @@ train_stage4_unified.py — Stage 4: Unified Fine-tuning (All Modules)  [DEPRECA
    このファイルは互換性のために残してありますが、今後削除される予定です。
 """
 
+from __future__ import annotations
+
 import warnings
 warnings.warn(
     "train_stage4_unified.py は非推奨です。"
@@ -19,10 +21,7 @@ warnings.warn(
     DeprecationWarning,
     stacklevel=1,
 )
-入力は full-scene シーケンス (T フレームの visual + geo features)。
-"""
-
-from __future__ import annotations
+# 入力は full-scene シーケンス (T フレームの visual + geo features)。
 
 import sys
 from pathlib import Path

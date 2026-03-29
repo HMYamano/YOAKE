@@ -137,7 +137,7 @@ def _build(
         raw = build_model(cfg.model)
         raw.set_stage(1)
         if checkpoint and Path(checkpoint).exists():
-            load_checkpoint(raw, checkpoint, device=device)
+            load_checkpoint(checkpoint, raw)
         raw.to(device).eval()
         wrapper = DetectorWrapper(raw)
 
@@ -155,7 +155,7 @@ def _build(
         raw = build_model(cfg.model)
         raw.set_stage(2)
         if checkpoint and Path(checkpoint).exists():
-            load_checkpoint(raw, checkpoint, device=device)
+            load_checkpoint(checkpoint, raw)
         raw.to(device).eval()
         wrapper = GeoStage2Wrapper(raw)
 
@@ -172,7 +172,7 @@ def _build(
         raw = build_model(cfg.model)
         raw.set_stage(3)
         if checkpoint and Path(checkpoint).exists():
-            load_checkpoint(raw, checkpoint, device=device)
+            load_checkpoint(checkpoint, raw)
         raw.to(device).eval()
         wrapper = GeoStage3Wrapper(raw)
 

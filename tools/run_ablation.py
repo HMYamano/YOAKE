@@ -79,7 +79,7 @@ def _eval_stage2(model, loader, device) -> Dict[str, float]:
     from htrtdetr.config.config import HTRTDETRConfig
 
     cfg = get_stage2_config()
-    evaluator = ActionEvaluator(num_classes=cfg.model.action_head.num_actions)
+    evaluator = ActionEvaluator(cfg.model.action_head.num_actions)
     model.eval()
 
     for batch in loader:
@@ -87,14 +87,12 @@ def _eval_stage2(model, loader, device) -> Dict[str, float]:
         gt_actions = batch["action_ids"]
         out = model.forward_geo_sequence(geo)
         preds = out["action_logits"].argmax(dim=-1).cpu()
-        scores = out["action_logits"].softmax(dim=-1).cpu()
         for i in range(geo.shape[0]):
             if gt_actions[i] < 0:
                 continue
             evaluator.update(
-                pred_labels=preds[i : i + 1],
-                gt_labels=gt_actions[i : i + 1],
-                pred_scores=scores[i : i + 1],
+                preds[i : i + 1].tolist(),
+                gt_actions[i : i + 1].tolist(),
             )
     return evaluator.compute()
 
@@ -198,7 +196,7 @@ def _run_variant(
 
     ckpt = _find_checkpoint(variant.name, checkpoint_dir)
     if ckpt:
-        load_checkpoint(model, ckpt, device=device)
+        load_checkpoint(ckpt, model)
         print(f"    Loaded: {ckpt}")
     else:
         print(f"    WARNING: No checkpoint found for {variant.name!r} in {checkpoint_dir}")

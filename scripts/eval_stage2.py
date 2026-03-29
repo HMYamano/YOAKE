@@ -71,14 +71,14 @@ def main():
     model.set_stage(2)
 
     if Path(checkpoint_path).exists():
-        load_checkpoint(model, checkpoint_path, device=device)
+        load_checkpoint(checkpoint_path, model)
         print(f"Loaded checkpoint: {checkpoint_path}")
     else:
         print(f"Warning: checkpoint not found: {checkpoint_path}")
 
     model.eval()
     num_actions = cfg.model.action_head.num_actions
-    evaluator = ActionEvaluator(num_classes=num_actions)
+    evaluator = ActionEvaluator(num_actions)
 
     for batch in loader:
         geo = batch["geo_features"].to(device)         # (B, T, 10)
@@ -86,15 +86,13 @@ def main():
 
         out = model.forward_geo_sequence(geo)
         preds = out["action_logits"].argmax(dim=-1).cpu()  # (B,)
-        scores = out["action_logits"].softmax(dim=-1).cpu()
 
         for i in range(geo.shape[0]):
             if gt_actions[i] < 0:
                 continue
             evaluator.update(
-                pred_labels=preds[i:i+1],
-                gt_labels=gt_actions[i:i+1],
-                pred_scores=scores[i:i+1],
+                preds[i:i+1].tolist(),
+                gt_actions[i:i+1].tolist(),
             )
 
     results = evaluator.compute()

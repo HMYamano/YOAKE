@@ -468,7 +468,9 @@ class Trainer:
                 self.logger.info(
                     f"[Epoch {epoch}] Best model saved ({metric_name}={metric_val:.4f})"
                 )
-            else:
+            elif val_metrics:
+                # validation を実施した epoch のみ early stopping カウントを進める
+                # (val_interval > 1 の場合、validation なし epoch はカウントしない)
                 self.no_improve_count += 1
 
             # --- Early stopping ---

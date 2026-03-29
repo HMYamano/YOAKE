@@ -130,7 +130,7 @@ def _load_model(checkpoint_path: Optional[str], device: torch.device):
     model.set_stage(1)
 
     if checkpoint_path and Path(checkpoint_path).exists():
-        load_checkpoint(model, checkpoint_path, device=device)
+        load_checkpoint(checkpoint_path, model)
         print(f"  Loaded checkpoint: {checkpoint_path}")
     else:
         print(f"  No checkpoint — using random weights.")
@@ -150,7 +150,7 @@ def _load_model_custom(overrides: dict, checkpoint_path: Optional[str], device: 
     model.set_stage(1)
 
     if checkpoint_path and Path(checkpoint_path).exists():
-        load_checkpoint(model, checkpoint_path, device=device)
+        load_checkpoint(checkpoint_path, model)
 
     model.eval()
     return model

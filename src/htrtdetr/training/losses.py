@@ -402,6 +402,10 @@ class ActionLoss(nn.Module):
         if action_logits.shape[0] == 0:
             return action_logits.sum() * 0.0
 
+        # 有効サンプルが 0 の場合は 0 を返す (F.cross_entropy は NaN になるため)
+        if (gt_action_ids != -1).sum() == 0:
+            return action_logits.sum() * 0.0
+
         strategy = getattr(self.cfg, "imbalance_strategy", "none")
 
         if strategy == "class_weight" and self._class_weights is not None:

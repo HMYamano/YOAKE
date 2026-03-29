@@ -12,11 +12,12 @@ from htrtdetr.training.metrics import (
 
 
 class TestSelectBestMetric:
-    def test_stage1_uses_ap50(self):
+    def test_stage1_uses_val_loss(self):
+        # Stage 1 は AP50 が DETR 初期学習で不安定なため val_loss を基準にする
         v, name, higher = select_best_metric(1, {"val_AP50": 0.75, "val_loss": 0.3})
-        assert name == "AP50"
-        assert higher is True
-        assert v == pytest.approx(0.75)
+        assert name == "val_loss"
+        assert higher is False
+        assert v == pytest.approx(0.3)
 
     def test_stage2_uses_macro_f1(self):
         v, name, higher = select_best_metric(2, {"macro_f1": 0.65, "val_loss": 0.4})

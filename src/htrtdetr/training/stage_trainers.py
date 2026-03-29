@@ -111,7 +111,7 @@ class BaseTrainer:
         """checkpoint から resume する"""
         if checkpoint_path and Path(checkpoint_path).exists():
             state = load_checkpoint(
-                self.model, checkpoint_path, device=self.device
+                checkpoint_path, self.model
             )
             self.start_epoch = state.get("epoch", 0)
             self.best_metric = state.get("best_metric", float("inf"))
@@ -601,15 +601,15 @@ class Stage4Trainer(BaseTrainer):
         # 前 stage の checkpoint をロード (resume より優先度低い)
         if stage1_ckpt and Path(stage1_ckpt).exists():
             from ..utils.misc import load_model_weights
-            load_model_weights(self.model, stage1_ckpt, strict=False)
+            load_model_weights(stage1_ckpt, self.model, strict=False)
             print(f"Loaded stage1 weights from {stage1_ckpt}")
         if stage2_ckpt and Path(stage2_ckpt).exists():
             from ..utils.misc import load_model_weights
-            load_model_weights(self.model, stage2_ckpt, strict=False)
+            load_model_weights(stage2_ckpt, self.model, strict=False)
             print(f"Loaded stage2 weights from {stage2_ckpt}")
         if stage3_ckpt and Path(stage3_ckpt).exists():
             from ..utils.misc import load_model_weights
-            load_model_weights(self.model, stage3_ckpt, strict=False)
+            load_model_weights(stage3_ckpt, self.model, strict=False)
             print(f"Loaded stage3 weights from {stage3_ckpt}")
 
         self.resume(resume)

@@ -249,7 +249,7 @@ def mode_branch_stats(
     model.set_stage(stage)
 
     if Path(checkpoint).exists():
-        load_checkpoint(model, checkpoint, device=device)
+        load_checkpoint(checkpoint, model)
         logger.info(f"Loaded checkpoint: {checkpoint}")
     else:
         logger.warning(f"Checkpoint not found: {checkpoint} — using random weights")

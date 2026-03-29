@@ -12,6 +12,8 @@ train_stage2_action.py — Stage 2: Action Head Training (Detector Frozen)  [DEP
    このファイルは互換性のために残してありますが、今後削除される予定です。
 """
 
+from __future__ import annotations
+
 import warnings
 warnings.warn(
     "train_stage2_action.py は非推奨です。"
@@ -19,8 +21,6 @@ warnings.warn(
     DeprecationWarning,
     stacklevel=1,
 )
-
-from __future__ import annotations
 
 import sys
 from pathlib import Path
@@ -102,7 +102,7 @@ def main():
 
     # Stage 1 checkpoint から detector 重みをロード
     if stage1_ckpt and Path(stage1_ckpt).exists():
-        load_model_weights(model, stage1_ckpt, strict=False)
+        load_model_weights(stage1_ckpt, model, strict=False)
         print(f"Loaded stage1 weights: {stage1_ckpt}")
     else:
         if stage1_ckpt:
