@@ -53,11 +53,13 @@ def select_best_metric(
         composite_idf1 = getattr(metrics_cfg, "composite_idf1", composite_idf1)
 
     if stage == 1:
+        # AP50 は DETR 初期学習で非常に不安定なため val_loss を早期停止・ベスト保存の基準にする。
+        # AP50 はログには引き続き記録される。
         val = _finite_or_default(
-            val_metrics.get("val_AP50", val_metrics.get("AP50", val_metrics.get("ap50", 0.0))),
-            0.0,
+            val_metrics.get("val_loss", float("inf")),
+            float("inf"),
         )
-        return val, "AP50", True
+        return val, "val_loss", False
 
     if stage == 2:
         if stage2_primary == "macro_f1":

@@ -95,19 +95,20 @@ class Trainer:
         # Optimizer & Scheduler
         from ..config.config import OptimizerConfig, SchedulerConfig
         opt_cfg = optimizer_cfg if optimizer_cfg is not None else OptimizerConfig()
-        sch_cfg = scheduler_cfg if scheduler_cfg is not None else SchedulerConfig(
-            total_epochs=train_cfg.max_epochs
-        )
+        sch_cfg = scheduler_cfg if scheduler_cfg is not None else SchedulerConfig()
         self.optimizer = build_optimizer(model, opt_cfg)
 
         # ステップ単位 warmup を Trainer 自身が管理するため、
         # Scheduler には warmup を持たせない (skip_warmup=True)。
         # T_max を warmup 後の残りエポック数に合わせる。
+        # total_epochs は常に max_epochs と同期させる（YAML 側の値がズレていても正しく動く）。
+        from dataclasses import replace as _dc_replace
+        sch_cfg = _dc_replace(sch_cfg, total_epochs=train_cfg.max_epochs)
+
         self._warmup_epochs: int = sch_cfg.warmup_epochs
         self._warmup_iters: Optional[int] = None  # _train_epoch 初回呼び出し時に確定
         self._base_lrs: List[float] = [pg["lr"] for pg in self.optimizer.param_groups]
 
-        from dataclasses import replace as _dc_replace
         sch_cfg_no_warmup = _dc_replace(
             sch_cfg,
             warmup_epochs=0,
