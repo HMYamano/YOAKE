@@ -25,7 +25,7 @@ import torch.nn as nn
 @dataclass
 class DetectionOutput:
     """
-    Detector の出力をまとめる dataclass
+    Detector の *学習/内部* 出力をまとめる dataclass (RT-DETR デコーダの生出力)。
 
     Attributes:
         pred_logits: (B, num_queries, num_classes) — class logits

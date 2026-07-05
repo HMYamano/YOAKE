@@ -130,6 +130,23 @@ If your shell cannot find `python` or `pytest`, use the repository CI workflow a
 
 ## Quick Start
 
+### GUI (Labeling / Training / Video Analysis)
+
+A DearPyGui hub (inspired by [YORU](https://github.com/Kamikouchi-lab/YORU)) bundles
+video **labeling with temporal range annotation**, staged **training with a live metric
+monitor**, and **interactive video analysis** (overlayed playback + per-track action
+timeline). It drives the `yoake` CLI under the hood, so the GUI itself is torch-free.
+
+```bash
+pip install -e ".[gui]"     # dearpygui + opencv-python
+yoake gui                    # or:  python -m htrtdetr.gui  /  gui
+```
+
+Range labeling lets you assign an action/track over a `[start, end]` frame span and
+linearly interpolates bounding boxes between keyframes (interpolated boxes render dashed),
+so long behaviors don't need per-frame drawing. Output stays in the standard JSON v1.1
+format. See [docs/gui.md](docs/gui.md).
+
 ### Verify the installation
 
 ```bash
@@ -151,6 +168,21 @@ python tools/infer_video.py \
 Outputs:
 - `outputs/inference/experiment_01_pred.mp4` — annotated video
 - `outputs/inference/experiment_01_pred.json` — structured predictions
+
+### Layered pipeline (detection → tracking → interaction)
+
+The single-pass model can also be driven through a declarative, stage-based pipeline that
+stacks temporal analysis (L1→L5) on top of detection. Each layer is toggled/swapped from a
+config file — no code branching. See [docs/pipeline.md](docs/pipeline.md).
+
+```bash
+# ④ full analysis: detect → stabilize → static-relation → track → motion → interaction
+yoake pipeline config=configs/pipeline/full_offline.yaml source=data/videos/experiment_01.mp4 \
+      output_dir=runs/pipeline
+```
+
+Analysis modes are just config swaps: `detect_only.yaml` (①), `temporal_detect.yaml` (②),
+`detect_track.yaml` (③), `full_offline.yaml` (④), `yolo_bytetrack.yaml` (backend swap example).
 
 ### Python API
 

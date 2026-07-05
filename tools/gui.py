@@ -26,6 +26,13 @@ except ImportError:
         build_yoake_command as _shared_build_yoake_command,
     )
 
+# 修正済みコマンドビルダ (visualize→show_* マッピング / analyze バリデーション)
+from htrtdetr.gui.commands import (
+    analyze_command as _analyze_command,
+    analyze_missing_field as _analyze_missing_field,
+    predict_command as _predict_command,
+)
+
 # tkinter for file dialogs only
 import tkinter as tk
 from tkinter import filedialog
@@ -39,25 +46,7 @@ RUNS = ROOT / "runs"           # 新しい出力ルート
 OUTPUTS = ROOT / "outputs"     # legacy (参照用のみ)
 
 
-def _yoake(*args: str) -> list:
-    """yoake CLI コマンドリストを返す (run_command に渡す形式)。
-
-    run_command は先頭に sys.executable を追加するため、
-    "-m htrtdetr.cli" 形式で渡す。
-    """
-    return ["-m", "htrtdetr.cli"] + list(args)
-
-
-def build_yoake_command(command: str, *args: str, **kwargs) -> list:
-    parts = [command, *args]
-    for key, value in kwargs.items():
-        if value in ("", None):
-            continue
-        parts.append(f"{key}={value}")
-    return _yoake(*parts)
-
-
-# Keep the legacy local names, but route them through the shared helper module.
+# 共有ヘルパ (htrtdetr.gui_cli) にルーティング。ローカル定義は廃止した。
 _yoake = _shared_yoake
 build_yoake_command = _shared_build_yoake_command
 
@@ -177,6 +166,20 @@ def stop_command():
     if proc and proc.poll() is None:
         proc.terminate()
         append_log("--- 中断されました ---")
+
+
+def _run_analyze_ui():
+    """analyze 実行前に mode 別必須フィールドを検証してから実行する。"""
+    mode = dpg.get_value("ana_mode")
+    pred = dpg.get_value("ana_pred")
+    gt = dpg.get_value("ana_gt")
+    missing = _analyze_missing_field(mode, pred, gt)
+    if missing:
+        append_log(f"[ERROR] mode={mode} には {missing}= が必要です。")
+        dpg.configure_item("status_bar", default_value="エラー: 入力不足")
+        return
+    run_command(_analyze_command(mode, dpg.get_value("ana_output"),
+                                 predictions=pred, annotation=gt))
 
 
 # ─────────────────────────── sidebar ──────────────────────────────
@@ -698,22 +701,23 @@ def panel_inference(parent):
         section("推論設定")
         float_row("Score Threshold", "inf_thresh", 0.5)
         int_row("Window Size (フレーム)", "inf_window", 16)
+        int_row("Max Frames (0=全フレーム)", "inf_maxframes", 0)
         with dpg.group(horizontal=True):
-            dpg.add_text("可視化出力:", indent=4)
+            dpg.add_text("可視化オーバーレイ:", indent=4)
             dpg.add_checkbox(tag="inf_vis", default_value=True)
 
         dpg.add_spacer(height=8)
         dpg.add_button(
             label="推論実行",
             height=36,
-            callback=lambda: run_command(_yoake(
-                "predict",
-                f"source={dpg.get_value('inf_input')}",
-                f"weights={dpg.get_value('inf_ckpt')}",
-                f"output_dir={dpg.get_value('inf_output')}",
-                f"score_threshold={dpg.get_value('inf_thresh')}",
-                f"window_size={dpg.get_value('inf_window')}",
-                f"visualize={dpg.get_value('inf_vis')}",
+            callback=lambda: run_command(_predict_command(
+                dpg.get_value("inf_input"),
+                dpg.get_value("inf_ckpt"),
+                dpg.get_value("inf_output"),
+                score_threshold=float(dpg.get_value("inf_thresh")),
+                window_size=int(dpg.get_value("inf_window")),
+                max_frames=int(dpg.get_value("inf_maxframes")) or None,
+                visualize=bool(dpg.get_value("inf_vis")),
             )),
         )
 
@@ -752,15 +756,7 @@ def panel_analysis(parent):
             dpg.add_button(
                 label="解析実行",
                 height=36,
-                callback=lambda: run_command(
-                    _yoake(
-                        "analyze",
-                        f"mode={dpg.get_value('ana_mode')}",
-                        f"predictions={dpg.get_value('ana_pred')}",
-                        f"output_dir={dpg.get_value('ana_output')}",
-                    ) + ([f"annotation={dpg.get_value('ana_gt')}"]
-                         if dpg.get_value("ana_gt") else [])
-                ),
+                callback=lambda: _run_analyze_ui(),
             )
             dpg.add_spacer(width=8)
             dpg.add_button(

@@ -1,0 +1,29 @@
+# 差し替え例: YOLO 検出 × ByteTrack 追跡 (どちらも dense_features 不要)
+# 「YOLO×神経系トラッカ(dense必須)」は strict なら事前エラーになるが、
+# bytetrack は boxes だけで通るので L4/L5 まで到達する。
+pipeline:
+  mode: strict
+  window_size: 0
+  stride: 8
+  inputs: [image]
+  device: auto
+  layers:
+    L1_detection:
+      enabled: true
+      backend: yolo             # dense_features を出さない
+      params: { weights: yolov8n.pt, score_threshold: 0.3, imgsz: 640 }
+
+    L3_tracking:
+      enabled: true
+      backend: bytetrack        # boxes だけで track_id を振る
+      params: { track_thresh: 0.5, match_iou: 0.3 }
+
+    L4_motion:
+      enabled: true
+      backend: kinematic
+      params: { smooth_window: 3 }
+
+    L5_interaction:
+      enabled: true
+      backend: heuristic
+      params: { max_pair_dist_px: 120.0, min_frames: 3 }

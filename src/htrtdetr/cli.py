@@ -423,6 +423,50 @@ def run_predict(argv: list) -> None:
     )
 
 
+def run_pipeline(argv: list) -> None:
+    """レイヤードパイプラインを config に従って動画/画像ディレクトリに適用する。"""
+    import json
+
+    config_path, overrides = parse_argv(argv)
+    if not config_path:
+        print("Error: config=<pipeline.yaml> is required.")
+        sys.exit(1)
+    source = str(overrides.get("source", ""))
+    if not source:
+        print("Error: source=<video/dir> is required.")
+        sys.exit(1)
+    output_dir = str(overrides.get("output_dir", "runs/pipeline"))
+    max_frames = int(overrides["max_frames"]) if "max_frames" in overrides else None
+
+    from .pipeline.builder import build_from_yaml
+    from .pipeline.io import (
+        frames_from_source, interactions_to_json, merge_windows, window_to_predictions,
+    )
+
+    runner = build_from_yaml(config_path)
+    print(runner.describe())
+
+    frames = list(frames_from_source(source, max_frames))
+    try:
+        windows = list(runner.run(frames))
+    finally:
+        runner.teardown()
+    merged = merge_windows(windows)
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    preds = window_to_predictions(merged)
+    with open(out / "predictions.json", "w", encoding="utf-8") as f:
+        json.dump(preds, f, indent=2)
+    inter = interactions_to_json(merged)
+    with open(out / "interactions.json", "w", encoding="utf-8") as f:
+        json.dump(inter, f, indent=2)
+    print(
+        f"Pipeline complete. Frames: {len(preds)} | Interactions: {len(inter)} | "
+        f"Output: {out / 'predictions.json'}"
+    )
+
+
 def run_analyze(argv: list) -> None:
     _, overrides = parse_argv(argv)
     mode = str(overrides.get("mode", ""))
@@ -490,6 +534,8 @@ Commands:
   val      stage=<1-4> [checkpoint=path.pth] [key=value ...]
   predict  source=<video/dir> weights=<path.pth> [key=value ...]
   analyze  mode=<timeline|distribution|id_switches|confidence> [key=value ...]
+  pipeline config=<pipeline.yaml> source=<video/dir> [output_dir=path] [max_frames=N]
+  gui      統一 GUI (Labeling / Training / Video Analysis) を起動する
 
 Examples:
   yoake train stage=1
@@ -497,6 +543,11 @@ Examples:
   yoake val stage=2 checkpoint=runs/train/stage2/weights/best.pth
   yoake predict source=data/videos/video.mp4 weights=runs/train/stage4/weights/best.pth
   yoake analyze mode=timeline predictions=runs/predict/predictions.json
+  yoake pipeline config=configs/pipeline/full_offline.yaml source=data/videos/video.mp4
+
+Layered pipeline (configs/pipeline/*.yaml):
+  detect_only | temporal_detect | detect_track | full_offline | yolo_bytetrack
+  各段は enabled トグルと backend 差し替えで解析モードを切り替える。
 
 Primary metrics:
   Stage 1: AP50
@@ -545,6 +596,16 @@ def main() -> None:
 
     if command == "analyze":
         run_analyze(rest)
+        return
+
+    if command == "pipeline":
+        run_pipeline(rest)
+        return
+
+    if command == "gui":
+        from .gui import main as gui_main
+
+        gui_main(rest)
         return
 
     print(f"yoake: unknown command '{command}'\n")

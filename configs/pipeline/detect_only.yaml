@@ -1,0 +1,15 @@
+# モード①: 物体検出のみ
+# 段: L1 のみ。track_id も relation も出さない。
+pipeline:
+  mode: strict
+  window_size: 0            # 0 = 1動画を1窓で処理
+  stride: 8
+  inputs: [image]
+  device: auto
+  layers:
+    L1_detection:
+      enabled: true
+      backend: rtdetr        # rtdetr | yolo | fused_htrtdetr
+      params:
+        checkpoint: weights/stage1_best.pth
+        score_threshold: 0.3

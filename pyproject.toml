@@ -32,9 +32,11 @@ dependencies = [
 [project.scripts]
 yoake = "htrtdetr.cli:main"
 annotate = "htrtdetr.annotator:main"
+gui = "htrtdetr.gui:main"
 
 [project.optional-dependencies]
 annotate = ["opencv-python>=4.8.0", "dearpygui>=1.11.0"]
+gui = ["opencv-python>=4.8.0", "dearpygui>=1.11.0"]
 vis = ["matplotlib>=3.7.0", "opencv-python>=4.8.0"]
 dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "black", "isort", "mypy"]
 wandb = ["wandb>=0.16.0"]

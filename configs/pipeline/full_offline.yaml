@@ -1,0 +1,44 @@
+# モード④: フル解析 (検出→安定化→静的関係→追跡→運動→相互作用)
+# 段の enabled を切り替えるだけで①〜④が作れる。ここは全部入り。
+pipeline:
+  mode: lenient            # strict=無効な組合せを事前エラー / lenient=満たせない段を自動スキップ
+  window_size: 16
+  stride: 8
+  inputs: [image]
+  device: auto
+
+  layers:
+    L1_detection:
+      enabled: true
+      backend: fused_htrtdetr   # rtdetr | yolo | fused_htrtdetr
+      params:
+        checkpoint: weights/stage4_best.pth
+
+    L1b_stabilization:
+      enabled: true
+      backend: temporal_nms
+      params: { iou_link: 0.5, min_persist: 2, max_gap: 1, score_smooth: ema, smooth_boxes: false }
+
+    L2_static:
+      enabled: true
+      backend: geometric
+      params: { near_dist_px: 40.0, overlap_iou: 0.1, use_vertical: true }
+
+    L3_tracking:
+      enabled: false            # fused が track_id を供給するので既定 OFF
+      backend: bytetrack        # memory_id(神経GRU) | bytetrack | iou
+      params: { track_thresh: 0.5, match_iou: 0.3, track_buffer: 30 }
+
+    L4_motion:
+      enabled: true
+      backend: kinematic
+      params: { smooth_window: 3 }
+
+    pose:
+      enabled: false            # 姿勢は任意。true なら L5 が向き情報を使える
+      backend: keypoint
+
+    L5_interaction:
+      enabled: true
+      backend: heuristic        # heuristic | learned_pair | gnn
+      params: { max_pair_dist_px: 120.0, approach_thresh: 0.0, min_frames: 3 }

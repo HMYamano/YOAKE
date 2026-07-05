@@ -44,6 +44,11 @@ except ImportError:
 
 import numpy as np
 
+try:  # 範囲ラベリング用の純粋関数 (dearpygui 非依存・単体テスト可)
+    from .gui.labeling_ops import clamp_bbox, resolve_range_boxes, round_bbox
+except ImportError:  # スクリプト直接実行時のフォールバック
+    from htrtdetr.gui.labeling_ops import clamp_bbox, resolve_range_boxes, round_bbox
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 _DEFAULT_ACTIONS = ["stationary", "walking", "grooming", "courtship", "aggression"]
@@ -61,6 +66,9 @@ _MIN_BOX_PX = 5
 _HANDLE_R = 7       # resize-handle radius in canvas pixels
 _FRAME_TEX = "yoake_frame_tex"
 _SIDEBAR_W = 280
+
+# dearpygui 2.x では mvKey_Control が廃止され mvKey_ModCtrl になった (1.x フォールバック付き)
+_KEY_CTRL = getattr(dpg, "mvKey_ModCtrl", getattr(dpg, "mvKey_Control", 17))
 
 
 def _track_color(track_id: int, alpha: int = 255) -> Tuple[int, int, int, int]:
@@ -113,7 +121,8 @@ _gid = 0
 
 class AnnObject:
     def __init__(self, bbox: List[int], track_id: int = -1, action_id: int = -1,
-                 occluded: bool = False, is_crowd: bool = False) -> None:
+                 occluded: bool = False, is_crowd: bool = False,
+                 keyframe: bool = True) -> None:
         global _gid
         _gid += 1
         self.object_id = _gid
@@ -122,6 +131,9 @@ class AnnObject:
         self.action_id = action_id
         self.occluded = occluded
         self.is_crowd = is_crowd
+        # keyframe: True = 手動で置いた box (補間のアンカー)、False = 補間/自動生成 box。
+        # 編集用フラグで、保存 JSON (v1.1) には出力しない。
+        self.keyframe = keyframe
 
     def to_dict(self) -> dict:
         return {
@@ -143,6 +155,7 @@ class AnnObject:
             action_id=d.get("action_id", -1),
             occluded=d.get("occluded", False),
             is_crowd=d.get("is_crowd", False),
+            keyframe=d.get("keyframe", True),  # 読み込んだ box はキーフレーム扱い
         )
         if "object_id" in d:
             obj.object_id = d["object_id"]
@@ -174,6 +187,10 @@ class AnnotationApp:
         self.annotations: Dict[int, List[AnnObject]] = {}
         self.next_track_id: int = 1
         self.active_track_id: int = 1
+
+        # ── range labeling state ─────────────────────────────────────
+        self.range_start: int = 0
+        self.range_end: int = 0
 
         # ── canvas interaction state ──────────────────────────────────
         self._mode: str = "idle"        # idle | draw | move | resize
@@ -408,6 +425,42 @@ class AnnotationApp:
 
             dpg.add_spacer(height=4)
 
+            # ── Range Labeling ────────────────────────────────────────
+            with dpg.collapsing_header(label="Range Labeling  (範囲ラベリング)",
+                                       default_open=True):
+                dpg.add_text("個体を選び [開始,終了] に行動/ID を一括付与。",
+                             color=(150, 150, 160), wrap=_SIDEBAR_W - 16)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("開始:", indent=4)
+                    dpg.add_input_int(tag="range_start", default_value=0, width=70,
+                                      min_value=0, max_value=0)
+                    dpg.add_button(label="現在", width=48,
+                                   callback=lambda: dpg.set_value(
+                                       "range_start", self.current_frame_idx))
+                with dpg.group(horizontal=True):
+                    dpg.add_text("終了:", indent=4)
+                    dpg.add_input_int(tag="range_end", default_value=0, width=70,
+                                      min_value=0, max_value=0)
+                    dpg.add_button(label="現在", width=48,
+                                   callback=lambda: dpg.set_value(
+                                       "range_end", self.current_frame_idx))
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Track ID:", indent=4)
+                    dpg.add_input_int(tag="range_track", default_value=1, width=80,
+                                      min_value=0, max_value=9999)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Action:", indent=4)
+                    dpg.add_combo(items=["(変更しない)"], tag="range_action",
+                                  default_value="(変更しない)", width=-1)
+                dpg.add_checkbox(label="bbox を補間する", tag="range_interp",
+                                 default_value=True)
+                dpg.add_button(label="範囲に適用  (Apply to range)", width=-1,
+                               height=30, callback=self._apply_range_ui)
+                dpg.add_button(label="この範囲の track を消去", width=-1,
+                               callback=self._clear_range_ui)
+
+            dpg.add_spacer(height=4)
+
             # ── Objects in frame ──────────────────────────────────────
             with dpg.collapsing_header(label="Objects in Frame", default_open=True):
                 dpg.add_listbox(items=[], tag="obj_listbox", num_items=6,
@@ -502,6 +555,10 @@ class AnnotationApp:
         if dpg.does_item_exist("sel_action"):
             dpg.configure_item("sel_action",
                                items=["(none)"] + list(self.action_names))
+        # Update range-labeling action combo
+        if dpg.does_item_exist("range_action"):
+            dpg.configure_item("range_action",
+                               items=["(変更しない)", "(none)"] + list(self.action_names))
 
     # ─── Navigation bar ──────────────────────────────────────────────
 
@@ -535,14 +592,16 @@ class AnnotationApp:
     # ─── Mouse handlers ──────────────────────────────────────────────
 
     def _build_mouse_handlers(self) -> None:
+        # dearpygui 2.x に add_mouse_press_handler は無い。押下相当は
+        # add_mouse_click_handler (押した瞬間に発火) を使う。
         with dpg.handler_registry(tag="mouse_handlers"):
-            dpg.add_mouse_press_handler(button=0,
+            dpg.add_mouse_click_handler(button=0,
                                         callback=self._on_mouse_press)
             dpg.add_mouse_drag_handler(button=0, threshold=1.0,
                                        callback=self._on_mouse_drag)
             dpg.add_mouse_release_handler(button=0,
                                           callback=self._on_mouse_release)
-            dpg.add_mouse_press_handler(button=1,
+            dpg.add_mouse_click_handler(button=1,
                                         callback=self._on_right_click)
 
     # ─── Key handlers ────────────────────────────────────────────────
@@ -642,6 +701,33 @@ class AnnotationApp:
                                 fill=(255, 255, 255, 30),
                                 thickness=1.5, parent="canvas")
 
+    def _draw_dashed_rect(self, c1: Tuple[float, float], c2: Tuple[float, float],
+                          color, thickness: float = 1.5,
+                          dash: float = 7.0, gap: float = 5.0) -> None:
+        """破線の矩形を drawlist に描く (dpg に破線 API が無いため線分で近似)。"""
+        import math
+
+        x1, y1 = c1
+        x2, y2 = c2
+
+        def _edge(ax, ay, bx, by):
+            length = math.hypot(bx - ax, by - ay)
+            if length < 1.0:
+                return
+            ux, uy = (bx - ax) / length, (by - ay) / length
+            d = 0.0
+            while d < length:
+                e = min(d + dash, length)
+                dpg.draw_line((ax + ux * d, ay + uy * d),
+                              (ax + ux * e, ay + uy * e),
+                              color=color, thickness=thickness, parent="canvas")
+                d += dash + gap
+
+        _edge(x1, y1, x2, y1)
+        _edge(x2, y1, x2, y2)
+        _edge(x2, y2, x1, y2)
+        _edge(x1, y2, x1, y1)
+
     def _draw_box(self, obj: AnnObject, selected: bool = False) -> None:
         x1, y1, x2, y2 = obj.bbox
         c1 = self._i2c(x1, y1)
@@ -649,8 +735,12 @@ class AnnotationApp:
         col = _track_color(obj.track_id)
         col_fill = _track_color(obj.track_id, alpha=50)
         thick = 3.0 if selected else 1.5
-        dpg.draw_rectangle(c1, c2, color=col, fill=col_fill,
-                            thickness=thick, parent="canvas")
+        if getattr(obj, "keyframe", True):
+            dpg.draw_rectangle(c1, c2, color=col, fill=col_fill,
+                                thickness=thick, parent="canvas")
+        else:
+            # 補間/自動生成 box は破線で描き、手動キーフレームと区別する
+            self._draw_dashed_rect(c1, c2, col, thickness=thick)
 
         # Label
         action_s = (self.action_names[obj.action_id]
@@ -740,6 +830,7 @@ class AnnotationApp:
             nx1 = int(max(0.0, min(ox1 + dx, self.frame_w - w)))
             ny1 = int(max(0.0, min(oy1 + dy, self.frame_h - h)))
             self._selected.bbox = [nx1, ny1, nx1 + w, ny1 + h]
+            self._selected.keyframe = True  # 手動移動でキーフレーム化 (補間アンカー)
             # Re-init tracker on manual move
             if self._auto_track and self._selected.track_id in self._trackers:
                 del self._trackers[self._selected.track_id]
@@ -760,6 +851,7 @@ class AnnotationApp:
             ny1, ny2 = sorted([ny1, ny2])
             if nx2 - nx1 >= _MIN_BOX_PX and ny2 - ny1 >= _MIN_BOX_PX:
                 self._selected.bbox = [nx1, ny1, nx2, ny2]
+                self._selected.keyframe = True  # 手動リサイズでキーフレーム化
             if self._auto_track and self._selected.track_id in self._trackers:
                 del self._trackers[self._selected.track_id]
 
@@ -897,6 +989,10 @@ class AnnotationApp:
             dpg.configure_item("frame_input", max_value=self.num_frames - 1)
         if dpg.does_item_exist("total_frames_text"):
             dpg.set_value("total_frames_text", f"/ {self.num_frames - 1}")
+        for _rtag in ("range_start", "range_end"):
+            if dpg.does_item_exist(_rtag):
+                dpg.configure_item(_rtag, max_value=max(self.num_frames - 1, 0))
+                dpg.set_value(_rtag, 0)
 
         dpg.set_viewport_title(f"YOAKE Annotation Tool — {path.name}")
         self.goto_frame(0)
@@ -991,6 +1087,8 @@ class AnnotationApp:
         self.active_track_id = self.next_track_id
         if dpg.does_item_exist("active_tid"):
             dpg.set_value("active_tid", self.next_track_id)
+        if dpg.does_item_exist("range_track"):
+            dpg.set_value("range_track", self.active_track_id)
         self._update_active_track_color()
         self._status(f"New track ID: {self.next_track_id}")
 
@@ -1020,6 +1118,117 @@ class AnnotationApp:
         self._render_canvas()
         self._refresh_sidebar()
         self._status(f"Propagated {count} object(s) from frame {prev}.")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Range Labeling  (範囲ラベリング)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _track_obj(self, frame_idx: int, track_id: int) -> Optional[AnnObject]:
+        """指定フレームで track_id を持つ最初のオブジェクトを返す (無ければ None)。"""
+        for obj in self.annotations.get(frame_idx, []):
+            if obj.track_id == track_id:
+                return obj
+        return None
+
+    def apply_range(self, track_id: int, action_id: Optional[int],
+                    f_start: int, f_end: int, interpolate: bool) -> None:
+        """区間 [f_start, f_end] の track に行動/bbox を一括適用する。
+
+        - ``interpolate=True`` かつ区間内にキーフレーム box が 2 個以上あれば、隣接
+          キーフレーム間を線形補間して中間フレームの box を生成する (端の外側は
+          最も近いキーフレームを保持)。キーフレームが 1 個なら全域その box を保持。
+        - ``action_id`` が ``None`` の場合は行動を変更しない。box が無く geometry も
+          得られないフレームはスキップ (既存 box があれば行動だけ更新)。
+        保存形式は v1.1 のまま (生成 box は通常の per-frame object)。
+        """
+        if self.cap is None:
+            self._status("No video loaded.")
+            return
+        if f_end < f_start:
+            f_start, f_end = f_end, f_start
+        f_start = max(0, f_start)
+        f_end = min(self.num_frames - 1, f_end) if self.num_frames else f_end
+
+        anchors: List[Tuple[int, List[int]]] = []
+        for f in range(f_start, f_end + 1):
+            obj = self._track_obj(f, track_id)
+            if obj is not None and obj.keyframe:
+                anchors.append((f, list(obj.bbox)))
+
+        # 補間 ON かつアンカーがあれば box_map を生成 (純関数 resolve_range_boxes)
+        box_map = (resolve_range_boxes(anchors, f_start, f_end)
+                   if interpolate and anchors else {})
+        anchor_frames = {f for f, _ in anchors}
+        count = 0
+        for f in range(f_start, f_end + 1):
+            obj = self._track_obj(f, track_id)
+            box = box_map.get(f)
+            if obj is None:
+                if box is None:
+                    continue  # 配置すべき box が無い → スキップ
+                placed = round_bbox(clamp_bbox(box, self.frame_w, self.frame_h))
+                obj = AnnObject(bbox=placed, track_id=track_id, action_id=-1,
+                                keyframe=False)
+                self.annotations.setdefault(f, []).append(obj)
+            elif box is not None and f not in anchor_frames:
+                obj.bbox = round_bbox(clamp_bbox(box, self.frame_w, self.frame_h))
+                obj.keyframe = False
+            if action_id is not None:
+                obj.action_id = action_id
+            count += 1
+
+        self.next_track_id = max(self.next_track_id, track_id)
+        self._render_canvas()
+        self._refresh_sidebar()
+        note = ""
+        if interpolate and len(anchors) < 2:
+            note = ("（キーフレーム保持）" if anchors
+                    else "（box無し → 行動のみ適用）")
+        self._status(f"範囲 [{f_start},{f_end}] track {track_id}: "
+                     f"{count} フレームに適用 {note}")
+
+    def clear_range(self, track_id: int, f_start: int, f_end: int) -> None:
+        """区間 [f_start, f_end] の指定 track のオブジェクトを削除する。"""
+        if f_end < f_start:
+            f_start, f_end = f_end, f_start
+        removed = 0
+        for f in range(f_start, f_end + 1):
+            objs = self.annotations.get(f, [])
+            keep = [o for o in objs if o.track_id != track_id]
+            removed += len(objs) - len(keep)
+            if keep:
+                self.annotations[f] = keep
+            elif f in self.annotations:
+                del self.annotations[f]
+        self.deselect()
+        self._render_canvas()
+        self._refresh_sidebar()
+        self._status(f"範囲 [{f_start},{f_end}] の track {track_id} を "
+                     f"{removed} 個削除しました。")
+
+    def _range_action_id(self) -> Optional[int]:
+        val = dpg.get_value("range_action") if dpg.does_item_exist("range_action") else None
+        if val in (None, "(変更しない)"):
+            return None
+        if val == "(none)":
+            return -1
+        return self.action_names.index(val) if val in self.action_names else None
+
+    def _apply_range_ui(self) -> None:
+        self.apply_range(
+            track_id=int(dpg.get_value("range_track")),
+            action_id=self._range_action_id(),
+            f_start=int(dpg.get_value("range_start")),
+            f_end=int(dpg.get_value("range_end")),
+            interpolate=bool(dpg.get_value("range_interp")),
+        )
+
+    def _clear_range_ui(self) -> None:
+        self.clear_range(
+            track_id=int(dpg.get_value("range_track")),
+            f_start=int(dpg.get_value("range_start")),
+            f_end=int(dpg.get_value("range_end")),
+        )
 
     def set_action(self, action_id: int) -> None:
         if self._selected is None:
@@ -1238,6 +1447,8 @@ class AnnotationApp:
     def _on_active_tid_change(self, sender, app_data) -> None:
         self.active_track_id = max(0, app_data)
         self.next_track_id = max(self.next_track_id, self.active_track_id)
+        if dpg.does_item_exist("range_track"):
+            dpg.set_value("range_track", self.active_track_id)
         self._update_active_track_color()
 
     def _on_list_select(self, sender, app_data) -> None:
@@ -1447,7 +1658,7 @@ class AnnotationApp:
             dpg.set_value("status_text", msg)
 
     def _ctrl_s_handler(self) -> None:
-        if dpg.is_key_down(dpg.mvKey_Control):
+        if dpg.is_key_down(_KEY_CTRL):
             self.save_annotation()
 
     def _show_help(self) -> None:

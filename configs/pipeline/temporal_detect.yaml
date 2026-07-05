@@ -1,0 +1,25 @@
+# モード②: 「時系列を加味した検出」(ID は振らず、検出だけ安定化)
+# 段: L1 + L1b。誤検出抑制・欠損補間・スコア平滑化。速度/向きは出さない。
+pipeline:
+  mode: strict
+  window_size: 0
+  stride: 8
+  inputs: [image]
+  device: auto
+  layers:
+    L1_detection:
+      enabled: true
+      backend: rtdetr
+      params:
+        checkpoint: weights/stage1_best.pth
+        score_threshold: 0.3
+
+    L1b_stabilization:       # ID は振らず検出だけ時系列安定化
+      enabled: true
+      backend: temporal_nms
+      params:
+        iou_link: 0.5         # 隣接フレーム連結とみなす IoU
+        min_persist: 2        # 2フレーム未満しか続かない検出は誤検出として除去
+        max_gap: 1            # 1フレームの欠損まで補間で復元
+        score_smooth: ema     # none | mean | ema
+        smooth_boxes: false   # 既定 false (座標平滑化はしない=運動情報は出さない)
