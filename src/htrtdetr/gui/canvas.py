@@ -90,7 +90,7 @@ class FrameCanvas:
         self,
         frame_rgb: Optional[np.ndarray],
         detections: Optional[Sequence[dict]] = None,
-        placeholder: str = "動画を読み込んでください",
+        placeholder: str = "Please load a video",
     ) -> None:
         """フレーム画像 + 検出 bbox/ラベルを描画する。
 

@@ -60,6 +60,8 @@ STEPS = [
     "Analysis",
 ]
 
+
+
 STEP_COLORS = {
     "Dataset":        (100, 180, 100),
     "Stage 1: Detector": (80, 140, 200),
@@ -82,7 +84,7 @@ MAX_LOG = 500
 
 # ─────────────────────────── helpers ──────────────────────────────
 
-def _tk_pick_file(title="ファイルを選択", filetypes=(("All", "*.*"),)):
+def _tk_pick_file(title="Select File", filetypes=(("All", "*.*"),)):
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
@@ -91,7 +93,7 @@ def _tk_pick_file(title="ファイルを選択", filetypes=(("All", "*.*"),)):
     return path or ""
 
 
-def _tk_pick_dir(title="フォルダを選択"):
+def _tk_pick_dir(title="Select Folder"):
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
@@ -100,7 +102,7 @@ def _tk_pick_dir(title="フォルダを選択"):
     return path or ""
 
 
-def _tk_save_file(title="保存先を選択", defaultextension=".json",
+def _tk_save_file(title="Save As", defaultextension=".json",
                   filetypes=(("JSON", "*.json"), ("All", "*.*"))):
     root = tk.Tk()
     root.withdraw()
@@ -127,7 +129,7 @@ def run_command(cmd: list[str], cwd=None):
     def _worker():
         append_log(f"$ {' '.join(str(c) for c in cmd)}")
         dpg.configure_item("btn_stop", enabled=True)
-        dpg.configure_item("status_bar", default_value="実行中...")
+        dpg.configure_item("status_bar", default_value="Running...")
         try:
             proc = subprocess.Popen(
                 [sys.executable] + [str(c) for c in cmd],
@@ -143,16 +145,16 @@ def run_command(cmd: list[str], cwd=None):
                 append_log(line.rstrip())
             proc.wait()
             code = proc.returncode
-            msg = "完了 ✓" if code == 0 else f"エラー (code={code})"
+            msg = "Done" if code == 0 else f"Error (code={code})"
             append_log(f"--- {msg} ---")
             dpg.configure_item("status_bar", default_value=msg)
         except FileNotFoundError as e:
-            append_log(f"[ERROR] コマンドが見つかりません: {e}")
-            append_log("  ヒント: pip install -e . で yoake をインストールしてください")
-            dpg.configure_item("status_bar", default_value="エラー: コマンド未発見")
+            append_log(f"[ERROR] Command not found: {e}")
+            append_log("  Hint: install yoake with 'pip install -e .'")
+            dpg.configure_item("status_bar", default_value="Error: command not found")
         except Exception as e:
             append_log(f"[ERROR] {e}")
-            dpg.configure_item("status_bar", default_value="エラー")
+            dpg.configure_item("status_bar", default_value="Error")
         finally:
             active_process[0] = None
             dpg.configure_item("btn_stop", enabled=False)
@@ -165,7 +167,7 @@ def stop_command():
     proc = active_process[0]
     if proc and proc.poll() is None:
         proc.terminate()
-        append_log("--- 中断されました ---")
+        append_log("--- Interrupted ---")
 
 
 def _run_analyze_ui():
@@ -175,8 +177,8 @@ def _run_analyze_ui():
     gt = dpg.get_value("ana_gt")
     missing = _analyze_missing_field(mode, pred, gt)
     if missing:
-        append_log(f"[ERROR] mode={mode} には {missing}= が必要です。")
-        dpg.configure_item("status_bar", default_value="エラー: 入力不足")
+        append_log(f"[ERROR] mode={mode} requires {missing}=")
+        dpg.configure_item("status_bar", default_value="Error: missing input")
         return
     run_command(_analyze_command(mode, dpg.get_value("ana_output"),
                                  predictions=pred, annotation=gt))
@@ -190,7 +192,7 @@ def build_sidebar():
         dpg.add_text("YOAKE GUI", color=(220, 220, 220))
         dpg.add_separator()
         dpg.add_spacer(height=8)
-        dpg.add_text("ステップ", color=(160, 160, 160))
+        dpg.add_text("Step", color=(160, 160, 160))
         dpg.add_spacer(height=4)
         for i, name in enumerate(STEPS):
             col = STEP_COLORS[name]
@@ -210,7 +212,7 @@ def build_sidebar():
 
         # Stop button
         dpg.add_button(
-            label="  ■ 中断",
+            label="  Stop",
             tag="btn_stop",
             width=SIDEBAR_W - 16,
             height=32,
@@ -252,7 +254,7 @@ def switch_step(idx: int):
 # ─────────────────────────── panels ───────────────────────────────
 
 def field_row(label: str, tag: str, default: str = "", hint: str = "",
-              btn_label="参照", btn_cb=None, width: int = 380):
+              btn_label="Browse", btn_cb=None, width: int = 380):
     """One-line: label + text input + optional browse button."""
     with dpg.group(horizontal=True):
         dpg.add_text(f"{label}:", indent=4)
@@ -287,32 +289,32 @@ def section(label):
 def panel_dataset(parent):
     with dpg.child_window(tag="panel_0", parent=parent,
                           width=-1, height=-1, show=True, border=False):
-        dpg.add_text("Dataset 準備", color=(220, 220, 220))
+        dpg.add_text("Dataset Preparation", color=(220, 220, 220))
         dpg.add_separator()
         dpg.add_spacer(height=8)
 
         with dpg.tab_bar():
 
             # --- Convert Tab ---
-            with dpg.tab(label="アノテーション変換"):
+            with dpg.tab(label="Convert Annotations"):
                 dpg.add_spacer(height=6)
-                section("入力 (CSV/MOT17)")
-                field_row("入力ファイル", "conv_input", hint="annotations.csv",
+                section("Input (CSV/MOT17)")
+                field_row("Input File", "conv_input", hint="annotations.csv",
                           btn_cb=lambda: dpg.set_value(
                               "conv_input",
-                              _tk_pick_file("入力ファイル選択",
+                              _tk_pick_file("Select Input File",
                                             [("CSV/JSON", "*.csv *.json"), ("All", "*.*")])))
-                field_row("出力 JSON", "conv_output", hint="annotations.json",
+                field_row("Output JSON", "conv_output", hint="annotations.json",
                           btn_cb=lambda: dpg.set_value(
                               "conv_output",
-                              _tk_save_file("出力先選択", ".json")))
+                              _tk_save_file("Select Output File", ".json")))
                 with dpg.group(horizontal=True):
-                    dpg.add_text("フォーマット:", indent=4)
+                    dpg.add_text("Format:", indent=4)
                     dpg.add_combo(["csv", "mot17"], tag="conv_format",
                                   default_value="csv", width=120)
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="変換実行",
+                    label="Convert",
                     height=32,
                     callback=lambda: run_command([
                         TOOLS / "convert_annotations.py",
@@ -323,26 +325,26 @@ def panel_dataset(parent):
                 )
 
             # --- Splits Tab ---
-            with dpg.tab(label="Train/Val/Test 分割"):
+            with dpg.tab(label="Train/Val/Test Split"):
                 dpg.add_spacer(height=6)
-                section("アノテーションファイル")
-                field_row("アノテーション JSON", "split_anno",
+                section("Annotation File")
+                field_row("Annotation JSON", "split_anno",
                           btn_cb=lambda: dpg.set_value(
                               "split_anno",
-                              _tk_pick_file("アノテーション JSON",
+                              _tk_pick_file("Annotation JSON",
                                             [("JSON", "*.json"), ("All", "*.*")])))
-                field_row("出力ディレクトリ", "split_output",
+                field_row("Output Directory", "split_output",
                           hint="data/splits/",
                           btn_cb=lambda: dpg.set_value(
-                              "split_output", _tk_pick_dir("出力ディレクトリ")))
+                              "split_output", _tk_pick_dir("Output Directory")))
                 dpg.add_spacer(height=4)
-                section("分割比率")
-                float_row("Train 比率", "split_train", 0.7)
-                float_row("Val 比率",   "split_val",   0.15)
-                float_row("Test 比率",  "split_test",  0.15)
+                section("Split Ratios")
+                float_row("Train Ratio", "split_train", 0.7)
+                float_row("Val Ratio",   "split_val",   0.15)
+                float_row("Test Ratio",  "split_test",  0.15)
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="分割実行",
+                    label="Run Split",
                     height=32,
                     callback=lambda: run_command([
                         TOOLS / "build_splits.py",
@@ -354,20 +356,20 @@ def panel_dataset(parent):
                 )
 
             # --- Visualize Tab ---
-            with dpg.tab(label="データ確認"):
+            with dpg.tab(label="Inspect Data"):
                 dpg.add_spacer(height=6)
-                field_row("アノテーション JSON", "vis_anno",
+                field_row("Annotation JSON", "vis_anno",
                           btn_cb=lambda: dpg.set_value(
                               "vis_anno",
-                              _tk_pick_file("アノテーション JSON",
+                              _tk_pick_file("Annotation JSON",
                                             [("JSON", "*.json"), ("All", "*.*")])))
                 dpg.add_spacer(height=8)
-                dpg.add_button(label="統計表示", height=32,
+                dpg.add_button(label="Show Statistics", height=32,
                                callback=lambda: run_command([
                                    TOOLS / "summarize_dataset.py",
                                    f"anno={dpg.get_value('vis_anno')}",
                                ]))
-                dpg.add_button(label="可視化", height=32,
+                dpg.add_button(label="Visualize", height=32,
                                callback=lambda: run_command([
                                    TOOLS / "visualize_dataset.py",
                                    f"anno={dpg.get_value('vis_anno')}",
@@ -379,35 +381,35 @@ def panel_dataset(parent):
 def panel_stage1(parent):
     with dpg.child_window(tag="panel_1", parent=parent,
                           width=-1, height=-1, show=False, border=False):
-        dpg.add_text("Stage 1: Spatial Detector 学習", color=(80, 140, 200))
+        dpg.add_text("Stage 1: Spatial Detector Training", color=(80, 140, 200))
         dpg.add_separator()
         dpg.add_spacer(height=8)
 
         with dpg.tab_bar():
 
-            with dpg.tab(label="学習"):
+            with dpg.tab(label="Train"):
                 dpg.add_spacer(height=6)
-                section("データ")
-                field_row("Train アノテーション", "s1_train_anno",
+                section("Data")
+                field_row("Train Annotation", "s1_train_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s1_train_anno",
                               _tk_pick_file("Train JSON", [("JSON", "*.json")])))
-                field_row("Val アノテーション", "s1_val_anno",
+                field_row("Val Annotation", "s1_val_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s1_val_anno",
                               _tk_pick_file("Val JSON", [("JSON", "*.json")])))
-                field_row("出力ディレクトリ", "s1_output",
+                field_row("Output Directory", "s1_output",
                           default=str(RUNS / "train" / "stage1"),
                           btn_cb=lambda: dpg.set_value(
-                              "s1_output", _tk_pick_dir("出力ディレクトリ")))
+                              "s1_output", _tk_pick_dir("Output Directory")))
                 dpg.add_spacer(height=4)
-                section("ハイパーパラメータ")
+                section("Hyperparameters")
                 int_row("Epochs", "s1_epochs", 50)
                 int_row("Batch Size", "s1_batch", 4)
                 float_row("Learning Rate", "s1_lr", 1e-4)
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="Stage 1 学習開始",
+                    label="Start Stage 1 Training",
                     height=36,
                     callback=lambda: run_command(_yoake(
                         "train", "stage=1",
@@ -420,25 +422,25 @@ def panel_stage1(parent):
                     )),
                 )
 
-            with dpg.tab(label="評価"):
+            with dpg.tab(label="Evaluate"):
                 dpg.add_spacer(height=6)
-                section("評価設定")
-                field_row("アノテーション JSON", "s1_eval_anno",
+                section("Evaluation Settings")
+                field_row("Annotation JSON", "s1_eval_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s1_eval_anno",
-                              _tk_pick_file("アノテーション JSON", [("JSON", "*.json")])))
-                field_row("チェックポイント (.pt)", "s1_ckpt",
+                              _tk_pick_file("Annotation JSON", [("JSON", "*.json")])))
+                field_row("Checkpoint (.pt)", "s1_ckpt",
                           hint="outputs/stage1/best.pt",
                           btn_cb=lambda: dpg.set_value(
                               "s1_ckpt",
-                              _tk_pick_file("チェックポイント", [("PyTorch", "*.pt *.pth")])))
-                field_row("出力ディレクトリ", "s1_eval_out",
+                              _tk_pick_file("Checkpoint", [("PyTorch", "*.pt *.pth")])))
+                field_row("Output Directory", "s1_eval_out",
                           default=str(RUNS / "val" / "stage1"),
                           btn_cb=lambda: dpg.set_value(
                               "s1_eval_out", _tk_pick_dir()))
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="Stage 1 評価実行",
+                    label="Run Stage 1 Evaluation",
                     height=36,
                     callback=lambda: run_command(_yoake(
                         "val", "stage=1",
@@ -454,43 +456,43 @@ def panel_stage1(parent):
 def panel_stage2(parent):
     with dpg.child_window(tag="panel_2", parent=parent,
                           width=-1, height=-1, show=False, border=False):
-        dpg.add_text("Stage 2: Action Head 学習", color=(160, 100, 200))
+        dpg.add_text("Stage 2: Action Head Training", color=(160, 100, 200))
         dpg.add_separator()
         dpg.add_spacer(height=8)
 
         with dpg.tab_bar():
 
-            with dpg.tab(label="学習"):
+            with dpg.tab(label="Train"):
                 dpg.add_spacer(height=6)
-                section("データ & チェックポイント")
-                field_row("Train アノテーション", "s2_train_anno",
+                section("Data & Checkpoint")
+                field_row("Train Annotation", "s2_train_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s2_train_anno", _tk_pick_file("Train JSON", [("JSON", "*.json")])))
-                field_row("Val アノテーション", "s2_val_anno",
+                field_row("Val Annotation", "s2_val_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s2_val_anno", _tk_pick_file("Val JSON", [("JSON", "*.json")])))
-                field_row("Stage 1 チェックポイント", "s2_s1_ckpt",
+                field_row("Stage 1 Checkpoint", "s2_s1_ckpt",
                           hint="outputs/stage1/best.pt",
                           btn_cb=lambda: dpg.set_value(
                               "s2_s1_ckpt", _tk_pick_file("Stage1 .pt", [("PyTorch", "*.pt *.pth")])))
-                field_row("出力ディレクトリ", "s2_output",
+                field_row("Output Directory", "s2_output",
                           default=str(RUNS / "train" / "stage2"),
                           btn_cb=lambda: dpg.set_value(
                               "s2_output", _tk_pick_dir()))
                 dpg.add_spacer(height=4)
-                section("ハイパーパラメータ")
+                section("Hyperparameters")
                 int_row("Epochs", "s2_epochs", 30)
                 int_row("Batch Size", "s2_batch", 8)
                 float_row("Learning Rate", "s2_lr", 5e-5)
                 with dpg.group(horizontal=True):
-                    dpg.add_text("クラス不均衡対策:", indent=4)
+                    dpg.add_text("Class Imbalance:", indent=4)
                     dpg.add_combo(
                         ["none", "class_weight", "focal"],
                         tag="s2_imbalance", default_value="class_weight", width=140,
                     )
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="Stage 2 学習開始",
+                    label="Start Stage 2 Training",
                     height=36,
                     callback=lambda: run_command(_yoake(
                         "train", "stage=2",
@@ -504,20 +506,20 @@ def panel_stage2(parent):
                     )),
                 )
 
-            with dpg.tab(label="評価"):
+            with dpg.tab(label="Evaluate"):
                 dpg.add_spacer(height=6)
-                field_row("アノテーション JSON", "s2_eval_anno",
+                field_row("Annotation JSON", "s2_eval_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s2_eval_anno", _tk_pick_file("JSON", [("JSON", "*.json")])))
-                field_row("チェックポイント", "s2_ckpt",
+                field_row("Checkpoint", "s2_ckpt",
                           btn_cb=lambda: dpg.set_value(
                               "s2_ckpt", _tk_pick_file("PT", [("PyTorch", "*.pt *.pth")])))
-                field_row("出力ディレクトリ", "s2_eval_out",
+                field_row("Output Directory", "s2_eval_out",
                           default=str(RUNS / "val" / "stage2"),
                           btn_cb=lambda: dpg.set_value("s2_eval_out", _tk_pick_dir()))
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="Stage 2 評価実行",
+                    label="Run Stage 2 Evaluation",
                     height=36,
                     callback=lambda: run_command(_yoake(
                         "val", "stage=2",
@@ -533,36 +535,36 @@ def panel_stage2(parent):
 def panel_stage3(parent):
     with dpg.child_window(tag="panel_3", parent=parent,
                           width=-1, height=-1, show=False, border=False):
-        dpg.add_text("Stage 3: ID Head 学習", color=(200, 140, 80))
+        dpg.add_text("Stage 3: ID Head Training", color=(200, 140, 80))
         dpg.add_separator()
         dpg.add_spacer(height=8)
 
         with dpg.tab_bar():
 
-            with dpg.tab(label="学習"):
+            with dpg.tab(label="Train"):
                 dpg.add_spacer(height=6)
-                section("データ & チェックポイント")
-                field_row("Train アノテーション", "s3_train_anno",
+                section("Data & Checkpoint")
+                field_row("Train Annotation", "s3_train_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s3_train_anno", _tk_pick_file("Train JSON", [("JSON", "*.json")])))
-                field_row("Val アノテーション", "s3_val_anno",
+                field_row("Val Annotation", "s3_val_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s3_val_anno", _tk_pick_file("Val JSON", [("JSON", "*.json")])))
-                field_row("Stage 1 チェックポイント", "s3_s1_ckpt",
+                field_row("Stage 1 Checkpoint", "s3_s1_ckpt",
                           hint="outputs/stage1/best.pt",
                           btn_cb=lambda: dpg.set_value(
                               "s3_s1_ckpt", _tk_pick_file("Stage1 .pt", [("PyTorch", "*.pt *.pth")])))
-                field_row("出力ディレクトリ", "s3_output",
+                field_row("Output Directory", "s3_output",
                           default=str(RUNS / "train" / "stage3"),
                           btn_cb=lambda: dpg.set_value("s3_output", _tk_pick_dir()))
                 dpg.add_spacer(height=4)
-                section("ハイパーパラメータ")
+                section("Hyperparameters")
                 int_row("Epochs", "s3_epochs", 30)
                 int_row("Batch Size", "s3_batch", 8)
                 float_row("Learning Rate", "s3_lr", 5e-5)
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="Stage 3 学習開始",
+                    label="Start Stage 3 Training",
                     height=36,
                     callback=lambda: run_command(_yoake(
                         "train", "stage=3",
@@ -575,20 +577,20 @@ def panel_stage3(parent):
                     )),
                 )
 
-            with dpg.tab(label="評価"):
+            with dpg.tab(label="Evaluate"):
                 dpg.add_spacer(height=6)
-                field_row("アノテーション JSON", "s3_eval_anno",
+                field_row("Annotation JSON", "s3_eval_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s3_eval_anno", _tk_pick_file("JSON", [("JSON", "*.json")])))
-                field_row("チェックポイント", "s3_ckpt",
+                field_row("Checkpoint", "s3_ckpt",
                           btn_cb=lambda: dpg.set_value(
                               "s3_ckpt", _tk_pick_file("PT", [("PyTorch", "*.pt *.pth")])))
-                field_row("出力ディレクトリ", "s3_eval_out",
+                field_row("Output Directory", "s3_eval_out",
                           default=str(RUNS / "val" / "stage3"),
                           btn_cb=lambda: dpg.set_value("s3_eval_out", _tk_pick_dir()))
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="Stage 3 評価実行",
+                    label="Run Stage 3 Evaluation",
                     height=36,
                     callback=lambda: run_command(_yoake(
                         "val", "stage=3",
@@ -610,35 +612,35 @@ def panel_stage4(parent):
 
         with dpg.tab_bar():
 
-            with dpg.tab(label="学習"):
+            with dpg.tab(label="Train"):
                 dpg.add_spacer(height=6)
-                section("データ & チェックポイント")
-                field_row("Train アノテーション", "s4_train_anno",
+                section("Data & Checkpoints")
+                field_row("Train Annotation", "s4_train_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s4_train_anno", _tk_pick_file("Train JSON", [("JSON", "*.json")])))
-                field_row("Val アノテーション", "s4_val_anno",
+                field_row("Val Annotation", "s4_val_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s4_val_anno", _tk_pick_file("Val JSON", [("JSON", "*.json")])))
-                field_row("Stage 1 チェックポイント", "s4_s1_ckpt",
+                field_row("Stage 1 Checkpoint", "s4_s1_ckpt",
                           btn_cb=lambda: dpg.set_value(
                               "s4_s1_ckpt", _tk_pick_file("Stage1", [("PyTorch", "*.pt *.pth")])))
-                field_row("Stage 2 チェックポイント", "s4_s2_ckpt",
+                field_row("Stage 2 Checkpoint", "s4_s2_ckpt",
                           btn_cb=lambda: dpg.set_value(
                               "s4_s2_ckpt", _tk_pick_file("Stage2", [("PyTorch", "*.pt *.pth")])))
-                field_row("Stage 3 チェックポイント", "s4_s3_ckpt",
+                field_row("Stage 3 Checkpoint", "s4_s3_ckpt",
                           btn_cb=lambda: dpg.set_value(
                               "s4_s3_ckpt", _tk_pick_file("Stage3", [("PyTorch", "*.pt *.pth")])))
-                field_row("出力ディレクトリ", "s4_output",
+                field_row("Output Directory", "s4_output",
                           default=str(RUNS / "train" / "stage4"),
                           btn_cb=lambda: dpg.set_value("s4_output", _tk_pick_dir()))
                 dpg.add_spacer(height=4)
-                section("ハイパーパラメータ")
+                section("Hyperparameters")
                 int_row("Epochs", "s4_epochs", 20)
                 int_row("Batch Size", "s4_batch", 2)
                 float_row("Learning Rate", "s4_lr", 1e-5)
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="Stage 4 学習開始",
+                    label="Start Stage 4 Training",
                     height=36,
                     callback=lambda: run_command(_yoake(
                         "train", "stage=4",
@@ -651,20 +653,20 @@ def panel_stage4(parent):
                     )),
                 )
 
-            with dpg.tab(label="評価"):
+            with dpg.tab(label="Evaluate"):
                 dpg.add_spacer(height=6)
-                field_row("アノテーション JSON", "s4_eval_anno",
+                field_row("Annotation JSON", "s4_eval_anno",
                           btn_cb=lambda: dpg.set_value(
                               "s4_eval_anno", _tk_pick_file("JSON", [("JSON", "*.json")])))
-                field_row("チェックポイント", "s4_ckpt",
+                field_row("Checkpoint", "s4_ckpt",
                           btn_cb=lambda: dpg.set_value(
                               "s4_ckpt", _tk_pick_file("PT", [("PyTorch", "*.pt *.pth")])))
-                field_row("出力ディレクトリ", "s4_eval_out",
+                field_row("Output Directory", "s4_eval_out",
                           default=str(RUNS / "val" / "stage4"),
                           btn_cb=lambda: dpg.set_value("s4_eval_out", _tk_pick_dir()))
                 dpg.add_spacer(height=8)
                 dpg.add_button(
-                    label="Unified 評価実行",
+                    label="Run Unified Evaluation",
                     height=36,
                     callback=lambda: run_command(_yoake(
                         "val", "stage=4",
@@ -680,35 +682,35 @@ def panel_stage4(parent):
 def panel_inference(parent):
     with dpg.child_window(tag="panel_5", parent=parent,
                           width=-1, height=-1, show=False, border=False):
-        dpg.add_text("Inference: 動画推論", color=(80, 180, 180))
+        dpg.add_text("Inference: Video Prediction", color=(80, 180, 180))
         dpg.add_separator()
         dpg.add_spacer(height=8)
 
-        section("入力")
-        field_row("入力動画 (.mp4)", "inf_input",
+        section("Input")
+        field_row("Input Video (.mp4)", "inf_input",
                   btn_cb=lambda: dpg.set_value(
                       "inf_input",
-                      _tk_pick_file("動画ファイル", [("動画", "*.mp4 *.avi *.mov"), ("All", "*.*")])))
-        field_row("チェックポイント", "inf_ckpt",
+                      _tk_pick_file("Video File", [("Video", "*.mp4 *.avi *.mov"), ("All", "*.*")])))
+        field_row("Checkpoint", "inf_ckpt",
                   hint="outputs/stage4/best.pt",
                   btn_cb=lambda: dpg.set_value(
-                      "inf_ckpt", _tk_pick_file("チェックポイント", [("PyTorch", "*.pt *.pth")])))
-        field_row("出力ディレクトリ", "inf_output",
+                      "inf_ckpt", _tk_pick_file("Checkpoint", [("PyTorch", "*.pt *.pth")])))
+        field_row("Output Directory", "inf_output",
                   default=str(RUNS / "predict"),
                   btn_cb=lambda: dpg.set_value("inf_output", _tk_pick_dir()))
 
         dpg.add_spacer(height=4)
-        section("推論設定")
+        section("Inference Settings")
         float_row("Score Threshold", "inf_thresh", 0.5)
-        int_row("Window Size (フレーム)", "inf_window", 16)
-        int_row("Max Frames (0=全フレーム)", "inf_maxframes", 0)
+        int_row("Window Size (frames)", "inf_window", 16)
+        int_row("Max Frames (0=all)", "inf_maxframes", 0)
         with dpg.group(horizontal=True):
-            dpg.add_text("可視化オーバーレイ:", indent=4)
+            dpg.add_text("Visualization Overlay:", indent=4)
             dpg.add_checkbox(tag="inf_vis", default_value=True)
 
         dpg.add_spacer(height=8)
         dpg.add_button(
-            label="推論実行",
+            label="Run Inference",
             height=36,
             callback=lambda: run_command(_predict_command(
                 dpg.get_value("inf_input"),
@@ -727,25 +729,25 @@ def panel_inference(parent):
 def panel_analysis(parent):
     with dpg.child_window(tag="panel_6", parent=parent,
                           width=-1, height=-1, show=False, border=False):
-        dpg.add_text("Analysis: 結果解析", color=(180, 180, 80))
+        dpg.add_text("Analysis: Result Analysis", color=(180, 180, 80))
         dpg.add_separator()
         dpg.add_spacer(height=8)
 
-        section("入力")
-        field_row("予測 JSON", "ana_pred",
+        section("Input")
+        field_row("Predictions JSON", "ana_pred",
                   btn_cb=lambda: dpg.set_value(
-                      "ana_pred", _tk_pick_file("予測 JSON", [("JSON", "*.json")])))
-        field_row("Ground Truth JSON (任意)", "ana_gt",
+                      "ana_pred", _tk_pick_file("Predictions JSON", [("JSON", "*.json")])))
+        field_row("Ground Truth JSON (optional)", "ana_gt",
                   btn_cb=lambda: dpg.set_value(
                       "ana_gt", _tk_pick_file("GT JSON", [("JSON", "*.json")])))
-        field_row("出力ディレクトリ", "ana_output",
+        field_row("Output Directory", "ana_output",
                   default=str(RUNS / "analyze"),
                   btn_cb=lambda: dpg.set_value("ana_output", _tk_pick_dir()))
 
         dpg.add_spacer(height=4)
-        section("解析モード")
+        section("Analysis Mode")
         with dpg.group(horizontal=True):
-            dpg.add_text("モード:", indent=4)
+            dpg.add_text("Mode:", indent=4)
             dpg.add_combo(
                 ["timeline", "distribution", "id_switches", "confidence"],
                 tag="ana_mode", default_value="timeline", width=160,
@@ -754,13 +756,13 @@ def panel_analysis(parent):
 
         with dpg.group(horizontal=True):
             dpg.add_button(
-                label="解析実行",
+                label="Run Analysis",
                 height=36,
                 callback=lambda: _run_analyze_ui(),
             )
             dpg.add_spacer(width=8)
             dpg.add_button(
-                label="アブレーション集計",
+                label="Ablation Summary",
                 height=36,
                 callback=lambda: run_command([
                     TOOLS / "run_ablation.py",
@@ -860,10 +862,10 @@ def main():
     _resize_cb()
 
     dpg.show_viewport()
-    append_log("YOAKE GUI を起動しました。左のメニューからステップを選択してください。")
+    append_log("YOAKE GUI started. Select a step from the left menu.")
     append_log(f"  ROOT: {ROOT}")
-    append_log(f"  出力先: {RUNS}")
-    append_log("  学習・評価は yoake CLI (python -m htrtdetr.cli) 経由で実行されます。")
+    append_log(f"  Output: {RUNS}")
+    append_log("  Training/evaluation runs via yoake CLI (python -m htrtdetr.cli).")
 
     while dpg.is_dearpygui_running():
         dpg.render_dearpygui_frame()

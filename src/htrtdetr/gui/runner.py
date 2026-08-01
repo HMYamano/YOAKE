@@ -54,13 +54,13 @@ class CommandRunner:
     def run(self, cmd: List[str], on_done: Optional[Callable[[int], None]] = None) -> None:
         """``cmd`` (例: ['-m','htrtdetr.cli','train',...]) を実行する。"""
         if self.is_running():
-            self.log("[WARN] 既に別のコマンドを実行中です。")
+            self.log("[WARN] Another command is already running.")
             return
 
         def _worker() -> None:
             full = [sys.executable] + [str(c) for c in cmd]
             self.log("$ " + " ".join(full))
-            self._status("実行中...")
+            self._status("Running...")
             try:
                 proc = subprocess.Popen(
                     full,
@@ -77,20 +77,20 @@ class CommandRunner:
                     self.log(line.rstrip())
                 proc.wait()
                 code = proc.returncode
-                self.log(f"--- {'完了 ✓' if code == 0 else f'エラー (code={code})'} ---")
-                self._status("完了 ✓" if code == 0 else f"エラー (code={code})")
+                self.log(f"--- {'Done' if code == 0 else f'Error (code={code})'} ---")
+                self._status("Done" if code == 0 else f"Error (code={code})")
                 if on_done is not None:
                     try:
                         on_done(code)
                     except Exception:  # noqa: BLE001
                         pass
             except FileNotFoundError as exc:
-                self.log(f"[ERROR] コマンドが見つかりません: {exc}")
-                self.log("  ヒント: pip install -e . で yoake をインストールしてください")
-                self._status("エラー: コマンド未発見")
+                self.log(f"[ERROR] Command not found: {exc}")
+                self.log("  Hint: install yoake with 'pip install -e .'")
+                self._status("Error: command not found")
             except Exception as exc:  # noqa: BLE001
                 self.log(f"[ERROR] {exc}")
-                self._status("エラー")
+                self._status("Error")
             finally:
                 self._proc = None
 
@@ -99,4 +99,4 @@ class CommandRunner:
     def stop(self) -> None:
         if self.is_running() and self._proc is not None:
             self._proc.terminate()
-            self.log("--- 中断されました ---")
+            self.log("--- Interrupted ---")

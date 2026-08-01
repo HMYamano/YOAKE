@@ -33,11 +33,15 @@ def train_command(
     lr: Optional[float] = None,
     window_size: Optional[int] = None,
     imbalance_strategy: Optional[str] = None,
+    annotation_format: Optional[str] = None,
+    classes_file: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """``yoake train stage=N`` コマンドを生成する。
 
     ``window_size`` は Stage 2–4 の sliding-window 学習に必須 (既定 16)。
+    ``annotation_format="yolo"`` を渡すと YOLO 形式のデータセットとしてロードする
+    (train_root は images/ + labels/ を含むディレクトリ)。
     """
     overrides: Dict[str, Any] = {}
     if epochs is not None:
@@ -50,6 +54,10 @@ def train_command(
         overrides["data.window_size"] = window_size
     if imbalance_strategy:
         overrides["loss.imbalance_strategy"] = imbalance_strategy
+    if annotation_format:
+        overrides["data.annotation_format"] = annotation_format
+    if classes_file:
+        overrides["data.classes_file"] = classes_file
     if extra:
         overrides.update(extra)
     return build_train_command(stage, train_root, val_root, output_dir, **overrides)

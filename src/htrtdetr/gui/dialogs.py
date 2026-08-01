@@ -30,21 +30,21 @@ def _dialog(kind: str, **kwargs) -> str:
     return path or ""
 
 
-def pick_file(title: str = "ファイルを選択",
+def pick_file(title: str = "Select File",
               filetypes: Optional[List[Tuple[str, str]]] = None) -> str:
     return _dialog("open", title=title, filetypes=filetypes or [("All", "*.*")])
 
 
-def pick_dir(title: str = "フォルダを選択") -> str:
+def pick_dir(title: str = "Select Folder") -> str:
     return _dialog("dir", title=title)
 
 
-def save_file(title: str = "保存先を選択", defaultextension: str = ".json",
+def save_file(title: str = "Save As", defaultextension: str = ".json",
               filetypes: Optional[List[Tuple[str, str]]] = None) -> str:
     return _dialog("save", title=title, defaultextension=defaultextension,
                    filetypes=filetypes or [("JSON", "*.json"), ("All", "*.*")])
 
 
-VIDEO_TYPES = [("動画", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"), ("All", "*.*")]
+VIDEO_TYPES = [("Video", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"), ("All", "*.*")]
 JSON_TYPES = [("JSON", "*.json"), ("All", "*.*")]
 CKPT_TYPES = [("PyTorch", "*.pt *.pth"), ("All", "*.*")]

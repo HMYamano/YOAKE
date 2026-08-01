@@ -210,6 +210,212 @@ def load_annotation(path: str) -> DatasetAnno:
     )
 
 
+_YOLO_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+
+
+def _read_yolo_classes(classes_file: Path) -> List[str]:
+    with open(classes_file, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def _read_yolo_label(label_file: Path) -> List[Tuple[int, float, float, float, float]]:
+    rows: List[Tuple[int, float, float, float, float]] = []
+    if not label_file.exists():
+        return rows
+    with open(label_file, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            cid = int(float(parts[0]))
+            cx, cy, w, h = (float(parts[1]), float(parts[2]),
+                            float(parts[3]), float(parts[4]))
+            rows.append((cid, cx, cy, w, h))
+    return rows
+
+
+def _probe_image_size(path: Path) -> Tuple[int, int]:
+    """Return (width, height) of an image. Falls back to (0, 0) if unreadable."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return int(im.width), int(im.height)
+    except Exception:
+        pass
+    try:
+        import cv2
+        img = cv2.imread(str(path))
+        if img is not None:
+            h, w = img.shape[:2]
+            return int(w), int(h)
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _find_yolo_pairs(
+    root: Path,
+    images_subdir: str = "images",
+    labels_subdir: str = "labels",
+) -> Tuple[Path, Path, Optional[Path]]:
+    """Locate images/, labels/, and classes.txt inside a YOLO dataset root.
+
+    Supports 3 layouts:
+      1. root/images/*.jpg  + root/labels/*.txt
+      2. root/*.jpg + root/*.txt (flat)
+      3. root/<split>/images/... (returns as-is if caller passes the split dir)
+    """
+    img_dir = root / images_subdir
+    lbl_dir = root / labels_subdir
+    if not img_dir.is_dir() or not lbl_dir.is_dir():
+        # Flat layout: images and labels colocated in root
+        img_dir = root
+        lbl_dir = root
+
+    classes_file: Optional[Path] = None
+    for candidate in ("classes.txt", "obj.names", "labels.txt"):
+        p = root / candidate
+        if p.exists():
+            classes_file = p
+            break
+    return img_dir, lbl_dir, classes_file
+
+
+def load_yolo_annotation(
+    dataset_dir: str,
+    classes_file: str = "",
+    default_class_names: Optional[List[str]] = None,
+    video_id: Optional[str] = None,
+    group_by_prefix: bool = True,
+    fps: float = 30.0,
+) -> DatasetAnno:
+    """Load a YOLO-format detection dataset into a DatasetAnno.
+
+    Args:
+        dataset_dir: Root directory containing images and labels. Supports both
+            ``root/images`` + ``root/labels`` layout and a flat layout.
+        classes_file: Optional explicit path to ``classes.txt``. Falls back to
+            ``<dataset_dir>/classes.txt`` (or ``obj.names`` / ``labels.txt``).
+        default_class_names: Used if no classes file is found.
+        video_id: Force a single video_id. Ignored when ``group_by_prefix=True``
+            and the filenames encode a prefix (e.g. ``fly_copulation_01_5241.jpg``
+            → video_id ``fly_copulation_01``).
+        group_by_prefix: When True, group frames whose filename shares the prefix
+            up to the last underscore-separated numeric segment into the same
+            video. This treats sequential frames as a temporal sequence.
+        fps: Frames per second recorded on the VideoAnno.
+    """
+    root = Path(dataset_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"YOLO dataset dir not found: {root}")
+
+    img_dir, lbl_dir, auto_classes = _find_yolo_pairs(root)
+
+    classes_path = Path(classes_file) if classes_file else auto_classes
+    if classes_path and classes_path.exists():
+        class_names = _read_yolo_classes(classes_path)
+    else:
+        class_names = list(default_class_names or ["fly"])
+
+    # Gather image files
+    image_files = sorted(
+        p for p in img_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in _YOLO_IMAGE_EXTS
+    )
+    if not image_files:
+        raise FileNotFoundError(f"No YOLO images found in {img_dir}")
+
+    def _group_key(stem: str) -> str:
+        if not group_by_prefix:
+            return video_id or "video_0"
+        parts = stem.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+            return parts[0]
+        return stem
+
+    def _frame_index(stem: str, fallback: int) -> int:
+        parts = stem.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+            try:
+                return int(parts[1])
+            except ValueError:
+                return fallback
+        return fallback
+
+    # {video_id: [(frame_index, image_path, label_path, width, height)]}
+    groups: Dict[str, List[Tuple[int, Path, Path, int, int]]] = {}
+    for i, img_path in enumerate(image_files):
+        stem = img_path.stem
+        vid = video_id or _group_key(stem)
+        fi = _frame_index(stem, i)
+        lbl_path = lbl_dir / f"{stem}.txt"
+        w, h = _probe_image_size(img_path)
+        groups.setdefault(vid, []).append((fi, img_path, lbl_path, w, h))
+
+    videos: List[VideoAnno] = []
+    obj_uid = 0
+    for vid, entries in sorted(groups.items()):
+        entries.sort(key=lambda t: t[0])
+        # Video-level size: majority of frames (defaults to first frame).
+        first_w, first_h = entries[0][3], entries[0][4]
+        frames: List[FrameAnno] = []
+        for fi, img_path, lbl_path, w, h in entries:
+            objects: List[ObjectAnno] = []
+            fw = w or first_w or 0
+            fh = h or first_h or 0
+            for cid, cx, cy, bw, bh in _read_yolo_label(lbl_path):
+                if fw <= 0 or fh <= 0:
+                    # Store normalized boxes verbatim; consumer will scale later
+                    x1 = cx - bw / 2.0
+                    y1 = cy - bh / 2.0
+                    x2 = cx + bw / 2.0
+                    y2 = cy + bh / 2.0
+                else:
+                    x1 = (cx - bw / 2.0) * fw
+                    y1 = (cy - bh / 2.0) * fh
+                    x2 = (cx + bw / 2.0) * fw
+                    y2 = (cy + bh / 2.0) * fh
+                obj_uid += 1
+                objects.append(ObjectAnno(
+                    object_id=obj_uid,
+                    bbox=[round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                    class_id=int(cid),
+                    track_id=-1,
+                    action_id=-1,
+                ))
+            try:
+                rel_path = str(img_path.relative_to(root))
+            except ValueError:
+                rel_path = str(img_path)
+            frames.append(FrameAnno(
+                frame_index=int(fi),
+                image_path=rel_path.replace("\\", "/"),
+                width=fw,
+                height=fh,
+                objects=objects,
+            ))
+        videos.append(VideoAnno(
+            video_id=vid,
+            fps=fps,
+            width=first_w,
+            height=first_h,
+            num_frames=len(frames),
+            frames=frames,
+        ))
+
+    return DatasetAnno(
+        meta={
+            "version": "1.1",
+            "source_format": "yolo",
+            "image_root": str(img_dir.relative_to(root)).replace("\\", "/")
+            if img_dir != root else "",
+        },
+        class_names=class_names,
+        action_names=list(class_names),
+        videos=videos,
+    )
+
+
 def save_annotation(anno: DatasetAnno, path: str) -> None:
     """DatasetAnno を JSON ファイルに保存する"""
     Path(path).parent.mkdir(parents=True, exist_ok=True)

@@ -122,6 +122,70 @@ def load_runtime_config_from_checkpoint(path: str):
     return None
 
 
+def _yolo_dataset_to_videos(anno) -> list:
+    """Adapt v1.1 ``DatasetAnno`` into the ``VideoAnnotation`` shape expected
+    by ``SingleFrameDataset`` / ``SlidingWindowDataset``.
+    """
+    from .data.dataset import ObjectAnnotation, FrameAnnotation, VideoAnnotation
+
+    videos = []
+    for v in anno.videos:
+        frames = []
+        for fr in v.frames:
+            objects = [
+                ObjectAnnotation(
+                    bbox=list(obj.bbox),
+                    class_id=obj.class_id,
+                    track_id=obj.track_id,
+                    action_id=obj.action_id,
+                )
+                for obj in fr.objects
+            ]
+            frames.append(FrameAnnotation(
+                frame_index=fr.frame_index,
+                image_path=fr.image_path,
+                objects=objects,
+                width=fr.width,
+                height=fr.height,
+            ))
+        videos.append(VideoAnnotation(
+            video_id=v.video_id,
+            fps=v.fps,
+            frames=frames,
+        ))
+    return videos
+
+
+def _load_dataset_videos(path_str: str, cfg) -> list:
+    """Load a training/val dataset by format.
+
+    Selects between YOLO and JSON based on ``cfg.data.annotation_format``.
+    When ``format=yolo``, ``path_str`` should point to a YOLO dataset root
+    (``images/`` + ``labels/`` or a flat directory with a ``classes.txt``).
+    """
+    fmt = str(getattr(cfg.data, "annotation_format", "json")).lower()
+    if fmt == "yolo":
+        from .data import load_yolo_annotation
+
+        classes_file = str(getattr(cfg.data, "classes_file", "") or "")
+        anno = load_yolo_annotation(path_str, classes_file=classes_file)
+        return _yolo_dataset_to_videos(anno)
+
+    from .data import load_annotations
+
+    ann_path = resolve_annotation_path(path_str)
+    videos, _, _ = load_annotations(str(ann_path))
+    return videos
+
+
+def _dataset_root_for(path_str: str, cfg) -> str:
+    """Resolve the image root used to locate frame images on disk."""
+    fmt = str(getattr(cfg.data, "annotation_format", "json")).lower()
+    if fmt == "yolo":
+        return str(Path(path_str))
+    return resolve_dataset_root(path_str)
+
+
 def _build_dataloaders(cfg, stage: int, use_dummy: bool):
     from torch.utils.data import DataLoader
 
@@ -130,7 +194,6 @@ def _build_dataloaders(cfg, stage: int, use_dummy: bool):
         SingleFrameDataset,
         SlidingWindowDataset,
         get_collate_fn,
-        load_annotations,
     )
 
     num_workers = cfg.data.num_workers
@@ -164,23 +227,24 @@ def _build_dataloaders(cfg, stage: int, use_dummy: bool):
                 mode="single",
             )
         else:
-            train_ann = resolve_annotation_path(str(cfg.data.train_root))
-            val_ann = resolve_annotation_path(str(cfg.data.val_root))
-            train_root = resolve_dataset_root(str(cfg.data.train_root))
-            val_root = resolve_dataset_root(str(cfg.data.val_root))
-            train_videos, _, _ = load_annotations(str(train_ann))
-            val_videos, _, _ = load_annotations(str(val_ann)) if val_ann.exists() else (train_videos, None, None)
+            train_root_str = str(cfg.data.train_root)
+            val_root_str = str(cfg.data.val_root)
+            train_videos = _load_dataset_videos(train_root_str, cfg)
+            try:
+                val_videos = _load_dataset_videos(val_root_str, cfg)
+            except FileNotFoundError:
+                val_videos = train_videos
             train_ds = SingleFrameDataset(
                 train_videos,
                 image_size=img_size,
                 augment=cfg.data.augment_train,
-                data_root=train_root,
+                data_root=_dataset_root_for(train_root_str, cfg),
             )
             val_ds = SingleFrameDataset(
                 val_videos,
                 image_size=img_size,
                 augment=False,
-                data_root=val_root,
+                data_root=_dataset_root_for(val_root_str, cfg),
             )
         mode = "single"
     else:
@@ -202,19 +266,17 @@ def _build_dataloaders(cfg, stage: int, use_dummy: bool):
                 mode="sequence",
             )
         else:
-            train_ann = resolve_annotation_path(str(cfg.data.train_root))
-            val_ann = resolve_annotation_path(str(cfg.data.val_root))
-            train_root = resolve_dataset_root(str(cfg.data.train_root))
-            val_root = resolve_dataset_root(str(cfg.data.val_root))
-            train_videos, _, _ = load_annotations(str(train_ann))
-            val_videos, _, _ = load_annotations(str(val_ann))
+            train_root_str = str(cfg.data.train_root)
+            val_root_str = str(cfg.data.val_root)
+            train_videos = _load_dataset_videos(train_root_str, cfg)
+            val_videos = _load_dataset_videos(val_root_str, cfg)
             train_ds = SlidingWindowDataset(
                 train_videos,
                 window_size=cfg.data.window_size,
                 stride=cfg.data.window_stride,
                 image_size=img_size,
                 augment=cfg.data.augment_train,
-                data_root=train_root,
+                data_root=_dataset_root_for(train_root_str, cfg),
                 require_action=(stage == 2),
             )
             val_ds = SlidingWindowDataset(
@@ -223,7 +285,7 @@ def _build_dataloaders(cfg, stage: int, use_dummy: bool):
                 stride=cfg.data.window_size,
                 image_size=img_size,
                 augment=False,
-                data_root=val_root,
+                data_root=_dataset_root_for(val_root_str, cfg),
             )
         mode = "sequence"
 
@@ -299,8 +361,13 @@ def run_train(stage: int, argv: list) -> None:
     logger.info("root   : %s", root)
 
     set_seed(cfg.train.seed)
-    train_ann = resolve_annotation_path(str(cfg.data.train_root)) if cfg.data.train_root else Path(".")
-    use_dummy = not train_ann.exists()
+    fmt = str(getattr(cfg.data, "annotation_format", "json")).lower()
+    if fmt == "yolo":
+        # YOLO 形式は train_root がデータセットディレクトリそのもの
+        use_dummy = not Path(str(cfg.data.train_root)).exists()
+    else:
+        train_ann = resolve_annotation_path(str(cfg.data.train_root)) if cfg.data.train_root else Path(".")
+        use_dummy = not train_ann.exists()
     if use_dummy:
         logger.warning("Train data not found at %s.", cfg.data.train_root)
         if not _ask_confirm("Run a DummyDataset smoke test instead?"):

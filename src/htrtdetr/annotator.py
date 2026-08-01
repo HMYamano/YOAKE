@@ -215,6 +215,9 @@ class AnnotationApp:
 
         # ── annotation save path ─────────────────────────────────────
         self.annotation_path: Optional[Path] = None
+        # プロジェクト保存ディレクトリ。設定されていれば Ctrl+S はここへ
+        # annotations.json を静かに書き込む (ダイアログを開かない)。
+        self.project_dir: Optional[Path] = None
 
         dpg.create_context()
         self._setup_theme()
@@ -254,33 +257,46 @@ class AnnotationApp:
     def _show_setup_screen(self) -> None:
         vw = dpg.get_viewport_width()
         vh = dpg.get_viewport_height()
-        w, h = 500, 520
+        w, h = 520, 560
 
         if dpg.does_item_exist("setup_win"):
             dpg.delete_item("setup_win")
 
-        with dpg.window(label="YOAKE — Project Setup", tag="setup_win",
+        with dpg.window(label="YOAKE - Project Setup", tag="setup_win",
                         width=w, height=h, no_resize=False, no_close=True,
                         pos=[(vw - w) // 2, (vh - h) // 2]):
 
             dpg.add_text("New Project", color=(230, 25, 75, 255))
             dpg.add_separator()
             dpg.add_spacer(height=6)
+            dpg.add_text(
+                "Create a project, define labels, and choose an optional folder for autosave.",
+                color=(170, 170, 180, 255),
+                wrap=w - 40,
+            )
+            dpg.add_spacer(height=8)
 
             dpg.add_text("Project name")
             dpg.add_input_text(tag="setup_proj_name", default_value="my_project",
                                width=-1)
             dpg.add_spacer(height=8)
 
-            dpg.add_text("Class labels  (comma-separated, e.g. fly,worm)")
+            dpg.add_text("Class labels (comma-separated, for example: fly,worm)")
             dpg.add_input_text(tag="setup_classes",
                                default_value=", ".join(_DEFAULT_CLASSES), width=-1)
             dpg.add_spacer(height=8)
 
-            dpg.add_text("Action labels  (comma-separated, in order)")
+            dpg.add_text("Action labels (comma-separated, in display order)")
             dpg.add_input_text(tag="setup_actions",
                                default_value=", ".join(_DEFAULT_ACTIONS),
                                width=-1, multiline=False)
+            dpg.add_spacer(height=8)
+
+            dpg.add_text("Project folder (optional - Save writes annotations.json here)")
+            with dpg.group(horizontal=True):
+                dpg.add_input_text(tag="setup_proj_dir", default_value="", width=-80)
+                dpg.add_button(label="Browse", width=72,
+                               callback=self._on_setup_pick_proj_dir)
             dpg.add_spacer(height=12)
             dpg.add_separator()
             dpg.add_spacer(height=8)
@@ -290,12 +306,17 @@ class AnnotationApp:
                            width=-1, height=36)
 
             dpg.add_spacer(height=12)
-            dpg.add_text("— or load an existing annotation —",
+            dpg.add_text("Or continue from an existing annotation file",
                          color=(140, 140, 150, 255))
             dpg.add_spacer(height=6)
-            dpg.add_button(label="Load Existing Annotation JSON…",
+            dpg.add_button(label="Load Existing Annotation JSON...",
                            callback=self._on_load_project_clicked,
                            width=-1, height=36)
+
+    def _on_setup_pick_proj_dir(self) -> None:
+        p = _tk_ask_dir(title="Select Project Directory")
+        if p is not None and dpg.does_item_exist("setup_proj_dir"):
+            dpg.set_value("setup_proj_dir", str(p))
 
     def _on_new_project_confirmed(self) -> None:
         self.project_name = dpg.get_value("setup_proj_name").strip() or "untitled"
@@ -307,9 +328,12 @@ class AnnotationApp:
             self.class_names = ["fly"]
         if not self.action_names:
             self.action_names = list(_DEFAULT_ACTIONS)
+        raw_dir = dpg.get_value("setup_proj_dir").strip()
+        self.project_dir = Path(raw_dir) if raw_dir else None
         dpg.delete_item("setup_win")
         self._build_main_window()
         self._update_action_buttons()
+        self._refresh_project_dir_display()
 
     def _on_load_project_clicked(self) -> None:
         path = _tk_open_file(
@@ -357,17 +381,21 @@ class AnnotationApp:
     def _build_menubar(self) -> None:
         with dpg.menu_bar():
             with dpg.menu(label="File"):
-                dpg.add_menu_item(label="Open Video…  Ctrl+O",
+                dpg.add_menu_item(label="Open Video...  Ctrl+O",
                                   callback=self._open_video_dialog)
-                dpg.add_menu_item(label="Load Annotation…",
+                dpg.add_menu_item(label="Load Annotation...",
                                   callback=self._load_annotation_dialog)
                 dpg.add_separator()
+                dpg.add_menu_item(label="Set Project Folder...",
+                                  callback=self._set_project_dir_dialog)
                 dpg.add_menu_item(label="Save  Ctrl+S",
                                   callback=self.save_annotation)
-                dpg.add_menu_item(label="Save & Export Frames…",
+                dpg.add_menu_item(label="Save As...",
+                                  callback=self._save_as_dialog)
+                dpg.add_menu_item(label="Save and Export Frames...",
                                   callback=self._save_and_export_dialog)
                 dpg.add_separator()
-                dpg.add_menu_item(label="New Project…",
+                dpg.add_menu_item(label="New Project...",
                                   callback=self._show_setup_screen)
 
             with dpg.menu(label="Edit"):
@@ -377,9 +405,9 @@ class AnnotationApp:
                                   callback=self.propagate_from_prev)
 
             with dpg.menu(label="Labels"):
-                dpg.add_menu_item(label="Add Class Label…",
+                dpg.add_menu_item(label="Add Class Label...",
                                   callback=self._add_class_label_dialog)
-                dpg.add_menu_item(label="Add Action Label…",
+                dpg.add_menu_item(label="Add Action Label...",
                                   callback=self._add_action_label_dialog)
 
             with dpg.menu(label="Help"):
@@ -408,7 +436,26 @@ class AnnotationApp:
                               no_scrollbar=False, border=True):
             # Title
             dpg.add_text("YOAKE Annotator", color=(230, 25, 75, 255))
+            dpg.add_text("Draw, track, and label behavior", color=(150, 150, 160, 255))
             dpg.add_separator()
+            dpg.add_spacer(height=4)
+
+            with dpg.collapsing_header(label="Quick Start", default_open=True):
+                dpg.add_text(
+                    "1. Open a video.\n"
+                    "2. Drag on the canvas to create a box.\n"
+                    "3. Assign a track and action.\n"
+                    "4. Use Range Labeling to update multiple frames faster.",
+                    color=(170, 170, 180, 255),
+                    wrap=_SIDEBAR_W - 16,
+                )
+                dpg.add_spacer(height=4)
+                dpg.add_text(
+                    "Tip: click a box to edit it, or use the object list below to jump to a selection.",
+                    color=(140, 140, 150, 255),
+                    wrap=_SIDEBAR_W - 16,
+                )
+
             dpg.add_spacer(height=4)
 
             # ── Active track ──────────────────────────────────────────
@@ -418,7 +465,7 @@ class AnnotationApp:
                     dpg.add_input_int(tag="active_tid", default_value=1, width=80,
                                       min_value=0, max_value=9999,
                                       callback=self._on_active_tid_change)
-                    dpg.add_button(label="+New", width=60,
+                    dpg.add_button(label="New Track", width=90,
                                    callback=self.new_track)
                 dpg.add_spacer(height=2)
                 dpg.add_text("", tag="active_track_color_label")
@@ -426,22 +473,23 @@ class AnnotationApp:
             dpg.add_spacer(height=4)
 
             # ── Range Labeling ────────────────────────────────────────
-            with dpg.collapsing_header(label="Range Labeling  (範囲ラベリング)",
+            with dpg.collapsing_header(label="Range Labeling",
                                        default_open=True):
-                dpg.add_text("個体を選び [開始,終了] に行動/ID を一括付与。",
+                dpg.add_text(
+                             "Select a track, choose a frame span, and apply track or action changes across that range.",
                              color=(150, 150, 160), wrap=_SIDEBAR_W - 16)
                 with dpg.group(horizontal=True):
-                    dpg.add_text("開始:", indent=4)
+                    dpg.add_text("Start:", indent=4)
                     dpg.add_input_int(tag="range_start", default_value=0, width=70,
                                       min_value=0, max_value=0)
-                    dpg.add_button(label="現在", width=48,
+                    dpg.add_button(label="Use Current", width=88,
                                    callback=lambda: dpg.set_value(
                                        "range_start", self.current_frame_idx))
                 with dpg.group(horizontal=True):
-                    dpg.add_text("終了:", indent=4)
+                    dpg.add_text("End:", indent=4)
                     dpg.add_input_int(tag="range_end", default_value=0, width=70,
                                       min_value=0, max_value=0)
-                    dpg.add_button(label="現在", width=48,
+                    dpg.add_button(label="Use Current", width=88,
                                    callback=lambda: dpg.set_value(
                                        "range_end", self.current_frame_idx))
                 with dpg.group(horizontal=True):
@@ -450,26 +498,26 @@ class AnnotationApp:
                                       min_value=0, max_value=9999)
                 with dpg.group(horizontal=True):
                     dpg.add_text("Action:", indent=4)
-                    dpg.add_combo(items=["(変更しない)"], tag="range_action",
-                                  default_value="(変更しない)", width=-1)
-                dpg.add_checkbox(label="bbox を補間する", tag="range_interp",
+                    dpg.add_combo(items=["(no change)"], tag="range_action",
+                                  default_value="(no change)", width=-1)
+                dpg.add_checkbox(label="Interpolate boxes", tag="range_interp",
                                  default_value=True)
-                dpg.add_button(label="範囲に適用  (Apply to range)", width=-1,
+                dpg.add_button(label="Apply to Range", width=-1,
                                height=30, callback=self._apply_range_ui)
-                dpg.add_button(label="この範囲の track を消去", width=-1,
+                dpg.add_button(label="Remove Track From Range", width=-1,
                                callback=self._clear_range_ui)
 
             dpg.add_spacer(height=4)
 
             # ── Objects in frame ──────────────────────────────────────
-            with dpg.collapsing_header(label="Objects in Frame", default_open=True):
+            with dpg.collapsing_header(label="Objects in Current Frame", default_open=True):
                 dpg.add_listbox(items=[], tag="obj_listbox", num_items=6,
                                 width=-1, callback=self._on_list_select)
 
             dpg.add_spacer(height=4)
 
             # ── Selected box ──────────────────────────────────────────
-            with dpg.collapsing_header(label="Selected Box", default_open=True):
+            with dpg.collapsing_header(label="Selected Object", default_open=True):
                 with dpg.group(horizontal=True):
                     dpg.add_text("Track ID:", indent=4)
                     dpg.add_input_text(tag="sel_tid", width=60,
@@ -489,17 +537,18 @@ class AnnotationApp:
             dpg.add_spacer(height=4)
 
             # ── Quick action buttons ───────────────────────────────────
-            with dpg.collapsing_header(label="Quick Actions (0–4)", default_open=True):
+            with dpg.collapsing_header(label="Quick Actions (0-4)", default_open=True):
                 dpg.add_group(tag="action_buttons_group")
 
             dpg.add_spacer(height=4)
 
             # ── Auto-track ────────────────────────────────────────────
             with dpg.collapsing_header(label="Auto-Track", default_open=True):
-                dpg.add_checkbox(label="Enable auto-track mode  (A)",
+                dpg.add_checkbox(label="Enable auto-track mode (A)",
                                  tag="auto_track_cb",
                                  callback=self._on_auto_track_toggle)
-                dpg.add_text("When ON: advancing a frame\nautomatically tracks all\ninitialized objects.",
+                dpg.add_text(
+                             "When enabled, moving to the next frame automatically updates every initialized tracker.",
                              color=(140, 140, 150, 255))
                 dpg.add_spacer(height=4)
                 dpg.add_button(label="Reset All Trackers",
@@ -513,12 +562,12 @@ class AnnotationApp:
             with dpg.collapsing_header(label="Labels", default_open=False):
                 dpg.add_text("Classes:", color=(160, 200, 255, 255))
                 dpg.add_text("", tag="classes_display")
-                dpg.add_button(label="+ Add Class",
+                dpg.add_button(label="Add Class Label",
                                callback=self._add_class_label_dialog, width=-1)
                 dpg.add_spacer(height=4)
                 dpg.add_text("Actions:", color=(160, 200, 255, 255))
                 dpg.add_text("", tag="actions_display")
-                dpg.add_button(label="+ Add Action",
+                dpg.add_button(label="Add Action Label",
                                callback=self._add_action_label_dialog, width=-1)
 
             dpg.add_spacer(height=4)
@@ -527,6 +576,12 @@ class AnnotationApp:
             with dpg.collapsing_header(label="Frame Info", default_open=True):
                 dpg.add_text("", tag="frame_info_text",
                              color=(120, 120, 130, 255))
+                dpg.add_spacer(height=4)
+                dpg.add_text("Project folder:", color=(160, 200, 255, 255))
+                dpg.add_text("(not set)", tag="project_dir_text",
+                             color=(120, 120, 130, 255), wrap=_SIDEBAR_W - 16)
+                dpg.add_button(label="Change...", width=-1,
+                               callback=self._set_project_dir_dialog)
 
     def _update_action_buttons(self) -> None:
         if not dpg.does_item_exist("action_buttons_group"):
@@ -558,15 +613,15 @@ class AnnotationApp:
         # Update range-labeling action combo
         if dpg.does_item_exist("range_action"):
             dpg.configure_item("range_action",
-                               items=["(変更しない)", "(none)"] + list(self.action_names))
+                               items=["(no change)", "(none)"] + list(self.action_names))
 
     # ─── Navigation bar ──────────────────────────────────────────────
 
     def _build_navbar(self) -> None:
         with dpg.group(horizontal=True, tag="navbar"):
-            dpg.add_button(label="|◀", width=32,
+            dpg.add_button(label="First", width=52,
                            callback=lambda: self.goto_frame(0))
-            dpg.add_button(label="◀", width=28,
+            dpg.add_button(label="Prev", width=48,
                            callback=lambda: self.goto_frame(self.current_frame_idx - 1))
             dpg.add_text("Frame:")
             dpg.add_input_int(tag="frame_input", default_value=0, width=80,
@@ -574,9 +629,9 @@ class AnnotationApp:
                               callback=lambda s, a: self.goto_frame(a),
                               on_enter=True)
             dpg.add_text("/ 0", tag="total_frames_text")
-            dpg.add_button(label="▶", width=28,
+            dpg.add_button(label="Next", width=48,
                            callback=lambda: self.goto_frame(self.current_frame_idx + 1))
-            dpg.add_button(label="▶|", width=32,
+            dpg.add_button(label="Last", width=52,
                            callback=lambda: self.goto_frame(self.num_frames - 1))
             dpg.add_spacer(width=12)
             dpg.add_button(label="Propagate  (Space)",
@@ -674,7 +729,7 @@ class AnnotationApp:
         cw, ch = self._canvas_w, self._canvas_h
 
         if self._current_bgr is None:
-            dpg.draw_text((cw // 2 - 160, ch // 2), "Open a video file  (File → Open Video)",
+            dpg.draw_text((cw // 2 - 160, ch // 2), "Open a video file (File -> Open Video)",
                           color=(80, 80, 100, 255), size=16, parent="canvas")
             return
 
@@ -905,7 +960,7 @@ class AnnotationApp:
                         no_move=True, pos=(mx, my), min_size=(160, 10)):
             dpg.add_text(f"Track {obj.track_id}", color=(200, 200, 100, 255))
             dpg.add_separator()
-            dpg.add_menu_item(label="Set Track ID…",
+            dpg.add_menu_item(label="Set Track ID...",
                               callback=self._prompt_track_id_dialog)
             dpg.add_separator()
             for i, name in enumerate(self.action_names):
@@ -1182,10 +1237,10 @@ class AnnotationApp:
         self._refresh_sidebar()
         note = ""
         if interpolate and len(anchors) < 2:
-            note = ("（キーフレーム保持）" if anchors
-                    else "（box無し → 行動のみ適用）")
-        self._status(f"範囲 [{f_start},{f_end}] track {track_id}: "
-                     f"{count} フレームに適用 {note}")
+            note = ("(keyframe held)" if anchors
+                    else "(no box -> action only)")
+        self._status(f"Range [{f_start},{f_end}] track {track_id}: "
+                     f"applied to {count} frame(s) {note}")
 
     def clear_range(self, track_id: int, f_start: int, f_end: int) -> None:
         """区間 [f_start, f_end] の指定 track のオブジェクトを削除する。"""
@@ -1203,12 +1258,12 @@ class AnnotationApp:
         self.deselect()
         self._render_canvas()
         self._refresh_sidebar()
-        self._status(f"範囲 [{f_start},{f_end}] の track {track_id} を "
-                     f"{removed} 個削除しました。")
+        self._status(f"Range [{f_start},{f_end}] track {track_id}: "
+                     f"removed {removed} object(s).")
 
     def _range_action_id(self) -> Optional[int]:
         val = dpg.get_value("range_action") if dpg.does_item_exist("range_action") else None
-        if val in (None, "(変更しない)"):
+        if val in (None, "(no change)"):
             return None
         if val == "(none)":
             return -1
@@ -1232,12 +1287,12 @@ class AnnotationApp:
 
     def set_action(self, action_id: int) -> None:
         if self._selected is None:
-            self._status(f"No box selected — action [{action_id}] ignored.")
+            self._status(f"No box selected. Action [{action_id}] was ignored.")
             return
         self._selected.action_id = action_id
         name = (self.action_names[action_id]
                 if action_id < len(self.action_names) else str(action_id))
-        self._status(f"Action → {name}")
+        self._status(f"Action set to {name}")
         self._refresh_sidebar()
         self._render_canvas()
 
@@ -1532,6 +1587,12 @@ class AnnotationApp:
         if self.cap is None:
             self._status("No video loaded.")
             return
+        # プロジェクトディレクトリが指定されていれば、静かに annotations.json を上書き。
+        if self.project_dir is not None:
+            path = self.project_dir / "annotations.json"
+            self._write_annotation(path)
+            return
+        # 未設定なら従来通りダイアログで保存先を選ばせる。
         initial = (self.annotation_path.name
                    if self.annotation_path else "annotations.json")
         path = _tk_save_file(
@@ -1541,6 +1602,37 @@ class AnnotationApp:
         )
         if path is not None:
             self._write_annotation(path)
+
+    def _save_as_dialog(self) -> None:
+        """プロジェクトディレクトリを設定していても、明示的にダイアログで保存先を選ぶ。"""
+        if self.cap is None:
+            self._status("No video loaded.")
+            return
+        initial = (self.annotation_path.name
+                   if self.annotation_path else "annotations.json")
+        path = _tk_save_file(
+            title="Save Annotation As",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initial_file=initial,
+        )
+        if path is not None:
+            self._write_annotation(path)
+
+    def _set_project_dir_dialog(self) -> None:
+        """メニューからプロジェクト保存ディレクトリを変更する。"""
+        p = _tk_ask_dir(title="Select Project Directory")
+        if p is None:
+            return
+        self.project_dir = p
+        self._refresh_project_dir_display()
+        self._status(f"Project folder set to {p}")
+
+    def _refresh_project_dir_display(self) -> None:
+        if dpg.does_item_exist("project_dir_text"):
+            dpg.set_value(
+                "project_dir_text",
+                str(self.project_dir) if self.project_dir else "(not set)",
+            )
 
     def _write_annotation(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1578,15 +1670,18 @@ class AnnotationApp:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         self.annotation_path = path
-        self._status(f"Saved → {path.name}")
+        self._status(f"Saved to {path.name}")
 
     def _save_and_export_dialog(self) -> None:
         if self.cap is None:
             self._status("No video loaded.")
             return
-        out = _tk_ask_dir(title="Select Output Directory")
+        # プロジェクトディレクトリが設定されていればそこへ出力、無ければダイアログ。
+        out = self.project_dir
         if out is None:
-            return
+            out = _tk_ask_dir(title="Select Output Directory")
+            if out is None:
+                return
         video_id = self.video_path.stem if self.video_path else "video_001"
         img_dir = out / "images" / video_id
         img_dir.mkdir(parents=True, exist_ok=True)
@@ -1600,7 +1695,7 @@ class AnnotationApp:
                 cv2.imwrite(str(img_dir / f"{fi:06d}.jpg"), frame_bgr,
                             [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-        self._status(f"Exported {len(frame_indices)} frames → {img_dir}")
+        self._status(f"Exported {len(frame_indices)} frames to {img_dir}")
 
     def _load_annotation_dialog(self) -> None:
         path = _tk_open_file(
@@ -1647,6 +1742,11 @@ class AnnotationApp:
         self._render_canvas()
         self._refresh_sidebar()
         self.annotation_path = path
+        # 読み込んだ JSON の親ディレクトリを既定のプロジェクトディレクトリにする。
+        # (既に手動で別ディレクトリを設定していた場合は上書きしない。)
+        if self.project_dir is None:
+            self.project_dir = path.parent
+            self._refresh_project_dir_display()
         self._status(f"Loaded: {path.name}")
 
     # ═══════════════════════════════════════════════════════════════════
@@ -1667,28 +1767,27 @@ class AnnotationApp:
         vw, vh = dpg.get_viewport_width(), dpg.get_viewport_height()
         txt = (
             "Keyboard Shortcuts\n"
-            "──────────────────\n"
-            "→ / N          Next frame\n"
-            "← / P          Previous frame\n"
-            "Space          Propagate boxes from prev frame\n"
+            "------------------\n"
+            "Right / N      Next frame\n"
+            "Left / P       Previous frame\n"
+            "Space          Propagate boxes from previous frame\n"
             "A              Toggle auto-track mode\n"
             "Delete         Delete selected box\n"
-            "0 – 4          Set action for selected box\n"
+            "0 - 4          Set action for selected box\n"
             "Ctrl+S         Save annotation JSON\n"
             "Escape         Deselect\n\n"
             "Mouse\n"
-            "─────\n"
-            "Drag on empty area   Draw new bounding box\n"
-            "Click on box         Select box\n"
-            "Drag selected box    Move box\n"
-            "Drag corner dot      Resize box\n"
-            "Right-click          Context menu\n\n"
+            "-----\n"
+            "Drag on empty area   Draw a new bounding box\n"
+            "Click on box         Select a box\n"
+            "Drag selected box    Move a box\n"
+            "Drag corner dot      Resize a box\n"
+            "Right-click          Open the context menu\n\n"
             "Auto-Track (A)\n"
-            "──────────────\n"
-            "Draw a box in auto-track mode → tracker\n"
-            "initialized automatically. On next-frame,\n"
-            "CSRT tracker updates all active boxes.\n"
-            "Green dot = tracker active for that box.\n"
+            "--------------\n"
+            "Draw a box while auto-track mode is on to initialize a tracker automatically.\n"
+            "When you move to the next frame, the CSRT tracker updates every active box.\n"
+            "A green dot means the tracker is active for that object.\n"
         )
         with dpg.window(label="Help / Shortcuts", tag="help_win",
                         width=380, height=420, modal=False,

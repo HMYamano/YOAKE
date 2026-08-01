@@ -210,7 +210,9 @@ class DataConfig:
     train_root: str = "data/train"
     val_root: str = "data/val"
     test_root: str = "data/test"
-    annotation_format: str = "json"  # "json" | "csv" | "custom"
+    annotation_format: str = "json"  # "json" | "yolo" | "csv" | "custom"
+    # YOLO 形式のときのオプション: classes.txt を明示指定 (未指定なら train_root/classes.txt を自動探索)
+    classes_file: str = ""
     image_size: Tuple[int, int] = (640, 640)  # (H, W)
     # Sequence window の設定
     window_size: int = 16            # 1 sample あたりのフレーム数
