@@ -23,7 +23,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 pytest.importorskip("dearpygui.dearpygui")
-pytest.importorskip("cv2")
+cv2 = pytest.importorskip("cv2")
+np = pytest.importorskip("numpy")
+
+from types import SimpleNamespace  # noqa: E402
 
 from htrtdetr import annotator as A  # noqa: E402
 from htrtdetr.gui import inspector as INS, shortcuts  # noqa: E402
@@ -198,3 +201,196 @@ def test_the_cli_accepts_the_flags_the_analysis_page_passes():
     source = inspect.getsource(A.main)
     for flag in ("--import-predictions", "--video", "--load"):
         assert flag in source, f"main() does not accept {flag}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Video propagation: two passes, no GUI
+# ══════════════════════════════════════════════════════════════════════════
+#
+# _propagate_worker runs off the render thread and touches only self._post,
+# self._status and the context it is handed, so it can be driven unbound
+# against a fake helper — no viewport, and no AnnotationApp instance. It does
+# open a VideoCapture of its own, so these write a few frames to tmp_path; that
+# is the one thing about it that cannot be faked without faking cv2.
+#
+# The decision under test is how many passes it asks for. SAM 2 propagates one
+# way from the prompt, so a window with frames before the prompt needs two —
+# and asking for one is invisible until someone counts the boxes.
+
+class _FakeVideoClient:
+    """Records every propagate call and answers with boxes for its own half."""
+
+    def __init__(self, num_frames, prompt_offset, drop=()):
+        self.num_frames = num_frames
+        self.prompt_offset = prompt_offset
+        self.drop = set(drop)          # directions that answer nothing
+        self.calls = []
+        self._replies = {}
+        self._next = 0
+
+    def propagate(self, *, frames_dir, first_frame, prompt_frame, points=None,
+                  box=None, obj_id=1, backward=False, max_frames=0):
+        self.calls.append(
+            {"backward": backward, "first_frame": first_frame,
+             "prompt_frame": prompt_frame, "obj_id": obj_id,
+             "points": points, "box": box})
+        self._next += 1
+        prompt = prompt_frame
+        last = first_frame + self.num_frames - 1
+        span = range(first_frame, prompt + 1) if backward else range(prompt, last + 1)
+        if backward in self.drop:
+            self._replies[self._next] = None
+        else:
+            self._replies[self._next] = {
+                "ok": True, "window": self.num_frames,
+                "items": [{"frame": f, "obb": [10.0, 10.0, 6.0, 3.0, 0.0]}
+                          for f in span]}
+        return self._next
+
+    def wait_for(self, request_id, timeout=0.0):
+        return self._replies.get(request_id)
+
+
+class _Recorder:
+    """The parts of AnnotationApp _propagate_worker actually reaches."""
+
+    def __init__(self):
+        self._propagate_stop = False
+        self.statuses = []
+        self.finished = []
+
+    def _post(self, fn):
+        fn()
+
+    def _status(self, text):
+        self.statuses.append(text)
+
+    def _finish_video_propagation(self, project, video, result, request):
+        self.finished.append(result)
+
+
+def _video_file(path, frames=40, size=(64, 48)):
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, size)
+    for i in range(frames):
+        writer.write(np.full((size[1], size[0], 3), (i * 5) % 255, np.uint8))
+    writer.release()
+    return path
+
+
+def _run_worker(tmp_path, *, before, after, prompt, frames=40, drop=()):
+    from htrtdetr.annotator import AnnotationApp
+    from htrtdetr.gui import video_segment as vs
+
+    video = SimpleNamespace(
+        path=_video_file(tmp_path / "clip.mp4", frames=frames),
+        num_frames=frames)
+    request = vs.PropagationRequest(
+        frame=prompt, box=(10.0, 10.0, 30.0, 30.0), track_id=5,
+        before=before, after=after)
+    first, _last = request.window(frames)
+    client = _FakeVideoClient(
+        num_frames=min(frames, request.window(frames)[1] - first + 1),
+        prompt_offset=prompt - first, drop=drop)
+    app = _Recorder()
+    AnnotationApp._propagate_worker(app, request, (None, video, client))
+    return app, client, request
+
+
+def test_a_window_with_a_before_half_costs_two_passes(tmp_path):
+    """One pass would export the before half, decode it, and drop it."""
+    app, client, _request = _run_worker(tmp_path, before=10, after=10, prompt=20)
+
+    assert [c["backward"] for c in client.calls] == [False, True]
+    assert app.finished, "the worker must hand a result to the main thread"
+    assert any("backward" in s for s in app.statuses), "say what it is doing"
+
+
+def test_a_window_that_starts_at_the_prompt_costs_one_pass(tmp_path):
+    """Nothing before the prompt, so the backward pass is pure waste."""
+    _app, client, _request = _run_worker(tmp_path, before=0, after=15, prompt=5)
+
+    assert [c["backward"] for c in client.calls] == [False]
+
+
+def test_a_window_clamped_to_frame_zero_still_gets_its_backward_pass(tmp_path):
+    """before=100 on frame 8 clamps to first=0, which is still before the
+    prompt — the decision is on the clamped window, not on the request."""
+    _app, client, _request = _run_worker(tmp_path, before=100, after=5, prompt=8)
+
+    assert [c["backward"] for c in client.calls] == [False, True]
+    assert client.calls[0]["first_frame"] == 0
+
+
+def test_both_passes_are_asked_about_the_same_prompt_and_track(tmp_path):
+    """A different prompt or obj_id between passes would produce two animals."""
+    _app, client, request = _run_worker(tmp_path, before=10, after=10, prompt=20)
+
+    forward, backward = client.calls
+    assert forward["prompt_frame"] == backward["prompt_frame"] == request.frame
+    assert forward["obj_id"] == backward["obj_id"] == 5
+    assert forward["box"] == backward["box"]
+
+
+def test_the_merged_result_covers_the_whole_window(tmp_path):
+    app, _client, request = _run_worker(tmp_path, before=10, after=10, prompt=20)
+
+    result = app.finished[0]
+    first, last = request.window(40)
+    assert result.frames == tuple(range(first, last + 1))
+    assert "lost it" not in result.describe(track_id=5)
+
+
+def test_one_dead_pass_still_delivers_the_other_half(tmp_path):
+    """Half a tracklet the human can accept beats an error message."""
+    app, _client, _request = _run_worker(
+        tmp_path, before=10, after=10, prompt=20, drop=(True,))
+
+    assert app.finished, "the forward half must survive a dead backward pass"
+    assert app.finished[0].ok and app.finished[0].count
+
+
+def test_two_dead_passes_report_a_timeout_and_change_nothing(tmp_path):
+    app, _client, _request = _run_worker(
+        tmp_path, before=10, after=10, prompt=20, drop=(True, False))
+
+    assert not app.finished, "nothing may be handed on when nothing came back"
+    assert any("did not answer" in s for s in app.statuses)
+
+
+def test_pressing_propagate_starts_the_helper_itself(tmp_path):
+    """Otherwise the feature is unreachable: the only other caller of
+    _start_sam is set_click_backend("sam"), so video propagation would be
+    gated behind an unrelated Click to Box setting."""
+    app = A.AnnotationApp.__new__(A.AnnotationApp)
+    started = []
+    app._sam_client = None
+    app._sam_ready = lambda: False
+    app._start_sam = lambda: (started.append(True), False)[1]
+    app._propagate_thread = None
+    shown = []
+    app._show_unavailable = lambda feature, reason: shown.append((feature, reason))
+
+    A.AnnotationApp.propagate_selection(app)
+
+    assert started, "the button must start the helper, not send the user away"
+    assert shown and shown[0][0] == "Video propagation"
+
+
+def test_propagate_does_not_restart_a_running_helper(tmp_path):
+    app = A.AnnotationApp.__new__(A.AnnotationApp)
+    started = []
+    app._sam_client = SimpleNamespace(
+        is_running=lambda: True,
+        hello={"backend": "sam2", "capabilities": ["point", "video"],
+               "device": "cuda"})
+    app._sam_ready = lambda: True
+    app._start_sam = lambda: started.append(True)
+    app._propagate_thread = None
+    app.cap = None
+    app.statuses = []
+    app._status = app.statuses.append
+
+    A.AnnotationApp.propagate_selection(app)
+
+    assert not started, "_start_sam must not be called on a live helper"
+    assert app.statuses == ["Open a video first."]

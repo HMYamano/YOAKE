@@ -527,7 +527,12 @@ class PoseLoss(nn.Module):
             total = self.cfg.w_pose_keypoint * loss_kp
 
         if pred_polarity is not None and gt_polarity is not None \
-                and pred_polarity.shape[0] > 0:
+                and pred_polarity.shape[0] > 0 and bool((gt_polarity >= 0).any()):
+            # ``(gt >= 0).any()`` guards the all-ignored case: cross_entropy
+            # with every target at ignore_index divides by a zero count and
+            # returns NaN, which then poisons total_loss and every gradient
+            # after it. "No labelled polarity in this batch" has to cost
+            # nothing, not everything.
             loss_pol = F.cross_entropy(pred_polarity, gt_polarity, ignore_index=-1)
             losses["loss_pose_polarity"] = loss_pol
             term = self.cfg.w_pose_polarity * loss_pol
@@ -964,10 +969,11 @@ class CombinedLoss(nn.Module):
         if not has_kp and not has_pol:
             return {}
 
-        from .matching import collect_matched_gt_tensor
-
-        pred_kp = getattr(model_output, "pred_keypoints", None)
-        pred_pol = getattr(model_output, "pred_polarity", None)
+        # ``collect_matched_gt`` was used below without ever being imported:
+        # any dataset that carried a ``polarity`` target raised NameError here
+        # instead of training. It is a scalar label, so it goes through the 1D
+        # collector and not the tensor one.
+        from .matching import collect_matched_gt, collect_matched_gt_tensor
 
         det_kp = self._gather_det_field(model_output, "keypoints")
         det_pol = self._gather_det_field(model_output, "polarity")
@@ -977,7 +983,7 @@ class CombinedLoss(nn.Module):
         ) if has_kp else None
         gt_pol = collect_matched_gt(
             model_output.det_results, targets, key="polarity"
-        ) if has_pol else None
+        ).long() if has_pol else None
 
         return self.pose_loss(det_kp, gt_kp, det_pol, gt_pol)
 

@@ -287,8 +287,17 @@ sequential `grab()` with selective `retrieve()`.
 
 *In YOAKE.* The auto-annotate frame export **must** use `grab()`/`retrieve()` and write
 `index_map.json`. Playback in `analysis_panel` uses sequential decode for `+1` steps and
-`cap.set` only for jumps. (The annotator's `_read_frame_bgr` seeks on every access; that is
-acceptable for random single-frame access but must never be used on the export path.)
+`cap.set` only for jumps.
+
+The annotator's `_read_frame_bgr` now follows the same rule. It used to seek on **every**
+access, which was written off as "acceptable for random single-frame access" — but the access
+it served most is not random: it is the Next-frame key, held down. On a long-GOP codec each
+seek re-decodes from the previous keyframe, so stepping through a video walked the decoder
+over the same group of pictures again and again, and the cost grew with the GOP length rather
+than with the step. `_decoded_idx` records where the capture actually is, so `idx + 1` is a
+bare `read()`, a hop of up to `_SEQ_SKIP_MAX` frames is `grab()` over the gap, and only a
+backwards move or a real jump seeks. It removes the off-by-one from the common path as well,
+for the reason stated above.
 
 *Related Windows trap, also from YOMU:* `cv2.imread` returns `None` silently on non-ASCII
 Windows paths. Read images with `np.fromfile` + `cv2.imdecode`. A silent `None` inside a

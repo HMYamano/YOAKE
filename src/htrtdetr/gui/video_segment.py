@@ -54,6 +54,7 @@ __all__ = [
     "export_window",
     "build_candidates",
     "result_from_reply",
+    "merge_results",
     "UNAVAILABLE_MESSAGE",
 ]
 
@@ -68,8 +69,11 @@ UNAVAILABLE_MESSAGE = (
     "SAM 2 is not installed.\n\n"
     "Video propagation is unavailable. Click to Box, tracking and everything "
     "else still work.\n\n"
-    "To enable it, install sam2 into the Python that runs the segmentation "
-    "helper:  pip install sam2"
+    "To enable it, install it into the Python that runs the segmentation "
+    "helper:  pip install sam2 huggingface_hub\n\n"
+    "Both packages are needed. sam2 reaches its weights through "
+    "huggingface_hub and does not depend on it, so installing sam2 alone "
+    "leaves every load failing inside the helper."
 )
 
 
@@ -273,6 +277,56 @@ def result_from_reply(reply: Dict[str, Any]) -> PropagationResult:
         boxes.append((frame, obb, bbox))
     boxes.sort(key=lambda row: row[0])
     return PropagationResult(boxes=tuple(boxes), ok=True, window=int(reply.get("window", 0) or 0))
+
+
+def merge_results(*results: Optional[PropagationResult]) -> PropagationResult:
+    """The passes of one propagation, as a single result.
+
+    **SAM 2 propagates in one direction only.** A forward pass covers the
+    prompt frame and everything after it, and produces nothing before it — so
+    a window built with :attr:`PropagationRequest.before` frames needs a second
+    pass with ``backward=True`` or that half comes back empty while still
+    having been decoded, exported and paid for. Measured on a 40-frame window
+    prompted at offset 20: forward alone returns 20 boxes, backward alone
+    returns 21, and the two together return all 40.
+
+    The prompt frame is produced by **both** passes. The first result that
+    carries a frame wins, so pass the forward result first and the tie is
+    resolved toward it.
+
+    ``window`` is the maximum and not the sum: both passes run over the same
+    exported directory and the helper reports the size of that directory, so
+    adding them would double it and make :meth:`PropagationResult.describe`
+    claim the model lost an animal it never lost.
+
+    A failed pass is not fatal — if the other one produced boxes they are kept,
+    because half a tracklet the human can accept beats an error message. Only
+    when nothing survives is the failure passed through.
+    """
+    kept = [r for r in results if r is not None]
+    if not kept:
+        return PropagationResult(ok=False, detail="Nothing was propagated.")
+
+    merged: Dict[int, Tuple[int, List[float], List[float]]] = {}
+    window = 0
+    for result in kept:
+        if not result.ok:
+            continue
+        window = max(window, int(result.window))
+        for row in result.boxes:
+            merged.setdefault(int(row[0]), row)
+
+    if not merged:
+        failed = [r for r in kept if not r.ok]
+        if failed:
+            return failed[0]
+        return PropagationResult(ok=True, boxes=(), window=window)
+
+    return PropagationResult(
+        boxes=tuple(merged[frame] for frame in sorted(merged)),
+        ok=True,
+        window=window,
+    )
 
 
 def build_candidates(

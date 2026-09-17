@@ -544,6 +544,39 @@ def _primary_theme_tag() -> int:
     return theme.accent_theme()
 
 
+#: Advance of one character, in pixels, used to size a button before a frame
+#: has been rendered (``dpg.get_text_size`` returns ``None`` until then, so it
+#: cannot be asked while the window is being built).
+#:
+#: Measured both ways: dearpygui's built-in fixed-pitch font is exactly 7 px
+#: per character, and once :func:`theme.setup` has loaded the suite's own font
+#: it is about 5.6. 7 is therefore an upper bound for both, which is the side
+#: to be wrong on - a button a few pixels wider than it needs to be is
+#: invisible, a button a few pixels too narrow eats the end of its label.
+_CHAR_W = 7
+#: ``mvStyleVar_FramePadding`` x, as :func:`theme.setup` sets it. ImGui reserves
+#: it on **both** sides of a button label and clips whatever does not fit.
+_FRAME_PAD_X = 10
+
+
+def fit_width(label: str, requested: int) -> int:
+    """``requested``, widened to whatever ``label`` actually needs.
+
+    A button narrower than its own label does not shrink the text, wrap it or
+    ellipsise it: ImGui clips it at the frame edge and the tail simply is not
+    drawn. That failure is silent and it hit the labels that matter most -
+    ``Undo (Ctrl+Z)`` needs 111 px and was given 90, so every user saw
+    ``Undo (Ct`` and the keyboard shortcut the button existed to teach was the
+    part cut off. ``First`` was clipped to ``Firs``.
+
+    ``width <= 0`` is dearpygui's "size yourself" and is passed through
+    untouched, so this only ever rescues an explicit, too-small number.
+    """
+    if requested <= 0:
+        return requested
+    return max(int(requested), len(label) * _CHAR_W + 2 * _FRAME_PAD_X + 2)
+
+
 def primary_button(
     label: str, callback, *, height: int = 36, width: int = -1, tag: Optional[str] = None
 ) -> None:
@@ -552,7 +585,15 @@ def primary_button(
     Text is ``ON_ACCENT`` (near black), never white — white on the accent
     measures 1.91:1 and is prohibited by the design tokens.
     """
-    kwargs = _tagged(tag, {"label": label, "height": height, "width": width, "callback": callback})
+    kwargs = _tagged(
+        tag,
+        {
+            "label": label,
+            "height": height,
+            "width": fit_width(label, width),
+            "callback": callback,
+        },
+    )
     _drop(tag)
     dpg.add_button(**kwargs)
     theme.bind(dpg.last_item(), theme.accent_theme())
@@ -562,7 +603,15 @@ def secondary_button(
     label: str, callback, *, height: int = 32, width: int = -1, tag: Optional[str] = None
 ) -> None:
     """Bordered ghost button — visibly subordinate to :func:`primary_button`."""
-    kwargs = _tagged(tag, {"label": label, "height": height, "width": width, "callback": callback})
+    kwargs = _tagged(
+        tag,
+        {
+            "label": label,
+            "height": height,
+            "width": fit_width(label, width),
+            "callback": callback,
+        },
+    )
     _drop(tag)
     dpg.add_button(**kwargs)
     theme.bind(dpg.last_item(), theme.ghost_theme())
@@ -572,7 +621,15 @@ def danger_button(
     label: str, callback, *, height: int = 32, width: int = -1, tag: Optional[str] = None
 ) -> None:
     """Destructive action. The label must name the verb and the exact scope."""
-    kwargs = _tagged(tag, {"label": label, "height": height, "width": width, "callback": callback})
+    kwargs = _tagged(
+        tag,
+        {
+            "label": label,
+            "height": height,
+            "width": fit_width(label, width),
+            "callback": callback,
+        },
+    )
     _drop(tag)
     dpg.add_button(**kwargs)
     theme.bind(dpg.last_item(), theme.danger_theme())
@@ -605,7 +662,12 @@ def toolbar_button(
         text = f"{text} ({shortcut})"
     _drop(tag)
     dpg.add_button(
-        label=text, tag=tag, callback=callback, width=width, height=height, enabled=enabled
+        label=text,
+        tag=tag,
+        callback=callback,
+        width=fit_width(text, width),
+        height=height,
+        enabled=enabled,
     )
     theme.bind(tag, theme.tool_theme(active))
     if help_text:

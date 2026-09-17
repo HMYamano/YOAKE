@@ -172,6 +172,14 @@ class WorkspaceOperations:
             self.goto_frame(frame + 1)
             self._select(copied)
             self._mark_dirty()
+            # Say which of the three methods ran. Continue resolves one of them
+            # from what this machine can do, so pressing it and being moved a
+            # frame with no word said leaves the user unable to tell a copy
+            # from a tracking run that quietly did nothing.
+            self._status(
+                "Continue: copied this box to the next frame. Adjust it, or "
+                "press Continue again."
+            )
             return
         if method != "Fast tracking":
             self._status(f"Unknown continuation method: {method}")
@@ -253,7 +261,10 @@ class WorkspaceOperations:
             target=work, daemon=True, name="yoake-fast-track"
         )
         self._fast_track_thread.start()
-        self._status("Following this animal; results will appear as suggestions.")
+        self._status(
+            "Continue: fast tracking this animal forward. The boxes arrive as "
+            "candidates for you to accept."
+        )
 
     def _finish_video_propagation(self, project, video, result, request):
         from .video_segment import build_candidates

@@ -325,7 +325,6 @@ Stated so an omission is not mistaken for an oversight.
 
 | Not built | Why, and what exists instead |
 |---|---|
-| SAM 2 **weights**, and any automatic download | The driver, the protocol op, the adapter and the UI are all in place and tested against a live helper. What is missing is a machine with `pip install sam2` on it; nothing here downloads weights, by design. |
 | A measured `WorkloadModel` | Its four constants are guesses and the UI labels them *estimated*. Replace them from an instrumented session and the feature gets better with no code change. |
 | In-process inference | The annotator's Python has no torch. Pre-labelling goes through `predictions.json`, which is how the suite already moves model output. |
 | `class_id` on a box | `to_dict` hardcodes `0` and `tests/test_labeling_ops.py` asserts it. The Inspector says so rather than appearing to work. |
@@ -355,6 +354,9 @@ python -m pytest tests/ -q -m "not gui"          # skip the windowed ones
 # the optional backends, incl. a live helper subprocess
 python -m pytest tests/test_gui_video_segment.py -q
 
+# ...without loading a real checkpoint (skip the ~150 MB first-run download)
+python -m pytest tests/ -q -m "not live_model"
+
 # the sidecar's own protocol check, on either interpreter
 python tools/sam_sidecar.py --selftest
 ```
@@ -376,16 +378,72 @@ name, and both leave YOAKE fully usable when absent.
 
 ### SAM 2 video propagation
 
+**Installed and verified.** Two packages, into the Python that runs the helper —
+not necessarily the one running the GUI:
+
+```bash
+pip install sam2 huggingface_hub          # or: pip install -e ".[sam2]"
+```
+
+`huggingface_hub` is listed because **sam2 does not depend on it and cannot
+reach a checkpoint without it.** `SAM2VideoPredictor.from_pretrained` imports it
+inside `build_sam._hf_download`, so `pip install sam2` alone installs a package
+that raises `ModuleNotFoundError` on every load — with the package sitting
+right there, which is the most confusing failure state available. Both
+`Sam2VideoAdapter.available()` and `InterpreterInfo.backends` therefore require
+the pair, and `locked_reason()` names the half-installed case specifically.
+
 ```
   select a box on frame N
       -> gui/video_segment.py exports the window as 00000.jpg upward
-      -> sidecar op "propagate"
+      -> sidecar op "propagate", FORWARD from the prompt
+      -> sidecar op "propagate", BACKWARD from the prompt   (see below)
       -> tools/sam_sidecar.py: Sam2VideoAdapter, SAM2VideoPredictor
       -> a mask per frame -> click_segment.mask_to_obb, in the child
       -> five floats per frame come back over the pipe
+      -> video_segment.merge_results: two passes -> one result
       -> Candidates, source="track", one track id
       -> one Tracklet, the quality checks, the Review Inbox
 ```
+
+**Why two passes.** SAM 2 propagates in one direction from the prompt. A
+forward pass covers the prompt frame and everything after it and produces
+nothing before it, so a window built with `before` frames — the default is 100
+each way — came back half empty while having been decoded, JPEG-exported and
+paid for in full. Measured on a 30-frame window prompted at offset 15: forward
+alone returns 15 boxes, backward alone 16, the merge 30. `merge_results` takes
+the maximum `window` rather than the sum, because both passes run over the same
+exported directory and summing would make `describe()` report a loss that never
+happened. The prompt frame comes back from both; the forward result is passed
+first and wins.
+
+The second pass costs a second `init_state`, which re-encodes the window. That
+is the price of the half that was previously discarded, and it is worth it.
+
+**Which device.** `SidecarSpec.device` defaults to `"auto"` and the *helper*
+resolves it, because only the helper has torch — the GUI cannot import it to
+ask, which is the entire reason the helper exists. The answer comes back in
+`hello` and is what `VideoCapability.describe()` shows. The old default was a
+hardcoded `"cpu"`: measured over one 30-frame pass, **269 ms/frame on cuda
+against 1153 ms/frame on cpu** — a factor of 4.3, which over the 200-frame
+window the UI offers is 54 s against 231 s. It said nothing about why.
+
+**Measured** on an RTX 5060 Ti with `facebook/sam2-hiera-tiny`, 256x256 frames,
+against a synthetic scene with exact ground truth
+(`tests/test_gui_video_segment.py`, `live_model`):
+
+| | |
+|---|---|
+| Throughput | ~180 ms/frame, both prompt kinds |
+| Rotated-box IoU | mean 0.88, worst 0.86, 100% above 0.7 |
+| Centre error | 0.6 px mean, 1.1 px worst |
+| Box size | 1.04-1.09x truth — consistently slightly loose |
+| Review items raised on a clean track | 0 |
+
+`sam2` builds an optional CUDA extension that is absent on this machine, so the
+helper logs `cannot import name '_C' from 'sam2'` and skips one mask
+post-processing step. It is a warning, not a failure, and the numbers above
+were measured with it.
 
 The window goes through the filesystem because `init_state` wants a directory
 of JPEGs, that path works on every SAM 2 version, and the GUI has OpenCV for

@@ -18,6 +18,12 @@ import torch
 from ..utils.misc import box_iou, cxcywh_to_xyxy
 
 
+#: 検出へ引き写すスカラー GT 属性。``polarity`` がここに無かったため
+#: ``collect_matched_gt(..., key="polarity")`` は常に全 -1 を返し、
+#: ``PoseLoss`` の cross_entropy が「全部 ignore」で NaN になっていた。
+_SCALAR_GT_KEYS = ("class_ids", "track_ids", "action_ids", "polarity")
+
+
 def assign_gt_to_detections(
     pred_boxes: torch.Tensor,   # (N_pred, 4) cxcywh normalized
     target: Dict,               # {boxes: (N_gt,4) xyxy, class_ids, track_ids, action_ids}
@@ -37,6 +43,7 @@ def assign_gt_to_detections(
           'matched_class_ids'  (N_pred,) long  — -1=unmatched  (boxes_only のとき省略)
           'matched_track_ids'  (N_pred,) long
           'matched_action_ids' (N_pred,) long
+          'matched_polarity'   (N_pred,) long  — head-tail 反転 (pose 有効時のみ)
     """
     N_pred = pred_boxes.shape[0]
     device = pred_boxes.device
@@ -47,7 +54,7 @@ def assign_gt_to_detections(
 
     gt_boxes = target.get("boxes", None)
     if gt_boxes is None or gt_boxes.shape[0] == 0 or N_pred == 0:
-        for key in ("class_ids", "track_ids", "action_ids"):
+        for key in _SCALAR_GT_KEYS:
             if key in target:
                 result[f"matched_{key}"] = torch.full(
                     (N_pred,), -1, dtype=torch.long, device=device
@@ -81,7 +88,7 @@ def assign_gt_to_detections(
     result["matched_gt_idx"] = matched_gt_idx
 
     # 各種 GT 属性を割り当て
-    for attr_key in ("class_ids", "track_ids", "action_ids"):
+    for attr_key in _SCALAR_GT_KEYS:
         if attr_key not in target:
             continue
         gt_attr = target[attr_key].to(device)  # (N_gt,)

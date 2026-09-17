@@ -116,3 +116,37 @@ mypyは導入済みNumPyの型定義がPython 3.12構文を使うため、`--pyt
 - 推論再開は完了した動画のキャッシュを単位とします。処理途中の動画は再実行します。
 - 数百動画・長時間動画でのメモリ使用量と待ち時間は未計測です。
 - 動画間の個体同定は対象外です。隣接フレームの簡易接続も候補として人間が確認します。
+
+---
+
+## レビューと修正 (2026-09-17)
+
+アノテーターのキャンバス操作・描画・保存経路をレビューし、次のバグを修正しました。
+すべて回帰テスト付きです (`tests/test_annotator_canvas_gui.py`, `tests/test_losses.py`)。
+
+### 修正したバグ
+
+| 症状 | 原因 | 修正 |
+|---|---|---|
+| Pan ツールがドラッグ 1 回分しか動かない | `_render_canvas` が `_mode == "pan"` を見て `_mode` と `_pan_origin` を消していた。`_drag_pan` は描画するので、最初の drag イベントで自分の状態を壊していた | 描画関数から状態変更を削除。`_mode` の終了は `_on_mouse_release` が持つ |
+| ボックスを動かす／伸ばす／回す操作が Undo できず、保存もされない | `_pending_snap` / `_moved` が宣言だけで未使用。ドラッグ経路に `_push_undo` も `_mark_dirty` も無かった。Ctrl+Z は 1 つ前の編集を取り消し、保存チップは "No changes" のままで autosave も動かなかった | press でスナップショット、release で「実際に動いたときだけ」push する P7 の設計を実装 (`_begin_drag_edit` / `_commit_drag_edit`) |
+| フレーム 0 で Space を押すと未保存状態になり redo が消える | `propagate_from_prev` がガードより前に `_push_undo` / `_mark_dirty` していた。`_push_undo` は redo スタックを消す | ガードを全部通過してから push。`convert_selected_to_aabb` / `convert_selected_to_obb` / `rotate_selected` / `delete_selected` / `set_action` も同様に修正 |
+| ツールレール・ツールバーのラベルが途中で切れる | `FramePadding.x = 10` のため 44px ボタンの表示領域は 24px しかないのに、ラベルは `[k] (V)` で 49px あった。`Undo (Ctrl+Z)` は 111px 必要なところに 90px。ImGui は黙って切り詰める | `widgets.fit_width()` を追加し全ボタンヘルパーが通す。レールは語 + キー (`Select V`) に変更し幅を確保 |
+| 最小ウィンドウ (900x600) で Panels / Settings とズーム操作に到達できない | 固定幅の横並びは折り返さず、レールは `no_scrollbar=True` だった | トップバーは各ボタンを自動幅に。レールはスクロール可能にし、スクロールバー分の幅を確保 |
+| 2 本目の動画を開くとテクスチャがサイズ不一致になりうる | `delete_item` が `SystemError` の場合「新しいタグにする」とコメントにあるだけで実装が無かった | `self._frame_tex` を導入し、削除できなかったときは本当に新しいタグを取る |
+| 動画伝播を止められない | `_propagate_stop` を True にする UI が無かった | 実行中に Continue をもう一度押すと停止要求 (P6)。効くタイミングも文言で明示 |
+| 起動直後の Project Setup で `Create Project` がただの灰色ボタン | `widgets.primary_button` ではなく素の `dpg.add_button` で作られていた | primary / secondary に置き換え。最初の画面で進む先が一目で分かる (§1.5) |
+| `polarity` を持つデータセットで学習が `NameError` | `losses._pose_losses` が未 import の `collect_matched_gt` を呼んでいた。さらに `polarity` は GT 引き写しキーに無く、import しても全件 -1 (= 全 ignore) で `cross_entropy` が NaN | `_SCALAR_GT_KEYS` に `polarity` を追加、import を修正、`PoseLoss` に「全件 ignore なら損失を作らない」ガードを追加 |
+
+### 速度
+
+| 操作 | 変更 |
+|---|---|
+| Next / Prev フレーム | `_read_frame_bgr` が `_decoded_idx` を持ち、`+1` は `read()` のみ、短い前方ジャンプは `grab()`、後方と大ジャンプだけ `cap.set` (P15) |
+| auto-track 有効時のフレーム送り | `goto_frame` が同じフレームを 2 回デコードしていたのを 1 回に |
+| SAM 2 の動画伝播 | `Sam2VideoAdapter` が `frames_dir` 単位で inference state をキャッシュ。前方・後方の 2 パスで同じ窓を 2 回エンコードしていたのをやめ、`init_state` は 1 回に |
+
+### 削除
+
+`annotator._finish_propagation` は `workspace_operations._finish_video_propagation` に置き換わっており、
+どこからも呼ばれない重複でした。

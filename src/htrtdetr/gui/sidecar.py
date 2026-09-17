@@ -136,7 +136,9 @@ class SidecarSpec:
     backend: str = "stub"
     model: str = ""
     checkpoint: str = ""
-    device: str = "cpu"
+    #: ``auto`` and not ``cpu``: only the helper has torch, so only the helper
+    #: can see a GPU. It resolves this and reports the answer through ``hello``.
+    device: str = "auto"
 
     def argv(self) -> List[str]:
         """The full command line, including the interpreter.
@@ -183,9 +185,15 @@ class InterpreterInfo:
 
     @property
     def backends(self) -> Tuple[str, ...]:
-        """Model backends this interpreter could run, best first."""
+        """Model backends this interpreter could run, best first.
+
+        ``sam2`` needs ``huggingface_hub`` beside it and does not depend on it:
+        ``from_pretrained`` is the only way the helper loads a SAM 2 checkpoint
+        and it imports ``huggingface_hub`` internally. Listing ``sam2`` without
+        it would start a helper that fails on the first click.
+        """
         out: List[str] = []
-        if "sam2" in self.modules:
+        if "sam2" in self.modules and "huggingface_hub" in self.modules:
             out.append("sam2")
         if "segment_anything" in self.modules:
             out.append("segment_anything")
@@ -193,10 +201,16 @@ class InterpreterInfo:
             out.append("transformers")
         return tuple(out)
 
+    @property
+    def sam2_needs_hub(self) -> bool:
+        """``sam2`` is installed but cannot reach any weights. Says which."""
+        return "sam2" in self.modules and "huggingface_hub" not in self.modules
+
 
 #: Modules the probe reports on. ``torch`` gates everything; the rest name which
 #: adapter can run.
-PROBE_MODULES = ("torch", "sam2", "segment_anything", "transformers", "numpy")
+PROBE_MODULES = ("torch", "sam2", "huggingface_hub", "segment_anything",
+                 "transformers", "numpy")
 
 _PROBE_SOURCE = (
     "import importlib.util as u, json, sys;"
@@ -293,12 +307,18 @@ def locked_reason(checked: Sequence[InterpreterInfo] = ()) -> str:
     is already working without any of this.
     """
     with_torch = [i for i in checked if i.ok and i.torch]
-    if with_torch:
+    half_installed = [i for i in with_torch if i.sam2_needs_hub]
+    if half_installed:
+        # The most confusing state there is: the package is there, so the user
+        # believes the install worked, and every load fails inside sam2.
+        cause = ("sam2 is installed next to PyTorch but cannot reach any weights: "
+                 "huggingface_hub is missing, and sam2 does not depend on it.")
+        fix = f"Finish the install with:  \"{half_installed[0].python}\" -m pip install huggingface_hub"
+    elif with_torch:
         names = ", ".join(sorted({",".join(i.backends) or "none" for i in with_torch}))
         cause = ("The segmentation helper needs a SAM package next to PyTorch, and none "
                  f"was found (present: {names}).")
-        fix = ("Install one with:  pip install git+https://github.com/facebookresearch/"
-               "segment-anything.git")
+        fix = "Install one with:  pip install sam2 huggingface_hub"
     else:
         cause = ("The segmentation helper needs PyTorch, and no Python this GUI can "
                  "reach has it.")

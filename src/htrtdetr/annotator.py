@@ -157,6 +157,10 @@ _BACKEND_TIPS = {
     ),
 }
 
+#: Canvas modes that edit the selected box by dragging it. One undo step each,
+#: pushed at release and only if the box actually changed (P7).
+_DRAG_EDIT_MODES = ("move", "resize", "rotate")
+
 _HANDLE_R = 7  # resize-handle radius in canvas pixels
 _ROT_HANDLE_OFFSET = 26  # rotation handle distance from the box edge (canvas px)
 _FRAME_TEX = "yoake_frame_tex"
@@ -165,8 +169,20 @@ _TIMELINE_H = 26  # シークバー (drawlist) の高さ
 _TIMELINE_PAD = 10  # シークバー左右の余白 (px)
 _BOTTOM_H = 160  # キャンバス下に確保する高さ (シークバー + ナビ + status)
 
-#: Left tool rail width. Icon-sized: the rail is muscle memory, not a menu.
-_RAIL_W = 60
+#: Left tool rail width.
+#:
+#: Wide enough for the label the rail actually draws. It was 60, giving 44 px
+#: buttons; the theme sets ``FramePadding.x = 10``, so ImGui clipped every
+#: label to 24 px and the 49 px ``"[k] (V)"`` rendered as ``"[k]"`` with the
+#: key silently cut off. The rail advertised its shortcuts and showed none of
+#: them, and the ASCII icon left behind said nothing on its own. This leaves
+#: room for the widest label (``"Select V"``) plus the vertical scrollbar the
+#: rail grows at the minimum window size, which is what turns the rail into
+#: something a first-time user can read.
+_RAIL_W = 108
+#: Rail button width: the rail minus its window padding and minus the width of
+#: a scrollbar, so a button is never half-covered by one when it appears.
+_RAIL_BTN_W = _RAIL_W - 26
 #: Right column width. 280 rather than 320: the Inspector shows one context at
 #: a time now, so it needs room for a label and a control and nothing else, and
 #: every pixel it gives back goes to the image.
@@ -186,6 +202,12 @@ _TOP_H = 114
 #: reflows the canvas instead of pushing the controls off screen.
 _UNDER_TIMELINE_H = 76
 
+#: How far ahead :meth:`AnnotationApp._read_frame_bgr` will ``grab()`` rather
+#: than seek. Half a second at 25 fps: far enough to cover a held Right arrow
+#: and the small hops the review queue makes, short enough that a real jump
+#: still takes the seek.
+_SEQ_SKIP_MAX = 12
+
 #: Undo depth, per frame (docs/GUI_DESIGN.md §0.3.5).
 _UNDO_DEPTH = 50
 
@@ -199,15 +221,21 @@ _ZOOM_MIN, _ZOOM_MAX = 0.2, 20.0
 #: Minimum image that must stay on screen when panning, in canvas px.
 _PAN_KEEP = 64
 
-#: The five tools, in rail order: ``(tool, label, icon, shortcut action)``.
-#: The icons are ASCII so they render before a font is loaded.
+#: The six tools, in rail order: ``(tool, full name, rail word, action)``.
+#:
+#: The rail word is a word and no longer an ASCII glyph. ``[k]``, ``[ ]``,
+#: ``[/]`` and ``(+)`` meant select, box, rotated box and click-an-animal to
+#: whoever chose them and nothing to anyone else, and the tooltip that
+#: explained them only appears once the cursor is already on the right button.
+#: The full name stays in the tooltip; the rail carries the word plus its key,
+#: which is what makes the keymap learnable without opening Help.
 _TOOLS: Tuple[Tuple[str, str, str, str], ...] = (
-    ("select", "Select", "[k]", "tool.select"),
-    ("draw", "Draw Box", "[ ]", "tool.draw_box"),
-    ("obb", "Draw Rotated Box", "[/]", "tool.draw_rotated"),
-    ("click", "Click animal", "(+)", "tool.click_box"),
-    ("pan", "Pan", "<->", "tool.pan"),
-    ("delete", "Delete Box", " X ", "tool.delete"),
+    ("select", "Select", "Select", "tool.select"),
+    ("draw", "Draw Box", "Box", "tool.draw_box"),
+    ("obb", "Draw Rotated Box", "Rotate", "tool.draw_rotated"),
+    ("click", "Click animal", "Click", "tool.click_box"),
+    ("pan", "Pan", "Pan", "tool.pan"),
+    ("delete", "Delete Box", "Delete", "tool.delete"),
 )
 
 #: One sentence per tool, shown in the canvas chip. Always names the *next*
@@ -342,6 +370,15 @@ class AnnotationApp(WorkspaceMixin):
         self.frame_h: int = 640
         self.current_frame_idx: int = 0
         self._current_bgr: Optional[np.ndarray] = None
+        #: Frame index the capture last decoded, or ``None`` when its position
+        #: is unknown. What lets :meth:`_read_frame_bgr` step without seeking.
+        self._decoded_idx: Optional[int] = None
+        #: Tag of the texture the frame is pushed into. An attribute and not
+        #: the module constant, because a texture dearpygui refuses to delete
+        #: has to be abandoned under a new tag rather than reused at the wrong
+        #: size (:meth:`_install_video_capture`).
+        self._frame_tex: str = _FRAME_TEX
+        self._tex_serial: int = 1
 
         # ── annotation state ─────────────────────────────────────────
         self.annotations: Dict[int, List[AnnObject]] = {}
@@ -595,12 +632,18 @@ class AnnotationApp(WorkspaceMixin):
                 )
 
             widgets.dialog_footer()
-            dpg.add_button(
-                label="Create Project", callback=self._on_new_project_confirmed, width=-1, height=34
+            # The primary action of the first screen anyone ever sees, and it
+            # was a bare dpg.add_button - so it rendered in the default grey,
+            # indistinguishable from the "or load an existing file" button
+            # under it. The accent fill is what the design tokens reserve for
+            # exactly this (§1.5), and it is the only thing on the screen that
+            # says which of the two buttons is the way forward.
+            widgets.primary_button(
+                "Create Project", self._on_new_project_confirmed, width=-1, height=34
             )
-            dpg.add_button(
-                label="Or load an existing annotation JSON...",
-                callback=self._on_load_project_clicked,
+            widgets.secondary_button(
+                "Or load an existing annotation JSON...",
+                self._on_load_project_clicked,
                 width=-1,
                 height=28,
             )
@@ -869,11 +912,15 @@ class AnnotationApp(WorkspaceMixin):
                 widgets.status_pill("top_saved", "No changes", "idle")
                 dpg.add_spacer(width=16)
 
+                # No hand-picked widths in this row. dearpygui sizes a button
+                # with width=0 to its own label, and the row has to survive the
+                # 900 px minimum viewport: with fixed widths, Panels and
+                # Settings were pushed past the right edge and could not be
+                # reached at all until the window was made wider.
                 widgets.toolbar_button(
                     "Smart Annotate...",
                     self.open_smart_annotate,
                     tag="top_smart",
-                    width=160,
                     height=26,
                     help_text="Analyze this video and choose the frames and "
                     "clips worth your time, instead of scrolling "
@@ -883,7 +930,6 @@ class AnnotationApp(WorkspaceMixin):
                     "Review",
                     self.toggle_inbox,
                     tag="top_review",
-                    width=120,
                     height=26,
                     help_text="Show the places the checks say are worth a " "second look.",
                 )
@@ -892,7 +938,6 @@ class AnnotationApp(WorkspaceMixin):
                     "Undo",
                     self.undo,
                     tag="top_undo",
-                    width=90,
                     height=26,
                     shortcut=shortcuts.label_for("edit.undo"),
                     help_text=shortcuts.help_for("edit.undo"),
@@ -901,7 +946,6 @@ class AnnotationApp(WorkspaceMixin):
                     "Redo",
                     self.redo,
                     tag="top_redo",
-                    width=90,
                     height=26,
                     shortcut=shortcuts.label_for("edit.redo"),
                     help_text=shortcuts.help_for("edit.redo"),
@@ -910,7 +954,6 @@ class AnnotationApp(WorkspaceMixin):
                     "Save",
                     self.save_annotation,
                     tag="top_save",
-                    width=90,
                     height=26,
                     shortcut=shortcuts.label_for("file.save"),
                     help_text=shortcuts.help_for("file.save"),
@@ -919,7 +962,6 @@ class AnnotationApp(WorkspaceMixin):
                     "Panels",
                     lambda *_: self.toggle_panels(),
                     tag="top_panels",
-                    width=90,
                     height=26,
                     active=True,
                     help_text="Hide the right-hand panels and give the whole "
@@ -929,7 +971,6 @@ class AnnotationApp(WorkspaceMixin):
                     "Settings",
                     lambda *_: self.open_settings(),
                     tag="top_settings",
-                    width=100,
                     height=26,
                     help_text="Project folder, labels, tracking, and what the "
                     "checks flag for review.",
@@ -951,34 +992,49 @@ class AnnotationApp(WorkspaceMixin):
         two.
         """
         _cw, ch = self._canvas_size()
+        button_w = _RAIL_BTN_W
+
+        def rail_label(word: str, action: str) -> str:
+            """``"Select V"``. The key on the button, never only in a tooltip."""
+            key = shortcuts.label_for(action)
+            return f"{word} {key}" if key else word
+
+        # Scrollable, because the rail is taller than the canvas at the
+        # minimum window size (900x600) and it used to be clipped there with no
+        # scrollbar: Zoom, Fit and the zoom readout simply did not exist until
+        # the user made the window bigger, and nothing said so.
         with dpg.child_window(
-            tag="toolrail", width=_RAIL_W, height=ch, border=False, no_scrollbar=True
+            tag="toolrail", width=_RAIL_W, height=ch, border=False, no_scrollbar=False
         ):
-            for tool, label, icon, action in _TOOLS:
+            for tool, label, word, action in _TOOLS:
                 tag = f"rail_{tool}"
                 widgets.toolbar_button(
-                    icon,
+                    rail_label(word, action),
                     (lambda t=tool: (lambda *_: self.set_tool(t)))(),
                     tag=tag,
-                    width=_RAIL_W - 16,
+                    width=button_w,
                     height=32,
                     active=(self._tool == tool),
-                    help_text=f"{label}. {shortcuts.help_for(action)}",
-                    shortcut=shortcuts.label_for(action),
+                    # hint_for, not help_for: it lists *every* key bound to the
+                    # action, so the E / R pair on Draw Rotated Box is
+                    # discoverable from the button that owns it.
+                    help_text=f"{label}. {shortcuts.hint_for(action) or shortcuts.help_for(action)}",
                 )
             widgets.toolbar_button(
-                ">>>",
+                "Continue",
                 lambda *_: self.continue_animal(),
                 tag="rail_propagate",
-                width=_RAIL_W - 16,
+                width=button_w,
                 height=32,
-                help_text="Continue this animal: tracking, accurate propagation, or copy to the next frame.",
+                help_text="Continue this animal into the following frames: "
+                "tracking, accurate propagation, or a copy to the next frame, "
+                "whichever this machine can do. Select a box first.",
             )
             widgets.toolbar_button(
-                "[=]",
+                "Keep on",
                 lambda *_: self.toggle_sticky_draw(),
                 tag="rail_sticky",
-                width=_RAIL_W - 16,
+                width=button_w,
                 height=26,
                 active=self._sticky_draw,
                 help_text="Keep the tool active after each box. Off means "
@@ -988,19 +1044,18 @@ class AnnotationApp(WorkspaceMixin):
             )
             dpg.add_separator()
             widgets.gap(1)
-            for label, callback, action, tip in (
-                ("+", lambda *_: self.zoom_by(1.25), "view.zoom_in", "Zoom in"),
-                ("-", lambda *_: self.zoom_by(0.8), "view.zoom_out", "Zoom out"),
-                ("[]", lambda *_: self.fit_view(), "view.fit", "Fit the frame to the window"),
+            for word, callback, action, tip in (
+                ("Zoom", lambda *_: self.zoom_by(1.25), "view.zoom_in", "Zoom in"),
+                ("Zoom", lambda *_: self.zoom_by(0.8), "view.zoom_out", "Zoom out"),
+                ("Fit", lambda *_: self.fit_view(), "view.fit", "Fit the frame to the window"),
             ):
                 widgets.toolbar_button(
-                    label,
+                    rail_label(word, action),
                     callback,
                     tag=f"rail_{action.replace('.', '_')}",
-                    width=_RAIL_W - 16,
+                    width=button_w,
                     height=26,
                     help_text=tip,
-                    shortcut=shortcuts.label_for(action),
                 )
             dpg.add_text("100%", tag="rail_zoom", color=theme.TEXT_FAINT)
 
@@ -1114,10 +1169,20 @@ class AnnotationApp(WorkspaceMixin):
         # three stacked rows costing 76 px of image; none of them needs a line
         # to itself, and the summary belongs next to the timeline it describes.
         with dpg.group(horizontal=True, tag="navbar"):
-            dpg.add_button(label="First", width=52, callback=lambda: self.goto_frame(0))
+            # Widths through widgets.fit_width, not hand-picked numbers: at the
+            # theme's FramePadding a 52 px button holds 32 px of text, so
+            # "First" was drawn as "Firs".
             dpg.add_button(
-                label="Prev", width=48, callback=lambda: self.goto_frame(self.current_frame_idx - 1)
+                label="First",
+                width=widgets.fit_width("First", 52),
+                callback=lambda: self.goto_frame(0),
             )
+            dpg.add_button(
+                label="Prev",
+                width=widgets.fit_width("Prev", 48),
+                callback=lambda: self.goto_frame(self.current_frame_idx - 1),
+            )
+            widgets.attach_tooltip(dpg.last_item(), shortcuts.hint_for("nav.prev"))
             dpg.add_text("Frame:")
             dpg.add_input_int(
                 tag="frame_input",
@@ -1130,10 +1195,15 @@ class AnnotationApp(WorkspaceMixin):
             )
             dpg.add_text("/ 0", tag="total_frames_text")
             dpg.add_button(
-                label="Next", width=48, callback=lambda: self.goto_frame(self.current_frame_idx + 1)
+                label="Next",
+                width=widgets.fit_width("Next", 48),
+                callback=lambda: self.goto_frame(self.current_frame_idx + 1),
             )
+            widgets.attach_tooltip(dpg.last_item(), shortcuts.hint_for("nav.next"))
             dpg.add_button(
-                label="Last", width=52, callback=lambda: self.goto_frame(self.num_frames - 1)
+                label="Last",
+                width=widgets.fit_width("Last", 52),
+                callback=lambda: self.goto_frame(self.num_frames - 1),
             )
             dpg.add_spacer(width=10)
             widgets.secondary_button(
@@ -1603,11 +1673,11 @@ class AnnotationApp(WorkspaceMixin):
             return
 
         # Frame image
-        if dpg.does_item_exist(_FRAME_TEX):
+        if dpg.does_item_exist(self._frame_tex):
             dw = int(self.frame_w * self._scale)
             dh = int(self.frame_h * self._scale)
             dpg.draw_image(
-                _FRAME_TEX,
+                self._frame_tex,
                 pmin=(self._offset_x, self._offset_y),
                 pmax=(self._offset_x + dw, self._offset_y + dh),
                 parent="canvas",
@@ -1622,11 +1692,15 @@ class AnnotationApp(WorkspaceMixin):
         for _index, cand in self.candidates_here():
             self._draw_candidate(cand)
 
-        # Rubber-band while drawing
-        if self._mode == "pan":
-            self._mode = "idle"
-            self._pan_origin = None
-            return
+        # Rubber-band while drawing.
+        #
+        # Nothing here may touch ``_mode``. This used to clear it whenever the
+        # Pan tool was armed, and ``_drag_pan`` renders - so the first drag
+        # event panned once, dropped the mode and the press origin, and every
+        # later event returned at ``_mode == "idle"``. The Pan tool moved the
+        # image by a single mouse delta and then went dead until the button was
+        # released and pressed again. A renderer reads state; it never retires
+        # it. ``_on_mouse_release`` owns that.
         if self._mode == "draw" and self._draw_start and self._draw_end:
             xs = sorted([self._draw_start[0], self._draw_end[0]])
             ys = sorted([self._draw_start[1], self._draw_end[1]])
@@ -1967,6 +2041,7 @@ class AnnotationApp(WorkspaceMixin):
             h = self._hit_handle(cx, cy, self._selected)
             if h is not None:
                 self._mode = "rotate" if h == "rot" else "resize"
+                self._begin_drag_edit()
                 self._resize_handle = h
                 self._drag_start = (ix, iy)
                 self._drag_bbox_orig = list(self._selected.bbox)
@@ -1989,6 +2064,7 @@ class AnnotationApp(WorkspaceMixin):
         if hit is not None:
             self._select(hit)
             self._mode = "move"
+            self._begin_drag_edit()
             self._drag_start = (ix, iy)
             self._drag_bbox_orig = list(hit.bbox)
             self._drag_obb_orig = list(hit.obb) if hit.has_obb else None
@@ -2042,6 +2118,7 @@ class AnnotationApp(WorkspaceMixin):
                 ny1 = int(max(0.0, min(oy1 + dy, self.frame_h - h)))
                 self._selected.bbox = [nx1, ny1, nx1 + w, ny1 + h]
             self._selected.keyframe = True  # 手動移動でキーフレーム化 (補間アンカー)
+            self._moved = True
             # Re-init tracker on manual move
             if self._auto_track and self._selected.track_id in self._trackers:
                 del self._trackers[self._selected.track_id]
@@ -2052,12 +2129,13 @@ class AnnotationApp(WorkspaceMixin):
             self._selected.obb[4] = math.atan2(iy - cy, ix - cx)
             self._selected.sync_bbox()
             self._selected.keyframe = True
+            self._moved = True
             if self._auto_track and self._selected.track_id in self._trackers:
                 del self._trackers[self._selected.track_id]
 
         elif self._mode == "resize" and self._selected is not None:
             if self._drag_obb_orig is not None:
-                self._resize_obb(ixc, iyc)
+                self._moved |= self._resize_obb(ixc, iyc)
             else:
                 ox1, oy1, ox2, oy2 = self._drag_bbox_orig
                 ixi, iyi = int(ixc), int(iyc)
@@ -2075,18 +2153,22 @@ class AnnotationApp(WorkspaceMixin):
                 if nx2 - nx1 >= _MIN_BOX_PX and ny2 - ny1 >= _MIN_BOX_PX:
                     self._selected.bbox = [nx1, ny1, nx2, ny2]
                     self._selected.keyframe = True  # 手動リサイズでキーフレーム化
+                    self._moved = True
             if self._auto_track and self._selected.track_id in self._trackers:
                 del self._trackers[self._selected.track_id]
 
         self._render_canvas()
 
-    def _resize_obb(self, ix: float, iy: float) -> None:
+    def _resize_obb(self, ix: float, iy: float) -> bool:
         """
-        回転矩形の隅ハンドルドラッグ。
+        回転矩形の隅ハンドルドラッグ。``True`` なら実際に形が変わった。
 
         マウス位置を box ローカル座標へ戻し、対角の隅を固定したまま w/h を決める。
         こうすると「掴んだ隅だけが動く」という軸平行の操作感が、回転していても
         そのまま成り立つ。
+
+        戻り値は undo のためにある: 最小サイズを下回って何もしなかったドラッグで
+        undo ステップを積むと、Ctrl+Z が「何も起きない 1 回」になってしまう。
         """
         obj = self._selected
         ocx, ocy, ow, oh, oth = self._drag_obb_orig
@@ -2106,7 +2188,7 @@ class AnnotationApp(WorkspaceMixin):
         new_w = abs(lx - fx)
         new_h = abs(ly - fy)
         if new_w < _MIN_BOX_PX or new_h < _MIN_BOX_PX:
-            return
+            return False
 
         # 新しい中心 = 固定点と可動点の中点 (ローカル) → グローバルへ戻す
         mid_lx = (lx + fx) / 2
@@ -2121,6 +2203,7 @@ class AnnotationApp(WorkspaceMixin):
         ]
         obj.sync_bbox()
         obj.keyframe = True
+        return True
 
     def _on_mouse_release(self, sender, app_data) -> None:
         if self._mode == "scrub":
@@ -2149,13 +2232,11 @@ class AnnotationApp(WorkspaceMixin):
                     f"The box was too small. Drag an area of at least "
                     f"{_MIN_BOX_PX} x {_MIN_BOX_PX} pixels."
                 )
-        elif self._mode == "move" and self._selected is not None:
-            # Re-initialize tracker from new position
-            if self._auto_track and self._current_bgr is not None:
-                self._init_tracker(
-                    self._selected.track_id, self.current_frame_idx, self._selected.bbox
-                )
-        elif self._mode == "resize" and self._selected is not None:
+        elif self._mode in _DRAG_EDIT_MODES and self._selected is not None:
+            # Rotate belongs here too: turning a box by its handle is an edit
+            # like any other, and leaving it out meant a rotated box kept a
+            # tracker initialised from the orientation it no longer has.
+            self._commit_drag_edit()
             if self._auto_track and self._current_bgr is not None:
                 self._init_tracker(
                     self._selected.track_id, self.current_frame_idx, self._selected.bbox
@@ -2166,8 +2247,43 @@ class AnnotationApp(WorkspaceMixin):
         self._drag_start = self._drag_bbox_orig = None
         self._drag_obb_orig = None
         self._resize_handle = None
+        self._pending_snap = None
+        self._moved = False
+        self._pan_origin = None
         self._render_canvas()
         self._refresh_sidebar()
+
+    def _begin_drag_edit(self) -> None:
+        """Snapshot before a move / resize / rotate drag starts (P7).
+
+        Taken at **press** because that is the only moment the box is still in
+        its old shape, and pushed at release only if it actually moved - so a
+        click that merely selects leaves no undo step behind.
+        """
+        self._pending_snap = self._snapshot()
+        self._moved = False
+
+    def _commit_drag_edit(self) -> None:
+        """Close a move / resize / rotate drag: one undo step, one dirty mark.
+
+        Dragging a box was the most common edit in the annotator and the only
+        one that recorded **nothing**: no undo entry and no dirty flag. Ctrl+Z
+        after a misplaced drag therefore undid whatever came before it - and
+        the save chip still read *No changes*, so the autosave never fired and
+        closing the window threw the correction away. ``_pending_snap`` and
+        ``_moved`` were declared for exactly this and never used.
+        """
+        if not self._moved or self._pending_snap is None:
+            return
+        self._push_undo(self._pending_snap)
+        self._pending_snap = None
+        self._moved = False
+        self._mark_dirty()
+        verb = {"move": "Moved", "resize": "Resized", "rotate": "Rotated"}.get(self._mode, "Edited")
+        self._status(
+            f"{verb} the box on track {self._selected.track_id}. "
+            f"{shortcuts.label_for('edit.undo')} takes it back."
+        )
 
     def _on_right_click(self, sender, app_data) -> None:
         if not self._is_over_canvas() or self.cap is None:
@@ -2306,6 +2422,7 @@ class AnnotationApp(WorkspaceMixin):
 
     def _install_video_capture(self, cap) -> None:
         self.cap = cap
+        self._decoded_idx = None
         path = self.video_path
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         self.frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2323,14 +2440,20 @@ class AnnotationApp(WorkspaceMixin):
             if dpg.does_item_exist(canvas):
                 dpg.delete_item(canvas, children_only=True)
         self._current_bgr = None
-        if dpg.does_item_exist(_FRAME_TEX):
+        if dpg.does_item_exist(self._frame_tex):
             try:
-                dpg.delete_item(_FRAME_TEX)
+                dpg.delete_item(self._frame_tex)
             except SystemError:
-                # Still bound by something we do not own. Reusing the tag is
-                # not possible, so fall back to a fresh one rather than
-                # refusing to open the video.
+                # Still bound by something we do not own. The comment here used
+                # to promise a fresh tag and the code did nothing, so the old
+                # texture survived at the **old video's** size and the next
+                # set_value pushed a differently-shaped buffer into it. Take
+                # the fresh tag for real; a leaked texture costs memory, a
+                # mismatched one costs the process.
                 pass
+        if dpg.does_item_exist(self._frame_tex):
+            self._frame_tex = f"{_FRAME_TEX}_{self._tex_serial}"
+            self._tex_serial += 1
         blank = np.zeros(self.frame_w * self.frame_h * 4, dtype=np.float32)
         if not dpg.does_item_exist("tex_reg"):
             with dpg.texture_registry(tag="tex_reg", show=False):
@@ -2338,13 +2461,17 @@ class AnnotationApp(WorkspaceMixin):
                     self.frame_w,
                     self.frame_h,
                     blank,
-                    tag=_FRAME_TEX,
+                    tag=self._frame_tex,
                     format=dpg.mvFormat_Float_rgba,
                 )
-        elif not dpg.does_item_exist(_FRAME_TEX):
+        elif not dpg.does_item_exist(self._frame_tex):
             dpg.push_container_stack("tex_reg")
             dpg.add_raw_texture(
-                self.frame_w, self.frame_h, blank, tag=_FRAME_TEX, format=dpg.mvFormat_Float_rgba
+                self.frame_w,
+                self.frame_h,
+                blank,
+                tag=self._frame_tex,
+                format=dpg.mvFormat_Float_rgba,
             )
             dpg.pop_container_stack()
 
@@ -2361,10 +2488,43 @@ class AnnotationApp(WorkspaceMixin):
         )
 
     def _read_frame_bgr(self, idx: int) -> Optional[np.ndarray]:
+        """Decode frame ``idx``, sequentially whenever that is possible (P15).
+
+        Stepping one frame forward is the single most-used gesture in the
+        annotator, and it used to cost a ``CAP_PROP_POS_FRAMES`` seek every
+        time. On a long-GOP codec a seek re-decodes from the previous keyframe,
+        so holding Right walked the decoder over the same group of pictures
+        again and again: Next/Prev felt heavy on exactly the videos this tool
+        is for, and the wait grew with the GOP length rather than with the step.
+
+        ``_decoded_idx`` remembers where the capture actually is, so:
+
+        * ``idx == _decoded_idx + 1`` is a bare ``read()`` - no seek at all;
+        * a short forward hop is ``grab()`` over the gap, which decodes nothing
+          it is going to throw away;
+        * anything else - backwards, or a jump - still seeks, because that is
+          genuinely cheaper than grabbing a thousand frames.
+
+        This also removes the off-by-one P15 warns about from the common path:
+        at a non-integer fps ``cap.set`` can land on the neighbouring frame,
+        and sequential decoding cannot.
+        """
         if self.cap is None:
             return None
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        here = self._decoded_idx
+        if here is not None and here < idx <= here + _SEQ_SKIP_MAX:
+            for _ in range(idx - here - 1):
+                if not self.cap.grab():
+                    here = None
+                    break
+        else:
+            here = None
+        if here is None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = self.cap.read()
+        # A failed read leaves the position unknowable, so the next access must
+        # seek rather than trust a stale count.
+        self._decoded_idx = idx if ret else None
         return frame if ret else None
 
     # ═══════════════════════════════════════════════════════════════════
@@ -2383,7 +2543,10 @@ class AnnotationApp(WorkspaceMixin):
             return
         idx = max(0, min(idx, self.num_frames - 1))
 
-        # Auto-track: run trackers when advancing one frame
+        # Auto-track: run trackers when advancing one frame. The frame it
+        # decodes is kept rather than decoded a second time below - with
+        # auto-track on, every step used to pay for the same frame twice.
+        frame_bgr = None
         if self._auto_track and not light and idx == self.current_frame_idx + 1 and self._trackers:
             frame_bgr = self._read_frame_bgr(idx)
             if frame_bgr is not None:
@@ -2391,14 +2554,15 @@ class AnnotationApp(WorkspaceMixin):
 
         self.current_frame_idx = idx
         self._visit_frame(idx)
-        frame_bgr = self._read_frame_bgr(idx)
+        if frame_bgr is None:
+            frame_bgr = self._read_frame_bgr(idx)
         self._current_bgr = frame_bgr
 
-        if frame_bgr is not None and dpg.does_item_exist(_FRAME_TEX):
+        if frame_bgr is not None and dpg.does_item_exist(self._frame_tex):
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             rgba = np.dstack([rgb, np.full(rgb.shape[:2], 255, dtype=np.uint8)])
             data = (rgba.astype(np.float32) / 255.0).flatten()
-            dpg.set_value(_FRAME_TEX, data)
+            dpg.set_value(self._frame_tex, data)
 
         if light:
             self._selected = None
@@ -2688,7 +2852,8 @@ class AnnotationApp(WorkspaceMixin):
             python=cap.interpreter.python,
             repo_root=str(_repo_root()),
             backend=cap.backends[0],
-            device="cpu",
+            # The helper picks the device, because only the helper has torch.
+            device="auto",
         )
         self._status(f"Starting the segmentation helper ({spec.backend})...")
         try:
@@ -3029,7 +3194,7 @@ class AnnotationApp(WorkspaceMixin):
         status line names the next action, and ``_render_canvas`` draws a
         coloured frame and caption for every tool but Select.
         """
-        for tool, _label, _icon, _action in _TOOLS:
+        for tool, _label, _word, _action in _TOOLS:
             tag = f"rail_{tool}"
             if dpg.does_item_exist(tag):
                 widgets.set_toolbar_active(tag, self._tool == tool)
@@ -3068,11 +3233,14 @@ class AnnotationApp(WorkspaceMixin):
 
     def convert_selected_to_obb(self) -> None:
         """選択中のボックスを回転矩形へ昇格させる (theta=0 から開始)。"""
-        if self._selected is not None:
-            self._push_undo()
-            self._mark_dirty()
         if self._selected is None:
+            self._status("Select a box first.")
             return
+        if self._selected.has_obb:
+            self._status("This box is already a rotated box.")
+            return
+        self._push_undo()
+        self._mark_dirty()
         self._selected.make_obb()
         self._selected.keyframe = True
         self._render_canvas()
@@ -3080,12 +3248,20 @@ class AnnotationApp(WorkspaceMixin):
         self._status("Converted to a rotated box (rotate with the yellow handle)")
 
     def convert_selected_to_aabb(self) -> None:
-        if self._selected is not None:
-            self._push_undo()
-            self._mark_dirty()
-        """選択中の回転矩形を軸平行ボックスへ戻す (外接矩形になる)。"""
-        if self._selected is None or not self._selected.has_obb:
+        """選択中の回転矩形を軸平行ボックスへ戻す (外接矩形になる)。
+
+        undo を積むのはガードを抜けたあと。抜けられなかった呼び出しで積むと、
+        何も変えていない undo ステップが 1 つ増え、しかも ``_push_undo`` が
+        redo スタックを消すので「やり直せたはずの操作」が消える。
+        """
+        if self._selected is None:
+            self._status("Select a box first.")
             return
+        if not self._selected.has_obb:
+            self._status("This box is already an axis-aligned box.")
+            return
+        self._push_undo()
+        self._mark_dirty()
         self._selected.drop_obb()
         self._selected.keyframe = True
         self._render_canvas()
@@ -3093,12 +3269,12 @@ class AnnotationApp(WorkspaceMixin):
         self._status("Reverted to an axis-aligned box (bounding rectangle)")
 
     def rotate_selected(self, degrees: float) -> None:
-        if self._selected is not None:
-            self._push_undo()
-            self._mark_dirty()
         """選択中の OBB を相対角度で回す (キーボードからの微調整用)。"""
         if self._selected is None:
+            self._status("Select a box first, then [ and ] turn it.")
             return
+        self._push_undo()
+        self._mark_dirty()
         self._selected.make_obb()
         self._selected.obb[4] += math.radians(degrees)
         self._selected.sync_bbox()
@@ -3107,11 +3283,11 @@ class AnnotationApp(WorkspaceMixin):
         self._status(f"Rotate {degrees:+.0f}° -> {math.degrees(self._selected.obb[4]):.1f}°")
 
     def delete_selected(self) -> None:
-        if self._selected is not None:
-            self._push_undo()
-            self._mark_dirty()
         if self._selected is None:
+            self._status("No box is selected.")
             return
+        self._push_undo()
+        self._mark_dirty()
         objs = self.annotations.get(self.current_frame_idx, [])
         if self._selected in objs:
             objs.remove(self._selected)
@@ -3133,8 +3309,15 @@ class AnnotationApp(WorkspaceMixin):
         self._status(f"New track ID: {self.next_track_id}")
 
     def propagate_from_prev(self) -> None:
-        self._push_undo()
-        self._mark_dirty()
+        """Copy the previous frame's boxes onto this one.
+
+        The undo step is pushed **after** every guard, not before. Space is a
+        bare key and it is easy to hit on frame 0, on an empty previous frame
+        or on a frame that is already annotated; pushing first meant each of
+        those left an undo entry that restores nothing, marked a clean project
+        Unsaved, and - because ``_push_undo`` clears the redo stack - threw
+        away a redo the user could still have wanted.
+        """
         if self.cap is None:
             return
         prev = self.current_frame_idx - 1
@@ -3149,12 +3332,20 @@ class AnnotationApp(WorkspaceMixin):
         # second copy on a track that is already here. Without them there is no
         # identity to compare, so an already-annotated frame is left alone
         # rather than doubled.
-        existing = self.annotations.setdefault(self.current_frame_idx, [])
+        # ``get``, not ``setdefault``: a guard that returns must not leave an
+        # empty list behind, or the frame counts an annotation it does not have.
+        existing = self.annotations.get(self.current_frame_idx, [])
         existing_tids = {o.track_id for o in existing}
         count = 0
         if not self.use_track_ids and existing:
             self._status("This frame already has boxes. Delete them first to propagate again.")
             return
+        if self.use_track_ids and all(o.track_id in existing_tids for o in prev_objs):
+            self._status("Every track from the previous frame is already here.")
+            return
+        self._push_undo()
+        self._mark_dirty()
+        existing = self.annotations.setdefault(self.current_frame_idx, [])
         for obj in prev_objs:
             if not self.use_track_ids or obj.track_id not in existing_tids:
                 record = obj.to_dict()
@@ -3168,12 +3359,13 @@ class AnnotationApp(WorkspaceMixin):
         self._status(f"Propagated {count} object(s) from frame {prev}.")
 
     def set_action(self, action_id: int) -> None:
-        if self._selected is not None:
-            self._push_undo()
-            self._mark_dirty()
         if self._selected is None:
             self._status(f"No box selected. Action [{action_id}] was ignored.")
             return
+        if self._selected.action_id == action_id:
+            return
+        self._push_undo()
+        self._mark_dirty()
         self._selected.action_id = action_id
         name = (
             self.action_names[action_id] if action_id < len(self.action_names) else str(action_id)
@@ -4317,9 +4509,9 @@ class AnnotationApp(WorkspaceMixin):
         off_x = (width - self.frame_w * scale) / 2
         off_y = (height - self.frame_h * scale) / 2
 
-        if dpg.does_item_exist(_FRAME_TEX):
+        if dpg.does_item_exist(self._frame_tex):
             dpg.draw_image(
-                _FRAME_TEX,
+                self._frame_tex,
                 pmin=(off_x, off_y),
                 pmax=(off_x + self.frame_w * scale, off_y + self.frame_h * scale),
                 parent=tag,
@@ -4610,12 +4802,23 @@ class AnnotationApp(WorkspaceMixin):
         return vs.capability(self._sam_client)
 
     def _refresh_propagation_ui(self) -> None:
-        """Lock or unlock Track Across Frames, with the reason (P4)."""
+        """Keep Continue unlocked, and say what it will actually do.
+
+        It is never locked, and that is correct rather than an oversight: the
+        method is resolved at press time and the last rung of the ladder -
+        copying the box to the next frame - needs nothing installed. What the
+        user cannot otherwise know is *which* rung they are on, so the tooltip
+        names the ladder and the status line names the rung that ran.
+        """
         tag = "rail_propagate"
         if dpg.does_item_exist(tag):
             widgets.unlock(
                 tag,
-                "Continue this animal. Uses the best available method; copy is always available.",
+                "Continue the selected animal into the frames that follow. "
+                "Uses accurate propagation when the segmentation helper is "
+                "running, fast tracking when OpenCV can, and otherwise copies "
+                "the box to the next frame - so it always does something. "
+                "Press it again while it is running to stop.",
             )
 
     def propagate_selection(self) -> None:
@@ -4631,6 +4834,13 @@ class AnnotationApp(WorkspaceMixin):
         except ImportError:  # pragma: no cover
             from htrtdetr.gui import video_segment as vs
 
+        # Pressing this IS asking to use the helper, so start it here rather
+        # than sending the user to Settings to turn on an unrelated setting.
+        # _start_sam is lazy and idempotent, and reports its own failure; the
+        # capability check below then turns that into the sentence to show.
+        if not self._sam_ready():
+            self._start_sam()
+
         capability = self.video_capability()
         if not capability.available:
             self._show_unavailable("Video propagation", capability.reason)
@@ -4639,7 +4849,17 @@ class AnnotationApp(WorkspaceMixin):
             self._status("Open a video first.")
             return
         if self._propagate_thread is not None and self._propagate_thread.is_alive():
-            self._status("A propagation is already running.")
+            # Pressing the one control again is how a job this long gets
+            # stopped (P6: a stop is a stop, never an error). There was no way
+            # to stop it at all, and it can run for minutes. The wording is
+            # exact about *when* it stops, because the pass already inside the
+            # helper cannot be interrupted from here and promising otherwise
+            # would be the second surprise.
+            self._propagate_stop = True
+            self._status(
+                "Stopping the propagation. The pass already running has to "
+                "finish first; nothing after it will start."
+            )
             return
 
         obj = self._selected
@@ -4707,22 +4927,39 @@ class AnnotationApp(WorkspaceMixin):
                 self._post(lambda: self._status("No frames could be prepared for propagation."))
                 return
 
-            req_id = client.propagate(
-                frames_dir=str(folder),
-                first_frame=first,
-                prompt_frame=request.frame,
-                points=[list(p) for p in request.points] or None,
-                box=list(request.box) if request.box else None,
-                obj_id=max(1, int(request.track_id)),
-            )
-            reply = client.wait_for(req_id, timeout=600.0)
-            if reply is None:
+            # SAM 2 propagates one way from the prompt. The window has frames
+            # on both sides of it, so it takes two passes - otherwise the
+            # `before` half is exported, decoded and then silently discarded.
+            # The backward pass is skipped entirely when there is no such half.
+            def one_pass(backward: bool):
+                req_id = client.propagate(
+                    frames_dir=str(folder),
+                    first_frame=first,
+                    prompt_frame=request.frame,
+                    points=[list(p) for p in request.points] or None,
+                    box=list(request.box) if request.box else None,
+                    obj_id=max(1, int(request.track_id)),
+                    backward=backward,
+                )
+                reply = client.wait_for(req_id, timeout=600.0)
+                return None if reply is None else vs.result_from_reply(reply)
+
+            self._post(lambda: self._status("Following the animal forward..."))
+            forward = one_pass(False)
+            backward = None
+            if first < request.frame and not self._propagate_stop:
+                self._post(lambda: self._status("Following the animal backward..."))
+                backward = one_pass(True)
+
+            if forward is None and backward is None:
                 self._post(
                     lambda: self._status("The helper did not answer in time. Nothing was changed.")
                 )
                 return
 
-            result = vs.result_from_reply(reply)
+            # Forward first, so the prompt frame - which both passes return -
+            # resolves to the forward pass.
+            result = vs.merge_results(forward, backward)
             self._post(
                 lambda r=result, q=request: self._finish_video_propagation(project, video, r, q)
             )
@@ -4734,37 +4971,6 @@ class AnnotationApp(WorkspaceMixin):
                 cap.release()
             if folder is not None:
                 shutil.rmtree(folder, ignore_errors=True)
-
-    def _finish_propagation(self, result, request) -> None:
-        """Main-thread tail: candidates in, checks run, Inbox updated."""
-        try:
-            from .gui import video_segment as vs
-        except ImportError:  # pragma: no cover
-            from htrtdetr.gui import video_segment as vs
-
-        if not result.ok or not result.boxes:
-            self._status(result.describe(request.track_id))
-            return
-
-        candidates = vs.build_candidates(result, track_id=request.track_id)
-        session = self._review_session()
-        for frame, items in candidates.items():
-            session.add_frame(frame, items)
-
-        self.rebuild_copilot()
-        self._refresh_candidate_ui()
-        self._render_canvas()
-
-        # Select the tracklet the propagation just produced, so the one action
-        # that follows - Accept tracklet - is already in front of the user.
-        parts = [
-            t for t in self._tracklets.for_track(request.track_id) if t.contains(request.frame)
-        ]
-        if parts:
-            self._sel_tracklet = parts[0]
-            self._selected = None
-            self._refresh_inspector()
-        self._status(result.describe(request.track_id))
 
     def _show_unavailable(self, feature: str, reason: str) -> None:
         """Explain a missing optional backend, never raise an ImportError (§35)."""

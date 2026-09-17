@@ -37,6 +37,15 @@ gui = "htrtdetr.gui:main"
 [project.optional-dependencies]
 annotate = ["opencv-python>=4.8.0", "dearpygui>=1.11.0"]
 gui = ["opencv-python>=4.8.0", "dearpygui>=1.11.0"]
+# Video propagation in the annotator: one prompt carried across a window.
+# Install into the Python that runs the segmentation helper (tools/sam_sidecar.py),
+# which is not necessarily the one running the GUI.
+#
+# huggingface_hub is listed because sam2 does NOT depend on it and cannot reach
+# a checkpoint without it: SAM2VideoPredictor.from_pretrained imports it inside
+# build_sam._hf_download. `pip install sam2` alone installs a package that
+# raises ModuleNotFoundError on every load.
+sam2 = ["sam2>=1.1.0", "huggingface_hub>=0.23.0"]
 vis = ["matplotlib>=3.7.0", "opencv-python>=4.8.0"]
 dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "black", "isort", "mypy"]
 wandb = ["wandb>=0.16.0"]
@@ -60,4 +69,5 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 markers = [
     "gui: opens a dearpygui window; deselect with -m 'not gui'",
+    "live_model: loads a real model checkpoint (downloads on first run); deselect with -m 'not live_model'",
 ]

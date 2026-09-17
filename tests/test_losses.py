@@ -122,3 +122,48 @@ class TestActionLossForward:
         expected = F.cross_entropy(logits, gt, ignore_index=-1) * loss_fn.cfg.w_action
         assert unweighted.item() == pytest.approx(expected.item())
         assert weighted.item() != pytest.approx(unweighted.item())
+
+
+class TestPosePolarity:
+    """head-tail polarity の GT 経路。
+
+    ``predict_polarity`` は pose を有効にすると既定で真になるのに、この経路は
+    一度も通ったことがなかった: ``_pose_losses`` が import していない
+    ``collect_matched_gt`` を呼んでいて、``polarity`` を持つデータセットは
+    学習ではなく ``NameError`` に到達していた。GT 側も ``polarity`` を運ぶ
+    キーとして登録されておらず、仮に import しても全件 -1 (= 全部 ignore) が
+    返り、``cross_entropy`` が NaN を返すだけだった。
+    """
+
+    def test_matched_polarity_reaches_the_detections(self):
+        from htrtdetr.training.matching import collect_matched_gt
+
+        det = [{"boxes": torch.tensor([[0.25, 0.25, 0.5, 0.5]])}]
+        target = [{
+            "boxes": torch.tensor([[0.0, 0.0, 0.5, 0.5]]),
+            "polarity": torch.tensor([1], dtype=torch.long),
+        }]
+        gt = collect_matched_gt(det, target, key="polarity")
+        assert gt.tolist() == [1], "polarity never reached the loss (all -1 = all ignored)"
+
+    def test_a_batch_with_no_labelled_polarity_costs_nothing_and_is_not_nan(self):
+        from htrtdetr.training.losses import PoseLoss
+
+        loss = PoseLoss(LossConfig())
+        pred = torch.zeros(4, 2, requires_grad=True)
+        gt = torch.full((4,), -1, dtype=torch.long)
+        out = loss(None, None, pred, gt)
+        assert not torch.isnan(out["loss_pose"]).any()
+        assert out["loss_pose"].item() == pytest.approx(0.0)
+        assert "loss_pose_polarity" not in out
+
+    def test_a_labelled_batch_still_produces_a_polarity_loss(self):
+        from htrtdetr.training.losses import PoseLoss
+
+        loss = PoseLoss(LossConfig())
+        pred = torch.tensor([[2.0, -2.0], [-2.0, 2.0], [0.0, 0.0]])
+        gt = torch.tensor([0, 1, -1], dtype=torch.long)
+        out = loss(None, None, pred, gt)
+        assert "loss_pose_polarity" in out
+        assert out["loss_pose_polarity"].item() > 0.0
+        assert not torch.isnan(out["loss_pose"]).any()

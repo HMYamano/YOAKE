@@ -435,7 +435,7 @@ class Inspector:
             widgets.attach_tooltip(
                 self._t("b_obb"),
                 "Turn this box into a rotated box, or back into an upright one. "
-                f"[ and ] then turn it 5 degrees at a time.",
+                "[ and ] then turn it 5 degrees at a time.",
             )
 
             widgets.gap(1)

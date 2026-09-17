@@ -156,6 +156,21 @@ class _TorchImageAdapter(Adapter):
         return best, (None if scores is None else float(scores[idx]))
 
 
+def sam2_ready() -> bool:
+    """Both packages SAM 2 needs to reach a checkpoint, without importing either.
+
+    ``huggingface_hub`` is the second one, and it is **not** a dependency of the
+    ``sam2`` distribution: ``pip install sam2`` alone leaves both
+    ``SAM2ImagePredictor.from_pretrained`` and ``SAM2VideoPredictor.from_pretrained``
+    raising ``ModuleNotFoundError`` deep inside ``build_sam._hf_download``.
+    Since ``from_pretrained`` is the only way this helper loads SAM 2, a helper
+    without it can advertise nothing it could actually deliver.
+    """
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None
+               for m in ("sam2", "huggingface_hub"))
+
+
 class Sam2Adapter(_TorchImageAdapter):
     """Meta's SAM 2 image predictor.
 
@@ -291,6 +306,40 @@ ADAPTERS = {
 }
 
 
+def resolve_device(name: str) -> str:
+    """``auto`` -> the best device this helper can actually use.
+
+    Resolved **here**, in the process that has torch, and reported back through
+    ``hello``. The GUI must never import torch to answer this — that is the
+    whole reason ``gui/sidecar.py`` exists — so it cannot pick the device
+    itself. It asks for ``auto`` and is told what it got.
+
+    Measured on this machine (RTX 5060 Ti, sam2-hiera-tiny, 256x256 frames, one
+    30-frame pass including the lazy model load): **269 ms/frame on cuda
+    against 1153 ms/frame on cpu**, a factor of 4.3. Over the 200-frame window
+    the UI offers that is 54 s against 231 s, and the gap widens with frame
+    size. Silently defaulting to ``cpu`` on a machine with a GPU is therefore
+    not a safe default, it is a hidden one.
+    """
+    want = (name or "auto").strip().lower()
+    if want != "auto":
+        return want
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    try:
+        if torch.cuda.is_available():
+            return "cuda"
+        mps = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except Exception:                                 # noqa: BLE001
+        # A broken driver must degrade to CPU, not take the helper down.
+        pass
+    return "cpu"
+
+
 # --------------------------------------------------------------------------- #
 # The loop
 # --------------------------------------------------------------------------- #
@@ -331,10 +380,40 @@ class Sam2VideoAdapter:
         self.model = model or "facebook/sam2-hiera-tiny"
         self.device = device or "cpu"
         self._predictor = None
+        #: ``(frames_dir, inference_state)`` for the window last prompted.
+        self._state = None
 
     def available(self) -> bool:
-        import importlib.util
-        return importlib.util.find_spec("sam2") is not None
+        return sam2_ready()
+
+    def _state_for(self, frames_dir: str):
+        """The inference state for ``frames_dir``, built at most once.
+
+        ``init_state`` runs the image encoder over **every** frame in the
+        window; that is the whole cost of a propagation. The GUI asks twice per
+        propagation - once forward, once backward from the same prompt over the
+        same exported directory - so building a new state for the second pass
+        encoded the identical frames a second time and doubled the wait for
+        nothing.
+
+        Reuse is safe because ``reset_state`` clears the prompts and the
+        tracking output while keeping the cached per-frame features, which is
+        exactly what this call already did to a freshly built state.
+
+        Only one window is held. A new directory drops the previous state
+        first, so the GPU memory of a finished propagation is released before
+        the next one allocates rather than after.
+        """
+        predictor = self._load()
+        key = str(frames_dir)
+        if self._state is not None and self._state[0] == key:
+            state = self._state[1]
+        else:
+            self._state = None
+            state = predictor.init_state(video_path=key)
+            self._state = (key, state)
+        predictor.reset_state(state)
+        return predictor, state
 
     def _load(self):
         if self._predictor is None:
@@ -354,11 +433,8 @@ class Sam2VideoAdapter:
         doing it here would mean this process has to be told the stride too.
         """
         import numpy as np
-        import torch
 
-        predictor = self._load()
-        state = predictor.init_state(video_path=str(frames_dir))
-        predictor.reset_state(state)
+        predictor, state = self._state_for(frames_dir)
 
         kwargs: Dict[str, Any] = {"inference_state": state,
                                   "frame_idx": int(prompt_offset),
@@ -899,13 +975,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--backend", default="stub", choices=sorted(ADAPTERS))
     parser.add_argument("--model", default="", help="model id or registry key")
     parser.add_argument("--checkpoint", default="", help="weights file, if the backend needs one")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto",
+                        help="cpu / cuda / mps, or auto to pick the best present")
     parser.add_argument("--selftest", action="store_true",
                         help="run the protocol against the stub and exit")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.selftest:
         return selftest()
+
+    # Before the adapters are built: every one of them takes the device at
+    # construction, and ``hello`` reports it from the adapter.
+    args.device = resolve_device(args.device)
 
     try:
         adapter = ADAPTERS[args.backend](args)

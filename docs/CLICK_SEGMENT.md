@@ -358,16 +358,30 @@ SAM ViT-B は 89M param なので、実機の値もこの近傍になります�
 
 ```
 The segmentation helper needs a SAM package next to PyTorch, and none was found (present: none).
-Install one with:  pip install git+https://github.com/facebookresearch/segment-anything.git
+Install one with:  pip install sam2 huggingface_hub
 Until then Click to Box keeps using the Local (OpenCV) fit, which needs nothing installed
 and is already the default - press C and click an animal.
+```
+
+原因は 3 通りあり、3 通りとも文面が違います。3 つ目は **`sam2` は入っているのに
+`huggingface_hub` が無い**ケースで、これが一番厄介です —— パッケージが見えているので
+ユーザは導入成功だと思い込み、ロードのたびに `sam2` の奥で失敗します
+(`from_pretrained` → `build_sam._hf_download` が内部 import する)。
+`InterpreterInfo.sam2_needs_hub` がこの状態を名指しし、`locked_reason` は
+**どのインタプリタに入れるか**までパス付きで出します。
+
+```
+sam2 is installed next to PyTorch but cannot reach any weights: huggingface_hub is
+missing, and sam2 does not depend on it.
+Finish the install with:  "C:\Users\you\miniconda3\envs\YOAKE\python.exe" -m pip install huggingface_hub
+Until then Click to Box keeps using the Local (OpenCV) fit, ...
 ```
 
 文字列はすべて ASCII に保っています。Windows の既定コンソール (cp932) に流れても
 `UnicodeEncodeError` にならないためで、これはテストで固定してはいませんが
 `locked_reason` と `DIAGNOSES` を触るときの約束です。
 
-### §6.7 実モデルのアダプタは**この機械では未検証**
+### §6.7 実モデルのアダプタ — `sam2` は実走済み、他の 2 つは未検証
 
 `tools/sam_sidecar.py` には 3 つの実アダプタが入っています。
 
@@ -377,18 +391,30 @@ and is already the default - press C and click an animal.
 | `segment_anything` | `segment_anything` + `.pth` | `sam_model_registry[key](checkpoint=...)` → `SamPredictor` |
 | `transformers` | `transformers` | `SamModel` + `SamProcessor`、`get_image_embeddings` を 1 回 |
 
-**どれもこの機械で実走させていません。** パッケージもチェックポイントも入っておらず、
-導入にはネットワーク・ディスク・ライセンス確認が要ります (P20 の精神からすれば、
-検証していないものを「動く」と書くわけにはいきません)。
+`sam2` は**実走検証済み**です (`facebook/sam2-hiera-tiny`, CUDA)。
+`segment_anything` と `transformers` の 2 つは依然として未検証で、
+P20 の精神からすれば検証していないものを「動く」と書くわけにはいきません。
 
-検証していないことと、**配管が検証されていることは別**です。プロトコル・プロセス管理・
-世代ガード・mask→OBB は `--backend stub` で 35 tests が実走しており、
-アダプタで残っているのは「モデルの API を正しく呼べているか」だけです。
+導入は 2 パッケージです。`sam2` は `huggingface_hub` に依存していないのに
+それ無しではチェックポイントに到達できないので、**片方だけ入れた状態が一番危険**です:
+
+```
+pip install sam2 huggingface_hub
+```
+
 入れたら最初にこれを実行してください:
 
 ```
+<torch のある python> tools/sam_sidecar.py --selftest
 <torch のある python> tools/sam_sidecar.py --backend sam2 --model facebook/sam2-hiera-tiny
 ```
+
+`--device` の既定は `cpu` ではなく **`auto`** です。デバイスを決められるのは torch を
+持つヘルパだけで、GUI 側は import できないため判定できません。解決結果は `hello` の
+`device` で返り、それが UI に出ます。
+
+実測は `docs/ANNOTATION_COPILOT.md` §11 に、回帰テストは
+`tests/test_gui_video_segment.py` の `live_model` ブロックにあります。
 
 `concept` (テキストから全個体) を名乗るアダプタは**まだありません**。
 3 つとも `capabilities` は `("point", "box")` を返し、`concept` 要求には
