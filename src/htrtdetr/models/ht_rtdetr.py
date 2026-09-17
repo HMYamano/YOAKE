@@ -33,7 +33,7 @@ Stage による動作の違い:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -44,7 +44,15 @@ from .detector import RTDETRDetector, DetectionOutput, build_detector
 from .temporal import HierarchicalTemporalModule
 from .id_head import MemoryIDHead, IdentityMemory
 from .action_head import ActionHead, InteractionFeatureComputer
-from .fusion import QueryTemporalFusion, DetectionFeatureAdapter, MultiHeadFeatureRouter
+from .fusion import (
+    DetectionFeatureAdapter,
+    MultiHeadFeatureRouter,
+    QueryTemporalFusion,
+    TrackTemporalFusion,
+)
+from .behavior import BehaviorBranch, BehaviorPrediction
+from ..geometry.obb import cxcywh_to_obb
+from ..tracking.assembly import FrameDetections, build_track_aligned_history
 from ..utils.misc import freeze_module, unfreeze_module, cxcywh_to_xyxy
 from ..data.feature_builder import GEO_FEAT_DIM
 
@@ -77,6 +85,16 @@ class HTRTDETROutput:
         det_results: Optional[List[Dict]] = None,           # B 個の dict
         # 中間デコーダ層の出力 (auxiliary loss 用)
         aux_outputs: Optional[List[Dict]] = None,
+        # --- OBB / pose (detector が対応している場合のみ) ---
+        pred_obb: Optional[torch.Tensor] = None,            # (B, Q, 5)
+        pred_angles: Optional[torch.Tensor] = None,         # (B, Q, 2)
+        pred_keypoints: Optional[torch.Tensor] = None,      # (B, Q, K, 3)
+        pred_polarity: Optional[torch.Tensor] = None,       # (B, Q, 2)
+        # --- Behavior branch (evidence 分解つき) ---
+        behavior: Optional["BehaviorPrediction"] = None,
+        # track-aligned な行動予測を検出順へ戻すための対応表
+        track_ids: Optional[List[int]] = None,
+        behavior_rows: Optional[List[List[int]]] = None,
     ):
         self.pred_logits = pred_logits
         self.pred_boxes = pred_boxes
@@ -88,6 +106,48 @@ class HTRTDETROutput:
         self.action_probs = action_probs
         self.det_results = det_results
         self.aux_outputs = aux_outputs
+        self.pred_obb = pred_obb
+        self.pred_angles = pred_angles
+        self.pred_keypoints = pred_keypoints
+        self.pred_polarity = pred_polarity
+        self.behavior = behavior
+        self.track_ids = track_ids
+        self.behavior_rows = behavior_rows
+
+    @property
+    def has_obb(self) -> bool:
+        return self.pred_obb is not None
+
+    def explain_detection(self, batch_index: int, det_index: int) -> Dict[str, float]:
+        """
+        1 検出の行動判断根拠 (evidence 寄与) を返す。
+
+        GUI の「個体をクリック → 判断根拠を表示」に対応する API。
+        evidence 分解が無効な構成や、その検出に track 履歴が無い場合は空 dict。
+
+        Returns:
+            {"actor": 0.32, "motion": 0.54, "interaction": 1.10, ...}
+            値は logit 単位で、足し合わせると最終 logit になる。
+        """
+        if self.behavior is None or self.behavior_rows is None:
+            return {}
+        if batch_index >= len(self.behavior_rows):
+            return {}
+        rows = self.behavior_rows[batch_index]
+        if det_index >= len(rows) or rows[det_index] < 0:
+            return {}
+        return self.behavior.explain(rows[det_index])
+
+    def behavior_gates(self, batch_index: int, det_index: int) -> Dict[str, float]:
+        """1 検出の feature gate 重み (重要度) を返す。寄与とは別物。"""
+        if self.behavior is None or self.behavior_rows is None:
+            return {}
+        if batch_index >= len(self.behavior_rows):
+            return {}
+        rows = self.behavior_rows[batch_index]
+        if det_index >= len(rows) or rows[det_index] < 0:
+            return {}
+        return self.behavior.gate_weights(rows[det_index])
 
     def iter_detection_batches(self):
         """
@@ -142,6 +202,12 @@ class HTRTDETR(nn.Module):
         self.temporal = HierarchicalTemporalModule(cfg.temporal)
 
         # --- Feature Fusion ---
+        # 既定は track 単位。query 単位 (旧挙動) は後方互換の ablation としてのみ残す。
+        self.track_aligned_temporal = bool(
+            getattr(cfg, "track_aligned_temporal", True)
+        )
+        self.track_temporal_fusion = TrackTemporalFusion(hidden_dim)
+        # 旧 checkpoint / 旧 ablation 用 (パラメータを持たないので構築コストは実質ゼロ)
         self.query_temporal_fusion = QueryTemporalFusion(hidden_dim)
         self.det_adapter = DetectionFeatureAdapter(hidden_dim)
         self.feature_router = MultiHeadFeatureRouter(
@@ -158,6 +224,26 @@ class HTRTDETR(nn.Module):
 
         # --- Interaction Feature Computer ---
         self.interaction = InteractionFeatureComputer(cfg.action_head)
+
+        # --- Behavior Branch (actor + context 2-stream, evidence 分解) ---
+        # 既存 ActionHead は互換のため常に残し、BehaviorBranch を追加で持つ。
+        # 行動出力は BehaviorBranch があればそちらを優先し、無ければ ActionHead。
+        behavior_cfg = getattr(cfg, "behavior", None)
+        self.behavior_enabled = behavior_cfg is not None
+        if self.behavior_enabled:
+            self.behavior = BehaviorBranch(
+                cfg=behavior_cfg,
+                num_actions=cfg.action_head.num_actions,
+                feature_channels=cfg.detector.fpn.out_channels,
+                detector_dim=hidden_dim,
+                temporal_dim=cfg.temporal.output_dim,
+                num_keypoints=cfg.detector.pose.num_keypoints
+                if cfg.detector.pose.enabled else 0,
+                explain_cfg=getattr(cfg, "explainability", None),
+            )
+            self.behavior_window = int(behavior_cfg.temporal_window)
+        else:
+            self.behavior_window = 16
 
         # --- Geo feature projector (Stage 2/3: geo-only track window training) ---
         temporal_feat_dim = cfg.temporal.feature_dim  # 256
@@ -181,20 +267,28 @@ class HTRTDETR(nn.Module):
         """
         self.training_stage = stage
 
+        # behavior ブランチは action head と同じ stage で学習する
+        # (どちらも「行動を当てる」責務なので freeze の単位を揃える)
+        behavior = getattr(self, "behavior", None) if self.behavior_enabled else None
+
         if stage == 1:
             # Stage 1: detector のみ学習
             unfreeze_module(self.detector)
             freeze_module(self.temporal)
             freeze_module(self.id_head)
             freeze_module(self.action_head)
+            if behavior is not None:
+                freeze_module(behavior)
 
         elif stage == 2:
-            # Stage 2: temporal + action head を学習 (detector は freeze)
+            # Stage 2: temporal + action/behavior head を学習 (detector は freeze)
             freeze_module(self.detector)
             unfreeze_module(self.temporal)
             freeze_module(self.id_head)
             unfreeze_module(self.action_head)
             unfreeze_module(self.interaction)
+            if behavior is not None:
+                unfreeze_module(behavior)
 
         elif stage == 3:
             # Stage 3: temporal + ID head を学習 (detector は freeze)
@@ -202,6 +296,8 @@ class HTRTDETR(nn.Module):
             unfreeze_module(self.temporal)
             unfreeze_module(self.id_head)
             freeze_module(self.action_head)
+            if behavior is not None:
+                freeze_module(behavior)
 
         elif stage == 4:
             # Stage 4: 全モジュールを fine-tune
@@ -222,11 +318,24 @@ class HTRTDETR(nn.Module):
         self,
         images: torch.Tensor,   # (B, T, 3, H, W)
         memory_list: Optional[List[IdentityMemory]] = None,  # 推論時のみ使用
+        track_ids_per_frame: Optional[List[List[Sequence[int]]]] = None,
     ) -> HTRTDETROutput:
         """
+        窓単位の forward。
+
+        データフロー (原則 3: 時間モデルは query 単位ではなく track 単位):
+
+            frames → detector (各フレーム 1 回) → detections
+                   → tracking → track_id
+                   → track-aligned history → HTM
+                   → behavior branch (actor + context + kinematics + interaction)
+
         Args:
             images: (B, T, 3, H, W) — シーケンス入力
             memory_list: バッチ内各シーケンスの IdentityMemory (推論時)
+            track_ids_per_frame: teacher forcing 用の track_id。
+                ``track_ids_per_frame[b][t]`` がバッチ要素 b・フレーム t の
+                各検出に対応する track_id。None なら内部 tracker が付与する。
 
         Returns:
             HTRTDETROutput
@@ -234,22 +343,15 @@ class HTRTDETR(nn.Module):
         B, T, C, H, W = images.shape
 
         # ---------------------------------------------------------------- #
-        # Step 1: Frame-wise detection
+        # Step 1: Frame-wise detection — 各フレームはちょうど 1 回だけ通す
         # ---------------------------------------------------------------- #
-        all_pred_logits = []   # List[(B, Q, C+1)], length T
-        all_pred_boxes = []    # List[(B, Q, 4)], length T
-        all_query_feats = []   # List[(B, Q, D)], length T
-
-        for t in range(T):
-            det_out = self.detector(images[:, t])  # DetectionOutput
-            all_pred_logits.append(det_out.pred_logits)
-            all_pred_boxes.append(det_out.pred_boxes)
-            all_query_feats.append(det_out.query_features)
-
-        # 最終フレームを main output に使う
-        pred_logits = all_pred_logits[-1]   # (B, Q, C+1)
-        pred_boxes = all_pred_boxes[-1]     # (B, Q, 4)
-        query_feats = all_query_feats[-1]   # (B, Q, D)
+        frame_outs: List[DetectionOutput] = [
+            self.detector(images[:, t]) for t in range(T)
+        ]
+        last_out = frame_outs[-1]
+        pred_logits = last_out.pred_logits   # (B, Q, C+1)
+        pred_boxes = last_out.pred_boxes     # (B, Q, 4)
+        query_feats = last_out.query_features  # (B, Q, D)
 
         # Stage 1: detection のみ
         if self.training_stage == 1:
@@ -257,96 +359,117 @@ class HTRTDETR(nn.Module):
                 pred_logits=pred_logits,
                 pred_boxes=pred_boxes,
                 query_features=query_feats,
+                aux_outputs=last_out.aux_outputs,
+                pred_obb=last_out.pred_obb,
+                pred_angles=last_out.pred_angles,
+                pred_keypoints=last_out.pred_keypoints,
+                pred_polarity=last_out.pred_polarity,
             )
 
         # ---------------------------------------------------------------- #
-        # Step 2: Hierarchical Temporal Module
+        # Step 2: 各フレームの有効な検出を抽出
         # ---------------------------------------------------------------- #
-        # query features を temporal 次元に変換: (B*Q, T, D)
-        Q = query_feats.shape[1]
-        packed = self.query_temporal_fusion.pack_for_temporal(all_query_feats)
-        # packed: (B*Q, T, D)
-
-        temporal_feats = self.temporal(packed)  # (B*Q, T, out_dim)
-
-        # (B, T, Q, out_dim) に戻す
-        temporal_feats_4d = self.query_temporal_fusion.unpack_from_temporal(
-            temporal_feats, B, Q
-        )
-
-        # 最終フレームの temporal feature: (B, Q, out_dim)
-        temporal_feats_last = temporal_feats_4d[:, -1]  # (B, Q, out_dim)
+        thr = self.cfg.detector.score_threshold
+        per_frame: List[List[Dict]] = [
+            self.det_adapter.extract_valid_detections(
+                fo.pred_logits, fo.pred_boxes, fo.query_features,
+                score_threshold=thr,
+                pred_obb=fo.pred_obb,
+                pred_keypoints=fo.pred_keypoints,
+                pred_polarity=fo.pred_polarity,
+            )
+            for fo in frame_outs
+        ]
+        det_results = per_frame[-1]   # 現フレーム (main output)
 
         # ---------------------------------------------------------------- #
-        # Step 3: 有効な検出を抽出
+        # Step 3: Temporal — track 単位 (既定) / query 単位 (旧・非推奨)
         # ---------------------------------------------------------------- #
-        det_results = self.det_adapter.extract_valid_detections(
-            pred_logits, pred_boxes, query_feats,
-            score_threshold=self.cfg.detector.score_threshold,
-        )
-
-        # ---------------------------------------------------------------- #
-        # Step 4: Feature routing (ID head / Action head 用)
-        # ---------------------------------------------------------------- #
-        # 各バッチの valid detection に対して feature を集める
-        all_spatial = []
-        all_temporal = []
-        all_boxes = []
-        all_batch_idx = []
-
-        for b in range(B):
-            det = det_results[b]
-            N_b = det["features"].shape[0]
-            if N_b == 0:
-                continue
-            q_idx = det["query_indices"]
-
-            # spatial feature (query feature)
-            sf = det["features"]                      # (N_b, D)
-            # temporal feature (対応する query の temporal)
-            tf = temporal_feats_last[b][q_idx]        # (N_b, out_dim)
-
-            all_spatial.append(sf)
-            all_temporal.append(tf)
-            all_boxes.append(det["boxes"])
-            all_batch_idx.extend([b] * N_b)
-
-        # concat して一括処理
-        if all_spatial:
-            all_spatial_cat = torch.cat(all_spatial, dim=0)    # (N_total, D)
-            all_temporal_cat = torch.cat(all_temporal, dim=0)  # (N_total, out_dim)
-            all_boxes_cat = torch.cat(all_boxes, dim=0)         # (N_total, 4)
+        if self.track_aligned_temporal:
+            aligned = self._build_track_aligned(
+                per_frame, B, T, images.device, track_ids_per_frame
+            )
+            temporal_in = self.track_temporal_fusion.pack_from_cache(
+                aligned.features, aligned.mask
+            )
+            if temporal_in.shape[0] > 0:
+                temporal_seq = self.temporal(temporal_in)     # (M, T, out_dim)
+                temporal_last = temporal_seq[:, -1]           # (M, out_dim)
+            else:
+                out_dim = self.cfg.temporal.output_dim
+                temporal_seq = temporal_in.new_zeros(0, T, out_dim)
+                temporal_last = temporal_in.new_zeros(0, out_dim)
+            temporal_features_out = temporal_seq
+            # 現フレームの各検出に対応する temporal 特徴を引き当てる
+            per_det_temporal = self._gather_by_rows(
+                temporal_last, aligned.current_rows, det_results
+            )
+            behavior_rows = aligned.current_rows
+            track_ids_out = aligned.track_ids
         else:
-            D = query_feats.shape[-1]
-            out_dim = temporal_feats_last.shape[-1]
-            all_spatial_cat = torch.zeros(0, D, device=images.device)
-            all_temporal_cat = torch.zeros(0, out_dim, device=images.device)
-            all_boxes_cat = torch.zeros(0, 4, device=images.device)
+            aligned = None
+            behavior_rows = None
+            track_ids_out = None
+            Q = query_feats.shape[1]
+            packed = self.query_temporal_fusion.pack_for_temporal(
+                [fo.query_features for fo in frame_outs]
+            )
+            temporal_feats = self.temporal(packed)            # (B*Q, T, out_dim)
+            temporal_4d = self.query_temporal_fusion.unpack_from_temporal(
+                temporal_feats, B, Q
+            )
+            temporal_features_out = temporal_4d
+            last_by_query = temporal_4d[:, -1]                # (B, Q, out_dim)
+            per_det_temporal = torch.cat([
+                last_by_query[b][det_results[b]["query_indices"]]
+                for b in range(B)
+            ], dim=0) if any(
+                d["features"].shape[0] > 0 for d in det_results
+            ) else query_feats.new_zeros(0, self.cfg.temporal.output_dim)
 
-        # Feature routing
+        # ---------------------------------------------------------------- #
+        # Step 4: 検出特徴を平坦化 (ID / action head 用)
+        # ---------------------------------------------------------------- #
+        flat = self._flatten_detections(det_results, images.device)
+        all_spatial_cat = flat["features"]
+        all_boxes_cat = flat["boxes"]
+        batch_index = flat["batch_index"]
+
         if all_spatial_cat.shape[0] > 0:
-            routed = self.feature_router(all_spatial_cat, all_temporal_cat)
-            id_feat = routed["id_feat"]             # (N_total, hidden_dim)
-            action_spatial = routed["action_spatial_feat"]  # (N_total, hidden_dim)
+            routed = self.feature_router(all_spatial_cat, per_det_temporal)
+            id_feat = routed["id_feat"]
+            action_spatial = routed["action_spatial_feat"]
         else:
             hidden_dim = self.detector.get_hidden_dim()
-            id_feat = torch.zeros(0, hidden_dim, device=images.device)
-            action_spatial = torch.zeros(0, hidden_dim, device=images.device)
+            id_feat = all_spatial_cat.new_zeros(0, hidden_dim)
+            action_spatial = all_spatial_cat.new_zeros(0, hidden_dim)
 
         # ---------------------------------------------------------------- #
-        # Step 5: Action Head
+        # Step 5: Behavior — actor + context 2-stream / evidence 分解
         # ---------------------------------------------------------------- #
-        action_logits = None
-        action_probs = None
+        action_logits: Optional[torch.Tensor] = None
+        action_probs: Optional[torch.Tensor] = None
+        behavior_pred: Optional[BehaviorPrediction] = None
 
         if self.training_stage in (2, 4):
-            # interaction feature
-            velocities = torch.zeros_like(all_boxes_cat[:, :2])  # (N_total, 2)
-            int_feat = self.interaction(all_boxes_cat, velocities)
+            if self.behavior_enabled and self.track_aligned_temporal and aligned is not None:
+                behavior_pred = self._run_behavior(
+                    aligned, last_out, temporal_last, det_results
+                )
+                if behavior_pred is not None and behavior_pred.logits is not None:
+                    # track 単位の予測を現フレームの検出順に並べ直す
+                    action_logits = self._gather_by_rows(
+                        behavior_pred.logits, aligned.current_rows, det_results
+                    )
+                    action_probs = F.softmax(action_logits, dim=-1)
 
-            act_out = self.action_head(action_spatial, all_temporal_cat, int_feat)
-            action_logits = act_out["action_logits"]  # (N_total, num_actions)
-            action_probs = act_out["action_probs"]
+            if action_logits is None:
+                # 旧 ActionHead 経路 (behavior 無効 / query-aligned 時)
+                velocities = torch.zeros_like(all_boxes_cat[:, :2])
+                int_feat = self.interaction(all_boxes_cat, velocities)
+                act_out = self.action_head(action_spatial, per_det_temporal, int_feat)
+                action_logits = act_out["action_logits"]
+                action_probs = act_out["action_probs"]
 
         # ---------------------------------------------------------------- #
         # Step 6: ID Head
@@ -355,67 +478,290 @@ class HTRTDETR(nn.Module):
         id_embeddings = None
 
         if self.training_stage in (3, 4):
-            if self.training:
-                # 学習時は GT track_id を使う (損失計算側で処理)
-                # ここでは embedding のみ計算
-                # (実際の ID 損失は trainer で計算する)
-                id_logits_list = []
-                id_emb_list = []
-                ptr = 0
-                for b in range(B):
-                    N_b = det_results[b]["features"].shape[0]
-                    if N_b == 0:
-                        continue
-                    feat_b = id_feat[ptr:ptr + N_b]
-                    box_b = all_boxes_cat[ptr:ptr + N_b]
-                    # geometry/motion を concat して input_proj の次元に合わせる
-                    vel_b = torch.zeros(N_b, 2, device=feat_b.device)
-                    x_b = self.id_head._build_input(feat_b, box_b, vel_b)
-                    h = torch.zeros(N_b, self.cfg.id_head.memory_dim, device=feat_b.device)
-                    _, emb = self.id_head.memory_net(x_b, h)
-                    logits = self.id_head.id_classifier(emb)
-                    id_logits_list.append(logits)
-                    id_emb_list.append(emb)
-                    ptr += N_b
-
-                if id_logits_list:
-                    id_logits = torch.cat(id_logits_list, dim=0)
-                    id_embeddings = torch.cat(id_emb_list, dim=0)
-            else:
-                # 推論時は memory を使って ID を割り当て
-                if memory_list is None:
-                    memory_list = [
-                        self.id_head.create_memory(images.device) for _ in range(B)
-                    ]
-                id_emb_list = []
-                ptr = 0
-                for b in range(B):
-                    N_b = det_results[b]["features"].shape[0]
-                    feat_b = id_feat[ptr:ptr + N_b]
-                    box_b = all_boxes_cat[ptr:ptr + N_b]
-                    inf_out = self.id_head.forward_inference(
-                        feat_b, box_b, memory_list[b]
-                    )
-                    # track_ids を det_results に書き込む
-                    det_results[b]["track_ids"] = inf_out["track_ids"]
-                    det_results[b]["id_scores"] = inf_out["id_scores"]
-                    id_emb_list.append(inf_out["embeddings"])
-                    ptr += N_b
-
-                if id_emb_list:
-                    id_embeddings = torch.cat(id_emb_list, dim=0)
+            id_logits, id_embeddings = self._run_id_head(
+                det_results, id_feat, all_boxes_cat, memory_list, images.device, B
+            )
 
         return HTRTDETROutput(
             pred_logits=pred_logits,
             pred_boxes=pred_boxes,
             query_features=query_feats,
-            temporal_features=temporal_feats_4d,
+            temporal_features=temporal_features_out,
             id_logits=id_logits,
             id_embeddings=id_embeddings,
             action_logits=action_logits,
             action_probs=action_probs,
             det_results=det_results,
+            aux_outputs=last_out.aux_outputs,
+            pred_obb=last_out.pred_obb,
+            pred_angles=last_out.pred_angles,
+            pred_keypoints=last_out.pred_keypoints,
+            pred_polarity=last_out.pred_polarity,
+            behavior=behavior_pred,
+            track_ids=track_ids_out,
+            behavior_rows=behavior_rows,
         )
+
+    # ------------------------------------------------------------------ #
+    # forward のヘルパー
+    # ------------------------------------------------------------------ #
+
+    def _det_obb(self, det: Dict) -> torch.Tensor:
+        """
+        検出 dict から OBB (N, 5) を取り出す。
+
+        OBB detector でない場合は theta=0 の OBB に昇格させる。これにより
+        下流 (tracking / behavior) は常に OBB を前提に書ける。
+        """
+        if "obb" in det:
+            return det["obb"]
+        return cxcywh_to_obb(det["boxes"])
+
+    def _build_track_aligned(
+        self,
+        per_frame: List[List[Dict]],
+        B: int,
+        T: int,
+        device: torch.device,
+        track_ids_per_frame: Optional[List[List[Sequence[int]]]],
+    ):
+        """
+        窓内の検出列に track_id を付け、track 単位の履歴テンソルへ組み立てる。
+
+        ``track_ids_per_frame`` が与えられればそれを使う (学習時の teacher forcing)。
+        無ければ内部 tracker が幾何 + 外観で関連付ける。tracker は窓ごとに新規作成
+        するので、この forward は窓に対して自己完結する (streaming 推論は
+        ``StreamingInferencer`` が持続的な tracker を保持する)。
+        """
+        from ..tracking import OnlineTracker
+
+        sequences: List[List[FrameDetections]] = []
+        for b in range(B):
+            tracker = None
+            if track_ids_per_frame is None:
+                tracker = OnlineTracker.from_config(
+                    self.cfg.tracking,
+                    feat_dim=self.detector.get_hidden_dim(),
+                    window=T,
+                    device=device,
+                )
+            frames: List[FrameDetections] = []
+            for t in range(T):
+                det = per_frame[t][b]
+                feats = det["features"]
+                obb = self._det_obb(det)
+                if track_ids_per_frame is not None:
+                    tids = list(track_ids_per_frame[b][t])
+                else:
+                    # tracking は離散的な割当なので勾配は流さない (特徴側には流れる)
+                    tracked = tracker.update(
+                        frame_index=t,
+                        det_obb=obb.detach(),
+                        det_features=feats.detach(),
+                        has_obb="obb" in det,
+                    )
+                    tids = [0] * feats.shape[0]
+                    for obj in tracked:
+                        tids[obj.detection_index] = obj.track_id
+                frames.append(FrameDetections(feats, obb, tids))
+            sequences.append(frames)
+
+        return build_track_aligned_history(
+            sequences,
+            window=T,
+            feat_dim=self.detector.get_hidden_dim(),
+            device=device,
+            dtype=per_frame[-1][0]["features"].dtype,
+        )
+
+    @staticmethod
+    def _gather_by_rows(
+        source: torch.Tensor,
+        rows: List[List[int]],
+        det_results: List[Dict],
+    ) -> torch.Tensor:
+        """
+        track 単位のテンソル (M, D) を、現フレームの検出順 (N_total, D) に並べ直す。
+
+        track 履歴が無い検出 (rows が -1) はゼロ行になる。
+        """
+        flat_rows: List[int] = []
+        for b, det in enumerate(det_results):
+            n = det["features"].shape[0]
+            r = rows[b] if b < len(rows) else []
+            for i in range(n):
+                flat_rows.append(r[i] if i < len(r) else -1)
+
+        if not flat_rows:
+            return source.new_zeros(0, source.shape[-1])
+
+        idx = torch.tensor(flat_rows, dtype=torch.long, device=source.device)
+        valid = idx >= 0
+        out = source.new_zeros(len(flat_rows), source.shape[-1])
+        if valid.any() and source.shape[0] > 0:
+            out[valid] = source[idx[valid]]
+        return out
+
+    @staticmethod
+    def _flatten_detections(
+        det_results: List[Dict], device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """バッチ内の検出を 1 本のテンソルに平坦化する。"""
+        feats, boxes, bidx = [], [], []
+        for b, det in enumerate(det_results):
+            n = det["features"].shape[0]
+            if n == 0:
+                continue
+            feats.append(det["features"])
+            boxes.append(det["boxes"])
+            bidx.extend([b] * n)
+
+        if not feats:
+            ref = det_results[0]["features"] if det_results else torch.zeros(0, 1)
+            return {
+                "features": ref.new_zeros(0, ref.shape[-1] if ref.ndim > 1 else 1),
+                "boxes": ref.new_zeros(0, 4),
+                "batch_index": torch.zeros(0, dtype=torch.long, device=device),
+            }
+        return {
+            "features": torch.cat(feats, dim=0),
+            "boxes": torch.cat(boxes, dim=0),
+            "batch_index": torch.tensor(bidx, dtype=torch.long, device=device),
+        }
+
+    def _run_behavior(
+        self,
+        aligned,
+        last_out: DetectionOutput,
+        temporal_last: torch.Tensor,
+        det_results: List[Dict],
+    ) -> Optional[BehaviorPrediction]:
+        """
+        BehaviorBranch を track 単位で走らせる。
+
+        actor / context crop は detector の最高解像度 FPN レベルから取る
+        (P2 有効なら stride 4、無効なら stride 8)。細かい姿勢を見る actor stream に
+        とって解像度が効くため。
+        """
+        if aligned.num_tracks == 0:
+            return None
+
+        cfg_b = self.cfg.behavior
+        spatial = None
+        if cfg_b.use_actor or cfg_b.use_context:
+            enc = last_out.encoder_features
+            if not enc:
+                return None
+            spatial = enc[0]   # 最高解像度レベル
+
+        detector_feats = None
+        if cfg_b.use_detector_feat:
+            # track ごとの「最後に観測された」検出特徴 = 履歴の最終フレーム
+            detector_feats = aligned.features[:, -1]
+
+        keypoints = None
+        if "pose" in self.behavior.group_dims:
+            keypoints = self._scatter_to_tracks(
+                det_results, aligned, key="keypoints",
+                num_rows=aligned.num_tracks,
+            )
+            if keypoints is None:
+                # pose head が無効 / このフレームに検出が無い等でキーポイントが
+                # 得られない場合はゼロで埋める (行動推論を止めない)。
+                K = self.cfg.detector.pose.num_keypoints
+                keypoints = aligned.obb.new_zeros(aligned.num_tracks, K, 3)
+
+        return self.behavior(
+            obb_history=aligned.obb,
+            history_mask=aligned.mask,
+            spatial_features=spatial,
+            batch_index=aligned.batch_index,
+            detector_features=detector_feats,
+            temporal_features=temporal_last if cfg_b.use_temporal else None,
+            keypoints=keypoints,
+        )
+
+    @staticmethod
+    def _scatter_to_tracks(
+        det_results: List[Dict],
+        aligned,
+        key: str,
+        num_rows: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        現フレームの検出ごとの値を track 行へ配置する (検出順 → track 順)。
+
+        現フレームに現れない track の行はゼロのまま残る。pose のように
+        「検出にはあるが track 履歴には持っていない」値を behavior へ渡すのに使う。
+        """
+        parts = [d[key] for d in det_results if key in d and d[key].shape[0] > 0]
+        if not parts:
+            return None
+
+        sample = parts[0]
+        out = sample.new_zeros((num_rows,) + tuple(sample.shape[1:]))
+        for b, det in enumerate(det_results):
+            if key not in det:
+                continue
+            rows = aligned.current_rows[b] if b < len(aligned.current_rows) else []
+            values = det[key]
+            for i in range(min(len(rows), values.shape[0])):
+                if rows[i] >= 0:
+                    out[rows[i]] = values[i]
+        return out
+
+    def _run_id_head(
+        self,
+        det_results: List[Dict],
+        id_feat: torch.Tensor,
+        all_boxes_cat: torch.Tensor,
+        memory_list: Optional[List[IdentityMemory]],
+        device: torch.device,
+        B: int,
+    ):
+        """ID head (学習: GT ベース / 推論: memory マッチング)。"""
+        if self.training:
+            id_logits_list, id_emb_list = [], []
+            ptr = 0
+            for b in range(B):
+                n = det_results[b]["features"].shape[0]
+                if n == 0:
+                    continue
+                feat_b = id_feat[ptr:ptr + n]
+                box_b = all_boxes_cat[ptr:ptr + n]
+                vel_b = torch.zeros(n, 2, device=feat_b.device, dtype=feat_b.dtype)
+                x_b = self.id_head._build_input(feat_b, box_b, vel_b)
+                h = torch.zeros(
+                    n, self.cfg.id_head.memory_dim,
+                    device=feat_b.device, dtype=feat_b.dtype,
+                )
+                _, emb = self.id_head.memory_net(x_b, h)
+                id_logits_list.append(self.id_head.id_classifier(emb))
+                id_emb_list.append(emb)
+                ptr += n
+
+            if id_logits_list:
+                return torch.cat(id_logits_list, 0), torch.cat(id_emb_list, 0)
+            return None, None
+
+        # --- 推論: memory を使って ID を割り当てる ---
+        if memory_list is None:
+            memory_list = [self.id_head.create_memory(device) for _ in range(B)]
+        id_emb_list = []
+        ptr = 0
+        for b in range(B):
+            n = det_results[b]["features"].shape[0]
+            feat_b = id_feat[ptr:ptr + n]
+            box_b = all_boxes_cat[ptr:ptr + n]
+            inf_out = self.id_head.forward_inference(feat_b, box_b, memory_list[b])
+            det_results[b]["track_ids"] = inf_out["track_ids"]
+            det_results[b]["id_scores"] = inf_out["id_scores"]
+            id_emb_list.append(inf_out["embeddings"])
+            ptr += n
+
+        if id_emb_list:
+            return None, torch.cat(id_emb_list, 0)
+        return None, None
 
     # ------------------------------------------------------------------ #
     # Forward (単一フレーム — Stage 1 用)
@@ -432,6 +778,10 @@ class HTRTDETR(nn.Module):
             pred_boxes=det_out.pred_boxes,
             query_features=det_out.query_features,
             aux_outputs=det_out.aux_outputs,
+            pred_obb=det_out.pred_obb,
+            pred_angles=det_out.pred_angles,
+            pred_keypoints=det_out.pred_keypoints,
+            pred_polarity=det_out.pred_polarity,
         )
 
     # ------------------------------------------------------------------ #

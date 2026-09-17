@@ -1,7 +1,18 @@
 """
 annotation.py — アノテーション仕様・検証・ユーティリティ
 
-=== Annotation Format Specification (v1.1) ===
+=== Annotation Format Specification (v2.0) ===
+
+v2.0 の変更点 (すべて **後方互換**):
+  * ``obb``       — 回転矩形 (任意)。dict / 5要素配列 / 4頂点8要素配列のいずれでも可。
+  * ``keypoints`` — pose (任意)。[[x, y, v], ...] または COCO 互換のフラット配列。
+  * ``keypoint_names`` / ``action_groups`` — データセットレベルの任意定義。
+
+v1.1 のファイルはそのまま読める (obb なしとして扱われ、必要時に theta=0 で導出)。
+OBB を持たないデータを保存すると v1.1 と同一の形になるので、旧ツールでも読める。
+移行は ``migrate_annotation()`` / ``migrate_annotation_file()`` を使う。
+
+
 
 ファイル形式: JSON (UTF-8)
 
@@ -37,7 +48,10 @@ annotation.py — アノテーション仕様・検証・ユーティリティ
               "track_id": 1,            // 動画全体でユニーク
               "action_id": 0,           // -1 = unannotated
               "occluded": false,        // optional
-              "is_crowd": false         // optional
+              "is_crowd": false,        // optional
+              // --- v2.0 optional ---
+              "obb": {"cx": 100, "cy": 200, "w": 40, "h": 15, "angle": 0.52},
+              "keypoints": [[100, 195, 2], [100, 205, 2]]
             }
           ]
         }
@@ -58,26 +72,84 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
 
 # ---------------------------------------------------------------------------
 # 内部データ表現 (既存 dataset.py の ObjectAnnotation / FrameAnnotation と互換)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ObjectAnno:
-    """1 フレーム内の 1 個体アノテーション"""
+    """
+    1 フレーム内の 1 個体アノテーション。
+
+    v2.0 で ``obb`` (回転矩形) と ``keypoints`` (任意 pose) を追加した。いずれも
+    Optional なので、v1.1 の bbox のみのデータもそのまま読み書きできる。
+
+    Attributes:
+        bbox: [x1, y1, x2, y2] pixel — **常に存在する**。obb がある場合はその外接矩形。
+        obb: [cx, cy, w, h, theta] pixel / rad。None なら回転アノテーションなし。
+        obb_source: "annotated" = 人手/モデルによる真の回転矩形、
+                    "derived"   = AABB から theta=0 で機械的に導出した代用値。
+                    derived は**真の回転アノテーションではない**ため、学習時に
+                    角度損失から除外され migration 時に警告される。
+        keypoints: [[x, y, v], ...] pixel。v は 0=未ラベル, 1=隠れ, 2=可視。
+                   None なら pose アノテーションなし (pose_enabled=False で動作)。
+    """
+
     object_id: int
-    bbox: List[float]          # [x1, y1, x2, y2] pixel coords
+    bbox: List[float]  # [x1, y1, x2, y2] pixel coords
     class_id: int = 0
     track_id: int = -1
     action_id: int = -1
     occluded: bool = False
     is_crowd: bool = False
+    obb: Optional[List[float]] = None  # [cx, cy, w, h, theta]
+    obb_source: str = "none"  # "none" | "annotated" | "derived"
+    keypoints: Optional[List[List[float]]] = None  # [[x, y, v], ...]
+
+    source: str = "human"
+    score: Optional[float] = None
+    provenance: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_obb(self) -> bool:
+        """真の回転アノテーションを持つか (derived は False)。"""
+        return self.obb is not None and self.obb_source == "annotated"
+
+    def get_obb(self) -> List[float]:
+        """
+        OBB を返す。未設定なら bbox から theta=0 で導出する (安全な fallback)。
+
+        戻り値が真のアノテーションか導出値かは ``has_obb`` で判定すること。
+        """
+        if self.obb is not None:
+            return list(self.obb)
+        x1, y1, x2, y2 = self.bbox
+        return [(x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, 0.0), max(y2 - y1, 0.0), 0.0]
+
+    def obb_corners(self) -> List[List[float]]:
+        """OBB の 4 頂点 [[x, y], ...] (反時計回り) を返す。GUI 描画用。"""
+        cx, cy, w, h, th = self.get_obb()
+        hw, hh = w / 2, h / 2
+        cos_t, sin_t = math.cos(th), math.sin(th)
+        return [
+            [cx + lx * cos_t - ly * sin_t, cy + lx * sin_t + ly * cos_t]
+            for lx, ly in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))
+        ]
+
+    def sync_bbox_from_obb(self) -> None:
+        """obb の外接矩形で bbox を更新する (OBB 編集後の整合性維持)。"""
+        if self.obb is None:
+            return
+        corners = self.obb_corners()
+        xs = [p[0] for p in corners]
+        ys = [p[1] for p in corners]
+        self.bbox = [min(xs), min(ys), max(xs), max(ys)]
 
     def bbox_normalized(self, w: int, h: int) -> List[float]:
         """pixel → [0,1] 正規化 (xyxy のまま)"""
@@ -97,6 +169,7 @@ class ObjectAnno:
 @dataclass
 class FrameAnno:
     """1 フレームのアノテーション"""
+
     frame_index: int
     image_path: str
     width: int = 0
@@ -107,6 +180,7 @@ class FrameAnno:
 @dataclass
 class VideoAnno:
     """1 動画のアノテーション"""
+
     video_id: str
     fps: float = 25.0
     width: int = 0
@@ -118,13 +192,46 @@ class VideoAnno:
 
 @dataclass
 class DatasetAnno:
-    """データセット全体"""
+    """
+    データセット全体。
+
+    v2.0 で ``keypoint_names`` (pose) と ``action_groups`` (階層/multi-head 行動定義)
+    を追加した。いずれも空でよく、その場合は v1.1 と完全に同じ挙動になる。
+    """
+
     meta: Dict[str, Any] = field(default_factory=dict)
     class_names: List[str] = field(default_factory=lambda: ["fly"])
     action_names: List[str] = field(
         default_factory=lambda: ["idle", "walk", "groom", "court", "other"]
     )
     videos: List[VideoAnno] = field(default_factory=list)
+    # v2.0: pose を使う場合のキーポイント名 (空なら pose 無し)
+    keypoint_names: List[str] = field(default_factory=list)
+    # v2.0: multi-head / hierarchical 行動分類の定義
+    #   {"locomotion": ["stationary","walking","running"], "social": [...]}
+    action_groups: Dict[str, List[str]] = field(default_factory=dict)
+
+    @property
+    def schema_version(self) -> str:
+        return str(self.meta.get("version", "1.1"))
+
+    @property
+    def num_keypoints(self) -> int:
+        return len(self.keypoint_names)
+
+    def has_obb(self) -> bool:
+        """真の回転アノテーションを 1 つでも含むか。"""
+        return any(obj.has_obb for v in self.videos for fr in v.frames for obj in fr.objects)
+
+    def obb_coverage(self) -> Tuple[int, int]:
+        """(真の OBB を持つ物体数, 総物体数) を返す。"""
+        total = annotated = 0
+        for v in self.videos:
+            for fr in v.frames:
+                for obj in fr.objects:
+                    total += 1
+                    annotated += int(obj.has_obb)
+        return annotated, total
 
     @property
     def num_classes(self) -> int:
@@ -154,8 +261,122 @@ class DatasetAnno:
 # JSON 読み込み / 保存
 # ---------------------------------------------------------------------------
 
+
+def parse_obb_field(raw_obb: Any) -> Optional[List[float]]:
+    """
+    JSON の ``obb`` フィールドを [cx, cy, w, h, theta] に正規化する。
+
+    受け付ける 3 形式 (どれで書かれていても読める):
+      1. dict        {"cx":.., "cy":.., "w":.., "h":.., "angle":..}
+                     ("theta" / "rotation" も angle の別名として受理)
+      2. 5 要素配列   [cx, cy, w, h, theta]
+      3. 8 要素配列   [x1,y1, x2,y2, x3,y3, x4,y4]  — 4 頂点表現
+
+    Returns:
+        [cx, cy, w, h, theta] または解釈できない場合 None
+    """
+    if raw_obb is None:
+        return None
+
+    if isinstance(raw_obb, dict):
+        try:
+            angle = raw_obb.get("angle", raw_obb.get("theta", raw_obb.get("rotation", 0.0)))
+            return [
+                float(raw_obb["cx"]),
+                float(raw_obb["cy"]),
+                float(raw_obb["w"]),
+                float(raw_obb["h"]),
+                float(angle),
+            ]
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    if isinstance(raw_obb, (list, tuple)):
+        vals = [float(v) for v in raw_obb]
+        if len(vals) == 5:
+            return vals
+        if len(vals) == 8:
+            return corners_to_obb_list(vals)
+    return None
+
+
+def corners_to_obb_list(flat: List[float]) -> List[float]:
+    """
+    4 頂点 [x1,y1,...,x4,y4] → [cx, cy, w, h, theta]。
+
+    幅方向の辺 (頂点0→1) を theta とし、box ローカル軸への射影幅を w/h にする。
+    厳密な長方形なら厳密に復元し、歪んだ四角形でも破綻せず妥当な OBB を返す。
+    geometry/obb.py の ``corners_to_obb`` と同じ定義 (torch 非依存の純 Python 版)。
+    """
+    pts = [(flat[i], flat[i + 1]) for i in range(0, 8, 2)]
+    cx = sum(p[0] for p in pts) / 4.0
+    cy = sum(p[1] for p in pts) / 4.0
+    theta = math.atan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0])
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    loc_x = [(p[0] - cx) * cos_t + (p[1] - cy) * sin_t for p in pts]
+    loc_y = [-(p[0] - cx) * sin_t + (p[1] - cy) * cos_t for p in pts]
+    w = max(loc_x) - min(loc_x)
+    h = max(loc_y) - min(loc_y)
+    return [cx, cy, w, h, normalize_theta(theta)]
+
+
+def normalize_theta(theta: float) -> float:
+    """theta を半開区間 [-pi/2, pi/2) に畳む (矩形の周期は pi)。"""
+    out = (theta + math.pi / 2) % math.pi - math.pi / 2
+    if out >= math.pi / 2 - 1e-6:
+        out -= math.pi
+    return out
+
+
+def _parse_object(obj: Dict[str, Any], index: int) -> ObjectAnno:
+    """1 個体の dict → ObjectAnno (v1.1 / v2.0 の両方を受理)。"""
+    obb = parse_obb_field(obj.get("obb"))
+
+    bbox = obj.get("bbox")
+    if bbox is None and obb is not None:
+        # OBB のみのアノテーション: 外接矩形を bbox として補う
+        cx, cy, w, h, th = obb
+        hw, hh = w / 2, h / 2
+        cos_t, sin_t = math.cos(th), math.sin(th)
+        xs, ys = [], []
+        for lx, ly in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)):
+            xs.append(cx + lx * cos_t - ly * sin_t)
+            ys.append(cy + lx * sin_t + ly * cos_t)
+        bbox = [min(xs), min(ys), max(xs), max(ys)]
+    elif bbox is None:
+        raise ValueError(f"object #{index}: 'bbox' も 'obb' も存在しません")
+
+    kpts = obj.get("keypoints")
+    if kpts is not None:
+        # [x,y,v,x,y,v,...] のフラット形式 (COCO 互換) も受理する
+        if kpts and not isinstance(kpts[0], (list, tuple)):
+            kpts = [list(kpts[i : i + 3]) for i in range(0, len(kpts) - 2, 3)]
+        kpts = [[float(c) for c in kp] for kp in kpts]
+
+    return ObjectAnno(
+        object_id=obj.get("object_id", index),
+        bbox=[float(v) for v in bbox],
+        class_id=obj.get("class_id", 0),
+        track_id=obj.get("track_id", -1),
+        action_id=obj.get("action_id", -1),
+        occluded=obj.get("occluded", False),
+        is_crowd=obj.get("is_crowd", False),
+        obb=obb,
+        obb_source=obj.get("obb_source", "annotated" if obb is not None else "none"),
+        keypoints=kpts,
+        source=obj.get("source", "human"),
+        score=obj.get("score"),
+        provenance=dict(obj.get("provenance", {})),
+    )
+
+
 def load_annotation(path: str) -> DatasetAnno:
-    """JSON アノテーションファイルを読み込み DatasetAnno を返す"""
+    """
+    JSON アノテーションファイルを読み込み DatasetAnno を返す。
+
+    v1.1 (bbox のみ) と v2.0 (obb / keypoints 付き) の両方を読める。v1.1 のファイルは
+    obb=None のまま読み込まれ、``ObjectAnno.get_obb()`` が必要時に theta=0 で導出する。
+    """
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
@@ -175,38 +396,38 @@ def load_annotation(path: str) -> DatasetAnno:
             f_height = fr.get("height", v_height)
 
             for i, obj in enumerate(fr.get("objects", [])):
-                objects.append(ObjectAnno(
-                    object_id=obj.get("object_id", i),
-                    bbox=obj["bbox"],
-                    class_id=obj.get("class_id", 0),
-                    track_id=obj.get("track_id", -1),
-                    action_id=obj.get("action_id", -1),
-                    occluded=obj.get("occluded", False),
-                    is_crowd=obj.get("is_crowd", False),
-                ))
-            frames.append(FrameAnno(
-                frame_index=fr["frame_index"],
-                image_path=fr["image_path"],
-                width=f_width,
-                height=f_height,
-                objects=objects,
-            ))
+                objects.append(_parse_object(obj, i))
+            frames.append(
+                FrameAnno(
+                    frame_index=fr["frame_index"],
+                    image_path=fr.get(
+                        "image_path", f"images/{v['video_id']}/{fr['frame_index']:06d}.jpg"
+                    ),
+                    width=f_width,
+                    height=f_height,
+                    objects=objects,
+                )
+            )
 
-        videos.append(VideoAnno(
-            video_id=v["video_id"],
-            fps=v.get("fps", meta.get("fps_default", 25.0)),
-            width=v_width,
-            height=v_height,
-            num_frames=v.get("num_frames", len(frames)),
-            video_path=v.get("video_path", ""),
-            frames=frames,
-        ))
+        videos.append(
+            VideoAnno(
+                video_id=v["video_id"],
+                fps=v.get("fps", meta.get("fps_default", 25.0)),
+                width=v_width,
+                height=v_height,
+                num_frames=v.get("num_frames", len(frames)),
+                video_path=v.get("video_path", ""),
+                frames=frames,
+            )
+        )
 
     return DatasetAnno(
         meta=meta,
         class_names=class_names,
         action_names=action_names,
         videos=videos,
+        keypoint_names=raw.get("keypoint_names", []),
+        action_groups=raw.get("action_groups", {}),
     )
 
 
@@ -228,8 +449,7 @@ def _read_yolo_label(label_file: Path) -> List[Tuple[int, float, float, float, f
             if len(parts) < 5:
                 continue
             cid = int(float(parts[0]))
-            cx, cy, w, h = (float(parts[1]), float(parts[2]),
-                            float(parts[3]), float(parts[4]))
+            cx, cy, w, h = (float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]))
             rows.append((cid, cx, cy, w, h))
     return rows
 
@@ -238,12 +458,14 @@ def _probe_image_size(path: Path) -> Tuple[int, int]:
     """Return (width, height) of an image. Falls back to (0, 0) if unreadable."""
     try:
         from PIL import Image
+
         with Image.open(path) as im:
             return int(im.width), int(im.height)
     except Exception:
         pass
     try:
         import cv2
+
         img = cv2.imread(str(path))
         if img is not None:
             h, w = img.shape[:2]
@@ -319,8 +541,7 @@ def load_yolo_annotation(
 
     # Gather image files
     image_files = sorted(
-        p for p in img_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in _YOLO_IMAGE_EXTS
+        p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in _YOLO_IMAGE_EXTS
     )
     if not image_files:
         raise FileNotFoundError(f"No YOLO images found in {img_dir}")
@@ -376,39 +597,46 @@ def load_yolo_annotation(
                     x2 = (cx + bw / 2.0) * fw
                     y2 = (cy + bh / 2.0) * fh
                 obj_uid += 1
-                objects.append(ObjectAnno(
-                    object_id=obj_uid,
-                    bbox=[round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
-                    class_id=int(cid),
-                    track_id=-1,
-                    action_id=-1,
-                ))
+                objects.append(
+                    ObjectAnno(
+                        object_id=obj_uid,
+                        bbox=[round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                        class_id=int(cid),
+                        track_id=-1,
+                        action_id=-1,
+                    )
+                )
             try:
                 rel_path = str(img_path.relative_to(root))
             except ValueError:
                 rel_path = str(img_path)
-            frames.append(FrameAnno(
-                frame_index=int(fi),
-                image_path=rel_path.replace("\\", "/"),
-                width=fw,
-                height=fh,
-                objects=objects,
-            ))
-        videos.append(VideoAnno(
-            video_id=vid,
-            fps=fps,
-            width=first_w,
-            height=first_h,
-            num_frames=len(frames),
-            frames=frames,
-        ))
+            frames.append(
+                FrameAnno(
+                    frame_index=int(fi),
+                    image_path=rel_path.replace("\\", "/"),
+                    width=fw,
+                    height=fh,
+                    objects=objects,
+                )
+            )
+        videos.append(
+            VideoAnno(
+                video_id=vid,
+                fps=fps,
+                width=first_w,
+                height=first_h,
+                num_frames=len(frames),
+                frames=frames,
+            )
+        )
 
     return DatasetAnno(
         meta={
             "version": "1.1",
             "source_format": "yolo",
-            "image_root": str(img_dir.relative_to(root)).replace("\\", "/")
-            if img_dir != root else "",
+            "image_root": (
+                str(img_dir.relative_to(root)).replace("\\", "/") if img_dir != root else ""
+            ),
         },
         class_names=class_names,
         action_names=list(class_names),
@@ -416,7 +644,49 @@ def load_yolo_annotation(
     )
 
 
-def save_annotation(anno: DatasetAnno, path: str) -> None:
+def _object_to_dict(obj: ObjectAnno, *, preserve_derived: bool = False) -> Dict[str, Any]:
+    """
+    ObjectAnno → JSON dict。
+
+    v1.1 のキーは常にそのまま出力し、v2.0 の追加キー (obb / keypoints) は値が
+    あるときだけ足す。よって OBB を持たないデータを保存すると v1.1 と
+    バイト単位で同じ形になり、旧ツールでも読める。
+    ``derived`` な OBB (AABB からの代用値) は情報量ゼロなので書き出さない。
+    """
+    d: Dict[str, Any] = {
+        "object_id": obj.object_id,
+        "bbox": obj.bbox,
+        "class_id": obj.class_id,
+        "track_id": obj.track_id,
+        "action_id": obj.action_id,
+    }
+    if obj.occluded:
+        d["occluded"] = obj.occluded
+    if obj.is_crowd:
+        d["is_crowd"] = obj.is_crowd
+    if obj.obb is not None and (obj.obb_source == "annotated" or preserve_derived):
+        cx, cy, w, h, th = obj.obb
+        d["obb"] = {
+            "cx": round(float(cx), 3),
+            "cy": round(float(cy), 3),
+            "w": round(float(w), 3),
+            "h": round(float(h), 3),
+            "angle": round(float(th), 6),
+        }
+    if preserve_derived and obj.obb is not None:
+        d["obb_source"] = obj.obb_source
+    if obj.source != "human":
+        d["source"] = obj.source
+    if obj.score is not None:
+        d["score"] = obj.score
+    if obj.provenance:
+        d["provenance"] = obj.provenance
+    if obj.keypoints:
+        d["keypoints"] = [[round(float(c), 2) for c in kp] for kp in obj.keypoints]
+    return d
+
+
+def save_annotation(anno: DatasetAnno, path: str, *, preserve_derived: bool = False) -> None:
     """DatasetAnno を JSON ファイルに保存する"""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -429,16 +699,7 @@ def save_annotation(anno: DatasetAnno, path: str) -> None:
             d["width"] = fr.width
             d["height"] = fr.height
         d["objects"] = [
-            {
-                "object_id": obj.object_id,
-                "bbox": obj.bbox,
-                "class_id": obj.class_id,
-                "track_id": obj.track_id,
-                "action_id": obj.action_id,
-                **({"occluded": obj.occluded} if obj.occluded else {}),
-                **({"is_crowd": obj.is_crowd} if obj.is_crowd else {}),
-            }
-            for obj in fr.objects
+            _object_to_dict(obj, preserve_derived=preserve_derived) for obj in fr.objects
         ]
         return d
 
@@ -448,6 +709,11 @@ def save_annotation(anno: DatasetAnno, path: str) -> None:
         "action_names": anno.action_names,
         "videos": [],
     }
+    # v2.0 の任意フィールドは中身があるときだけ書き出す (v1.1 との差分を最小に保つ)
+    if anno.keypoint_names:
+        out["keypoint_names"] = anno.keypoint_names
+    if anno.action_groups:
+        out["action_groups"] = anno.action_groups
     for v in anno.videos:
         vd: Dict[str, Any] = {
             "video_id": v.video_id,
@@ -461,13 +727,132 @@ def save_annotation(anno: DatasetAnno, path: str) -> None:
         vd["frames"] = [_frame_to_dict(fr) for fr in v.frames]
         out["videos"].append(vd)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+    from ..annotation.storage import atomic_json
+
+    atomic_json(Path(path), out)
+
+
+# ---------------------------------------------------------------------------
+# スキーマ移行 (v1.1 → v2.0)
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION = "2.0"
+
+
+@dataclass
+class MigrationReport:
+    """migrate_annotation の結果サマリ。"""
+
+    from_version: str
+    to_version: str
+    num_objects: int = 0
+    num_obb_annotated: int = 0  # 元から真の OBB を持っていた物体
+    num_obb_derived: int = 0  # AABB から theta=0 で導出した物体
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def obb_ratio(self) -> float:
+        return self.num_obb_annotated / max(self.num_objects, 1)
+
+    def __str__(self) -> str:
+        lines = [
+            f"Annotation schema {self.from_version} -> {self.to_version}",
+            f"  objects:       {self.num_objects}",
+            f"  true OBB:      {self.num_obb_annotated} ({self.obb_ratio*100:.1f}%)",
+            f"  derived OBB:   {self.num_obb_derived} (theta=0 fallback)",
+        ]
+        lines.extend(f"  [WARN] {w}" for w in self.warnings)
+        return "\n".join(lines)
+
+
+def migrate_annotation(
+    anno: DatasetAnno,
+    derive_obb: bool = False,
+    keypoint_names: Optional[List[str]] = None,
+    action_groups: Optional[Dict[str, List[str]]] = None,
+) -> MigrationReport:
+    """
+    アノテーションを v2.0 スキーマへ **in-place** で移行する。
+
+    v1.1 → v2.0 の実体は「meta.version の更新」と「任意フィールドの追加」だけで、
+    既存の bbox / class_id / track_id / action_id は一切変更しない。よって移行は
+    常に可逆かつ非破壊で、移行しなくても新コードは v1.1 をそのまま読める
+    (この関数は「明示的に v2.0 として保存したい」ときに使う)。
+
+    Args:
+        anno: 対象データセット (破壊的に更新される)
+        derive_obb: True のとき、OBB を持たない物体に AABB 由来の theta=0 OBB を
+            ``obb_source="derived"`` で書き込む。**真の回転アノテーションではない**
+            ため学習時に角度損失から除外される。既定 False (必要時のみ明示的に)。
+        keypoint_names: pose を使う場合のキーポイント名
+        action_groups: multi-head / hierarchical 行動分類の定義
+
+    Returns:
+        MigrationReport — 統計と警告
+
+    Example::
+
+        anno = load_annotation("old.json")
+        report = migrate_annotation(anno)
+        print(report)
+        save_annotation(anno, "new_v2.json")
+    """
+    report = MigrationReport(
+        from_version=str(anno.meta.get("version", "1.1")),
+        to_version=SCHEMA_VERSION,
+    )
+
+    for v in anno.videos:
+        for fr in v.frames:
+            for obj in fr.objects:
+                report.num_objects += 1
+                if obj.has_obb:
+                    report.num_obb_annotated += 1
+                elif derive_obb and obj.obb is None:
+                    obj.obb = obj.get_obb()
+                    obj.obb_source = "derived"
+                    report.num_obb_derived += 1
+
+    if keypoint_names is not None:
+        anno.keypoint_names = list(keypoint_names)
+    if action_groups is not None:
+        anno.action_groups = dict(action_groups)
+
+    anno.meta["version"] = SCHEMA_VERSION
+    anno.meta.setdefault("migrated_from", report.from_version)
+
+    if report.num_obb_derived > 0:
+        report.warnings.append(
+            f"{report.num_obb_derived} 個の物体に theta=0 の代用 OBB を付与しました。"
+            "これは真の回転アノテーションではないため、OBB detector の角度損失からは "
+            "除外されます (obb_source='derived')。回転性能を出すには実際の回転 "
+            "アノテーションが必要です。"
+        )
+    if report.num_objects > 0 and report.num_obb_annotated == 0:
+        report.warnings.append(
+            "真の OBB アノテーションが 1 つもありません。detector.type='rtdetr_obb' で "
+            "学習しても角度は学習されず、実質 AABB detector として振る舞います。"
+        )
+    return report
+
+
+def migrate_annotation_file(
+    src: str,
+    dst: str,
+    derive_obb: bool = False,
+    **kwargs: Any,
+) -> MigrationReport:
+    """ファイル単位で v2.0 へ移行する (load → migrate → save)。"""
+    anno = load_annotation(src)
+    report = migrate_annotation(anno, derive_obb=derive_obb, **kwargs)
+    save_annotation(anno, dst)
+    return report
 
 
 # ---------------------------------------------------------------------------
 # アノテーション検証
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ValidationResult:
@@ -497,17 +882,18 @@ def validate_annotation(anno: DatasetAnno) -> ValidationResult:
 
     num_classes = len(anno.class_names)
     num_actions = len(anno.action_names)
+    num_keypoints = len(anno.keypoint_names)
 
     for v in anno.videos:
         if v.width <= 0 or v.height <= 0:
-            result.warnings.append(f"Video {v.video_id}: missing/invalid size ({v.width}×{v.height})")
+            result.warnings.append(
+                f"Video {v.video_id}: missing/invalid size ({v.width}×{v.height})"
+            )
 
         frame_indices = set()
         for fr in v.frames:
             if fr.frame_index in frame_indices:
-                result.errors.append(
-                    f"Video {v.video_id}: duplicate frame_index {fr.frame_index}"
-                )
+                result.errors.append(f"Video {v.video_id}: duplicate frame_index {fr.frame_index}")
                 result.valid = False
             frame_indices.add(fr.frame_index)
 
@@ -549,12 +935,60 @@ def validate_annotation(anno: DatasetAnno) -> ValidationResult:
                     )
                     result.valid = False
 
+                # --- v2.0: OBB ---
+                if obj.obb is not None:
+                    if len(obj.obb) != 5:
+                        result.errors.append(
+                            f"Video {v.video_id} Frame {fr.frame_index} Obj {obj.object_id}: "
+                            f"obb must have 5 values [cx,cy,w,h,theta], got {len(obj.obb)}"
+                        )
+                        result.valid = False
+                    else:
+                        ow, oh = obj.obb[2], obj.obb[3]
+                        if ow <= 0 or oh <= 0:
+                            result.errors.append(
+                                f"Video {v.video_id} Frame {fr.frame_index} Obj {obj.object_id}: "
+                                f"obb has non-positive size (w={ow}, h={oh})"
+                            )
+                            result.valid = False
+                        if abs(obj.obb[4]) > 2 * math.pi:
+                            result.warnings.append(
+                                f"Video {v.video_id} Frame {fr.frame_index} Obj {obj.object_id}: "
+                                f"obb angle {obj.obb[4]} looks like degrees, not radians"
+                            )
+
+                # --- v2.0: keypoints ---
+                if obj.keypoints is not None:
+                    if num_keypoints and len(obj.keypoints) != num_keypoints:
+                        result.warnings.append(
+                            f"Video {v.video_id} Frame {fr.frame_index} Obj {obj.object_id}: "
+                            f"{len(obj.keypoints)} keypoints but keypoint_names has "
+                            f"{num_keypoints}"
+                        )
+                    for kp in obj.keypoints:
+                        if len(kp) != 3:
+                            result.errors.append(
+                                f"Video {v.video_id} Frame {fr.frame_index} "
+                                f"Obj {obj.object_id}: keypoint must be [x, y, v], got {kp}"
+                            )
+                            result.valid = False
+                            break
+
+    # OBB カバレッジの通知 (エラーではないが学習前に知りたい情報)
+    annotated, total = anno.obb_coverage()
+    if 0 < annotated < total:
+        result.warnings.append(
+            f"OBB coverage {annotated}/{total} ({annotated/total*100:.1f}%): "
+            "OBB を持たない物体は角度損失から除外されます"
+        )
+
     return result
 
 
 # ---------------------------------------------------------------------------
 # サンプルアノテーション生成 (テスト・デバッグ用)
 # ---------------------------------------------------------------------------
+
 
 def generate_sample_annotation(
     num_videos: int = 3,
@@ -563,7 +997,7 @@ def generate_sample_annotation(
     image_width: int = 512,
     image_height: int = 512,
     fps: float = 25.0,
-    fly_size: int = 20,       # approx bbox size in pixels
+    fly_size: int = 20,  # approx bbox size in pixels
     seed: int = 42,
     action_names: Optional[List[str]] = None,
 ) -> DatasetAnno:
@@ -593,9 +1027,7 @@ def generate_sample_annotation(
     ]
     # num_actions が 5 以外の場合は uniform にする
     if num_actions != 5:
-        action_transition = [
-            [1.0 / num_actions] * num_actions for _ in range(num_actions)
-        ]
+        action_transition = [[1.0 / num_actions] * num_actions for _ in range(num_actions)]
 
     videos = []
     for v_idx in range(num_videos):
@@ -609,12 +1041,16 @@ def generate_sample_annotation(
             vx = rng.uniform(-2, 2)  # velocity
             vy = rng.uniform(-2, 2)
             action = rng.randint(0, num_actions - 1)
-            fly_states.append({
-                "track_id": f_idx + 1,
-                "x": x, "y": y,
-                "vx": vx, "vy": vy,
-                "action": action,
-            })
+            fly_states.append(
+                {
+                    "track_id": f_idx + 1,
+                    "x": x,
+                    "y": y,
+                    "vx": vx,
+                    "vy": vy,
+                    "action": action,
+                }
+            )
 
         frames = []
         for fi in range(num_frames_per_video):
@@ -646,30 +1082,36 @@ def generate_sample_annotation(
                 x2 = min(image_width, state["x"] + bw / 2)
                 y2 = min(image_height, state["y"] + bh / 2)
 
-                objects.append(ObjectAnno(
-                    object_id=obj_i + 1,
-                    bbox=[round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
-                    class_id=0,
-                    track_id=state["track_id"],
-                    action_id=state["action"],
-                ))
+                objects.append(
+                    ObjectAnno(
+                        object_id=obj_i + 1,
+                        bbox=[round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+                        class_id=0,
+                        track_id=state["track_id"],
+                        action_id=state["action"],
+                    )
+                )
 
-            frames.append(FrameAnno(
-                frame_index=fi,
-                image_path=f"images/{video_id}/{fi:06d}.jpg",
+            frames.append(
+                FrameAnno(
+                    frame_index=fi,
+                    image_path=f"images/{video_id}/{fi:06d}.jpg",
+                    width=image_width,
+                    height=image_height,
+                    objects=objects,
+                )
+            )
+
+        videos.append(
+            VideoAnno(
+                video_id=video_id,
+                fps=fps,
                 width=image_width,
                 height=image_height,
-                objects=objects,
-            ))
-
-        videos.append(VideoAnno(
-            video_id=video_id,
-            fps=fps,
-            width=image_width,
-            height=image_height,
-            num_frames=num_frames_per_video,
-            frames=frames,
-        ))
+                num_frames=num_frames_per_video,
+                frames=frames,
+            )
+        )
 
     return DatasetAnno(
         meta={
@@ -691,9 +1133,7 @@ def print_annotation_stats(anno: DatasetAnno) -> None:
     from collections import Counter
 
     total_frames = sum(len(v.frames) for v in anno.videos)
-    total_objects = sum(
-        len(fr.objects) for v in anno.videos for fr in v.frames
-    )
+    total_objects = sum(len(fr.objects) for v in anno.videos for fr in v.frames)
 
     print(f"=== Annotation Statistics ===")
     print(f"Videos:       {len(anno.videos)}")
@@ -709,8 +1149,11 @@ def print_annotation_stats(anno: DatasetAnno) -> None:
         for fr in v.frames:
             for obj in fr.objects:
                 if obj.action_id >= 0:
-                    name = anno.action_names[obj.action_id] \
-                        if obj.action_id < len(anno.action_names) else str(obj.action_id)
+                    name = (
+                        anno.action_names[obj.action_id]
+                        if obj.action_id < len(anno.action_names)
+                        else str(obj.action_id)
+                    )
                     action_counter[name] += 1
 
     if action_counter:

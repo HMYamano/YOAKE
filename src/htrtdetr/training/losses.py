@@ -24,6 +24,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config.config import LossConfig
+from ..geometry.obb import (
+    aabb_to_obb,
+    canonicalize_obb,
+    cxcywh_to_obb,
+    encode_angle,
+    normalize_angle,
+    probiou,
+    rotated_iou,
+)
 from ..utils.misc import generalized_box_iou, xyxy_to_cxcywh, cxcywh_to_xyxy
 
 
@@ -113,11 +122,16 @@ class HungarianMatcher(nn.Module):
         cost_class: float = 2.0,
         cost_bbox: float = 5.0,
         cost_giou: float = 2.0,
+        use_rotated: bool = False,
     ):
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
+        # OBB 検出時に localization cost を rotated IoU にするか。
+        # 接近して並ぶ細長い個体では、軸平行 GIoU だと隣の個体に引っ張られた
+        # マッチングになりやすいので、回転を考慮した重なりで評価する。
+        self.use_rotated = bool(use_rotated)
 
     @torch.no_grad()
     def forward(
@@ -125,6 +139,7 @@ class HungarianMatcher(nn.Module):
         pred_logits: torch.Tensor,  # (B, Q, C+1)
         pred_boxes: torch.Tensor,   # (B, Q, 4) [cx, cy, w, h]
         targets: List[Dict],        # B 個の dict: {boxes: (N_i, 4), class_ids: (N_i,)}
+        pred_obb: Optional[torch.Tensor] = None,  # (B, Q, 5)
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Returns:
@@ -139,6 +154,7 @@ class HungarianMatcher(nn.Module):
 
         B, Q = pred_logits.shape[:2]
         indices = []
+        rotated = self.use_rotated and pred_obb is not None
 
         for b in range(B):
             gt_boxes = targets[b]["boxes"]    # (N_i, 4)
@@ -163,11 +179,17 @@ class HungarianMatcher(nn.Module):
                 pred_boxes[b], gt_cxcywh, p=1
             )  # (Q, N_i)
 
-            # GIoU cost — both in xyxy
-            pred_xyxy = cxcywh_to_xyxy(pred_boxes[b])  # (Q, 4)
-            gt_xyxy = gt_boxes                           # (N_i, 4) already xyxy
-            giou = generalized_box_iou(pred_xyxy, gt_xyxy)  # (Q, N_i)
-            cost_giou = -giou
+            if rotated:
+                # rotated IoU cost — GT に OBB があればそれを、無ければ theta=0 を使う
+                gt_obb = targets[b].get("obb")
+                gt_obb = aabb_to_obb(gt_boxes) if gt_obb is None else gt_obb
+                cost_giou = -rotated_iou(pred_obb[b], gt_obb)   # (Q, N_i)
+            else:
+                # GIoU cost — both in xyxy
+                pred_xyxy = cxcywh_to_xyxy(pred_boxes[b])  # (Q, 4)
+                gt_xyxy = gt_boxes                           # (N_i, 4) already xyxy
+                giou = generalized_box_iou(pred_xyxy, gt_xyxy)  # (Q, N_i)
+                cost_giou = -giou
 
             # Combined cost matrix
             cost = (
@@ -199,28 +221,34 @@ class DetectionLoss(nn.Module):
     - GIoU loss
     """
 
-    def __init__(self, cfg: LossConfig, num_classes: int = 1):
+    def __init__(self, cfg: LossConfig, num_classes: int = 1, obb_cfg=None):
         super().__init__()
         self.cfg = cfg
         self.num_classes = num_classes
+        self.obb_cfg = obb_cfg
+        self.obb_enabled = bool(obb_cfg is not None and obb_cfg.enabled)
         self.matcher = HungarianMatcher(
             cost_class=cfg.w_class,
             cost_bbox=cfg.w_bbox_l1,
             cost_giou=cfg.w_bbox_giou,
+            use_rotated=self.obb_enabled and obb_cfg.use_rotated_matching,
         )
+        self.obb_loss = OBBLoss(cfg, obb_cfg) if self.obb_enabled else None
 
     def forward(
         self,
         pred_logits: torch.Tensor,  # (B, Q, C+1)
         pred_boxes: torch.Tensor,   # (B, Q, 4) [cx, cy, w, h]
         targets: List[Dict],        # B 個の dict
+        pred_obb: Optional[torch.Tensor] = None,     # (B, Q, 5)
+        pred_angles: Optional[torch.Tensor] = None,  # (B, Q, 2)
     ) -> Dict[str, torch.Tensor]:
         """
         Returns:
             losses: Dict[str, Tensor]
         """
         # Hungarian matching
-        indices = self.matcher(pred_logits, pred_boxes, targets)
+        indices = self.matcher(pred_logits, pred_boxes, targets, pred_obb=pred_obb)
 
         # Class loss
         loss_class = self._class_loss(pred_logits, targets, indices)
@@ -237,12 +265,67 @@ class DetectionLoss(nn.Module):
             + self.cfg.w_bbox_giou * loss_giou
         )
 
-        return {
+        losses = {
             "loss_class": loss_class,
             "loss_bbox": loss_bbox,
             "loss_giou": loss_giou,
-            "loss_detection": total,
         }
+
+        # --- OBB losses ---
+        if self.obb_loss is not None and pred_obb is not None and pred_angles is not None:
+            obb_losses = self._obb_losses(pred_obb, pred_angles, targets, indices)
+            losses.update(obb_losses)
+            total = total + obb_losses["loss_obb"]
+
+        losses["loss_detection"] = total
+        return losses
+
+    def _obb_losses(
+        self,
+        pred_obb: torch.Tensor,      # (B, Q, 5)
+        pred_angles: torch.Tensor,   # (B, Q, 2)
+        targets: List[Dict],
+        indices: List[Tuple],
+    ) -> Dict[str, torch.Tensor]:
+        """マッチした予測と GT の OBB 損失を集める。"""
+        pred_list, angle_list, gt_list, valid_list = [], [], [], []
+
+        for b, (row_ind, col_ind) in enumerate(indices):
+            if len(row_ind) == 0:
+                continue
+            pred_list.append(pred_obb[b][row_ind])
+            angle_list.append(pred_angles[b][row_ind])
+
+            gt_obb = targets[b].get("obb")
+            if gt_obb is None:
+                # 真の回転 GT が無い: AABB から theta=0 で代用しつつ、角度損失は無効化。
+                # ここで角度まで学習させると「すべて水平」を教え込むことになる。
+                gt_obb = aabb_to_obb(targets[b]["boxes"])
+                valid = torch.zeros(
+                    len(col_ind), dtype=torch.bool, device=pred_obb.device
+                )
+            else:
+                gt_obb = gt_obb.to(pred_obb.device)
+                av = targets[b].get("obb_valid")
+                valid = (
+                    torch.ones(len(col_ind), dtype=torch.bool, device=pred_obb.device)
+                    if av is None else av.to(pred_obb.device)[col_ind].bool()
+                )
+            gt_list.append(gt_obb[col_ind])
+            valid_list.append(valid)
+
+        if not pred_list:
+            zero = pred_obb.sum() * 0.0
+            return {
+                "loss_obb_angle": zero, "loss_obb_probiou": zero, "loss_obb": zero,
+            }
+
+        return self.obb_loss(
+            torch.cat(pred_list, 0),
+            torch.cat(angle_list, 0),
+            torch.cat(gt_list, 0),
+            torch.cat(valid_list, 0),
+        )
 
     def _class_loss(
         self,
@@ -325,6 +408,183 @@ class DetectionLoss(nn.Module):
         giou = generalized_box_iou(pred_xyxy, gt_xyxy)
         diag = giou.diag()
         return (1 - diag).mean()
+
+
+# ---------------------------------------------------------------------------
+# OBB Loss
+# ---------------------------------------------------------------------------
+
+class OBBLoss(nn.Module):
+    """
+    Oriented Bounding Box の回帰損失。
+
+    2 つの補完的な項を足す:
+
+    1. **角度損失** — 予測 [sin2t, cos2t] と GT [sin2t, cos2t] の L1。
+       2 倍角なので矩形の周期 pi と一致し、±pi/2 の境界で損失が飛ばない。
+       ネットワーク出力は正規化されていないので、GT の単位ベクトルへ向かうように
+       L2 正規化してから比較する (ノルムは角度に無関係なので学習対象にしない)。
+
+    2. **ProbIoU 損失** — 中心・サイズ・角度を 1 つの微分可能な IoU で同時に最適化。
+       厳密な rotated IoU は場合分けが不連続で勾配が壊れるため、ガウス近似を使う。
+
+    === derived な GT の扱い ===
+
+    AABB から theta=0 で機械的に導出した GT (``obb_source="derived"``) は
+    真の回転情報を持たない。これを角度損失に含めると「すべて水平」という誤った
+    事前分布を学習してしまうので、``angle_valid`` マスクで**角度損失からのみ**除外する
+    (ProbIoU は位置とサイズの情報を持つので除外しない)。
+    """
+
+    def __init__(self, cfg: LossConfig, obb_cfg=None):
+        super().__init__()
+        self.cfg = cfg
+        self.angle_weight = cfg.w_obb_angle
+        self.probiou_weight = cfg.w_obb_probiou
+        if obb_cfg is not None:
+            self.angle_weight *= obb_cfg.angle_loss_weight
+            self.probiou_weight *= obb_cfg.probiou_loss_weight
+
+    def forward(
+        self,
+        pred_obb: torch.Tensor,         # (N, 5) [cx, cy, w, h, theta]
+        pred_angles: torch.Tensor,      # (N, 2) [sin2t, cos2t] 未正規化
+        gt_obb: torch.Tensor,           # (N, 5)
+        angle_valid: Optional[torch.Tensor] = None,  # (N,) bool
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Returns:
+            {"loss_obb_angle", "loss_obb_probiou", "loss_obb"}
+        """
+        if pred_obb.shape[0] == 0:
+            zero = pred_obb.sum() * 0.0
+            return {
+                "loss_obb_angle": zero,
+                "loss_obb_probiou": zero,
+                "loss_obb": zero,
+            }
+
+        # --- 角度損失 ---
+        if angle_valid is None:
+            angle_valid = torch.ones(
+                pred_obb.shape[0], dtype=torch.bool, device=pred_obb.device
+            )
+        if angle_valid.any():
+            gt_enc = encode_angle(gt_obb[angle_valid, 4])            # (M, 2) 単位ベクトル
+            pred_enc = F.normalize(pred_angles[angle_valid], dim=-1)
+            loss_angle = F.l1_loss(pred_enc, gt_enc, reduction="mean")
+        else:
+            loss_angle = pred_angles.sum() * 0.0
+
+        # --- ProbIoU 損失 ---
+        iou = probiou(pred_obb, gt_obb)
+        loss_probiou = (1.0 - iou).mean()
+
+        total = self.angle_weight * loss_angle + self.probiou_weight * loss_probiou
+        return {
+            "loss_obb_angle": loss_angle,
+            "loss_obb_probiou": loss_probiou,
+            "loss_obb": total,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Pose Loss (任意)
+# ---------------------------------------------------------------------------
+
+class PoseLoss(nn.Module):
+    """
+    キーポイントと head-tail polarity の損失 (どちらも任意)。
+
+    pose アノテーションが無いデータセットでは呼ばれないので、
+    ``pose_enabled=False`` の既存ワークフローには一切影響しない。
+    """
+
+    def __init__(self, cfg: LossConfig):
+        super().__init__()
+        self.cfg = cfg
+
+    def forward(
+        self,
+        pred_keypoints: Optional[torch.Tensor],   # (N, K, 3) [x, y, vis_logit]
+        gt_keypoints: Optional[torch.Tensor],     # (N, K, 3) [x, y, v]
+        pred_polarity: Optional[torch.Tensor] = None,  # (N, 2)
+        gt_polarity: Optional[torch.Tensor] = None,    # (N,) 0/1、-1 は ignore
+    ) -> Dict[str, torch.Tensor]:
+        losses: Dict[str, torch.Tensor] = {}
+        total = None
+
+        if pred_keypoints is not None and gt_keypoints is not None \
+                and pred_keypoints.shape[0] > 0:
+            # v > 0 のキーポイントだけを座標回帰の対象にする
+            vis = (gt_keypoints[..., 2] > 0).float()               # (N, K)
+            coord_err = F.l1_loss(
+                pred_keypoints[..., :2], gt_keypoints[..., :2], reduction="none"
+            ).sum(dim=-1)                                          # (N, K)
+            denom = vis.sum().clamp(min=1.0)
+            loss_kp = (coord_err * vis).sum() / denom
+            losses["loss_pose_keypoint"] = loss_kp
+            total = self.cfg.w_pose_keypoint * loss_kp
+
+        if pred_polarity is not None and gt_polarity is not None \
+                and pred_polarity.shape[0] > 0:
+            loss_pol = F.cross_entropy(pred_polarity, gt_polarity, ignore_index=-1)
+            losses["loss_pose_polarity"] = loss_pol
+            term = self.cfg.w_pose_polarity * loss_pol
+            total = term if total is None else total + term
+
+        if total is None:
+            ref = pred_keypoints if pred_keypoints is not None else pred_polarity
+            total = ref.sum() * 0.0 if ref is not None else torch.zeros(())
+        losses["loss_pose"] = total
+        return losses
+
+
+# ---------------------------------------------------------------------------
+# Multi-head / Hierarchical Behavior Loss
+# ---------------------------------------------------------------------------
+
+class MultiHeadActionLoss(nn.Module):
+    """
+    multi-head 行動分類の損失。
+
+    head ごとに独立した cross-entropy を計算し、平均する。GT が欠けている head は
+    -1 (ignore) で飛ばせるので、「locomotion だけラベルがある」ような部分
+    アノテーションのデータセットでも学習できる。
+    """
+
+    def __init__(self, cfg: LossConfig, head_names: Optional[List[str]] = None):
+        super().__init__()
+        self.cfg = cfg
+        self.head_names = list(head_names) if head_names else []
+
+    def forward(
+        self,
+        head_logits: Dict[str, torch.Tensor],   # head 名 → (N, C_h)
+        head_targets: Dict[str, torch.Tensor],  # head 名 → (N,)、-1 は ignore
+    ) -> Dict[str, torch.Tensor]:
+        losses: Dict[str, torch.Tensor] = {}
+        terms: List[torch.Tensor] = []
+
+        for name, logits in head_logits.items():
+            target = head_targets.get(name)
+            if target is None or logits.shape[0] == 0:
+                continue
+            if (target != -1).sum() == 0:
+                continue
+            loss = softmax_focal_loss(
+                logits, target, gamma=self.cfg.focal_gamma, ignore_index=-1
+            )
+            losses[f"loss_action_{name}"] = loss
+            terms.append(loss)
+
+        if terms:
+            total = torch.stack(terms).mean() * self.cfg.w_action
+        else:
+            any_logits = next(iter(head_logits.values()), None)
+            total = any_logits.sum() * 0.0 if any_logits is not None else torch.zeros(())
+        losses["loss_action"] = total
+        return losses
 
 
 # ---------------------------------------------------------------------------
@@ -573,13 +833,17 @@ class CombinedLoss(nn.Module):
         num_classes: int = 1,
         num_actions: int = 5,
         max_ids: int = 50,
+        obb_cfg=None,
+        head_names: Optional[List[str]] = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.stage = 1
 
-        self.detection_loss = DetectionLoss(cfg, num_classes)
+        self.detection_loss = DetectionLoss(cfg, num_classes, obb_cfg=obb_cfg)
         self.action_loss = ActionLoss(cfg, num_actions)
+        self.multi_head_action_loss = MultiHeadActionLoss(cfg, head_names)
+        self.pose_loss = PoseLoss(cfg)
         self.id_loss = IDLoss(cfg, max_ids)
         self.temporal_smooth = TemporalSmoothingLoss(cfg)
 
@@ -612,6 +876,8 @@ class CombinedLoss(nn.Module):
                 model_output.pred_logits,
                 model_output.pred_boxes,
                 frame_targets,
+                pred_obb=getattr(model_output, "pred_obb", None),
+                pred_angles=getattr(model_output, "pred_angles", None),
             )
             losses.update(det_losses)
 
@@ -624,20 +890,42 @@ class CombinedLoss(nn.Module):
                         aux["pred_logits"],
                         aux["pred_boxes"],
                         frame_targets,
+                        pred_obb=aux.get("pred_obb"),
+                        pred_angles=aux.get("pred_angles"),
                     )
                     aux_total = aux_total + aux_losses["loss_detection"]
                     losses[f"aux_det_layer{i}"] = aux_losses["loss_detection"]  # ログ用 (合計には含まない)
                 losses["loss_detection_aux"] = aux_total
 
+            # Pose losses (pose head 有効時のみ)
+            pred_kp = getattr(model_output, "pred_keypoints", None)
+            pred_pol = getattr(model_output, "pred_polarity", None)
+            if pred_kp is not None or pred_pol is not None:
+                pose_losses = self._pose_losses(model_output, frame_targets)
+                if pose_losses:
+                    losses.update(pose_losses)
+
         # ----- Stage 2: Action -----
-        if s in (2, 4) and model_output.action_logits is not None:
-            # GT action_id を収集
+        if s in (2, 4):
             frame_targets = targets if isinstance(targets[0], dict) else targets[-1]
-            gt_action = self._collect_gt_actions(frame_targets, model_output)
-            if gt_action is not None:
-                losses["loss_action"] = self.action_loss(
-                    model_output.action_logits, gt_action
+            behavior = getattr(model_output, "behavior", None)
+
+            if behavior is not None and behavior.head_logits:
+                # multi-head: head ごとの GT を targets から引く
+                head_targets = self._collect_multi_head_targets(
+                    frame_targets, model_output, list(behavior.head_logits)
                 )
+                if head_targets:
+                    losses.update(
+                        self.multi_head_action_loss(behavior.head_logits, head_targets)
+                    )
+            elif model_output.action_logits is not None:
+                # single / hierarchical: どちらも (N, num_actions) の logit
+                gt_action = self._collect_gt_actions(frame_targets, model_output)
+                if gt_action is not None:
+                    losses["loss_action"] = self.action_loss(
+                        model_output.action_logits, gt_action
+                    )
 
         # ----- Stage 3: ID -----
         if s in (3, 4) and model_output.id_logits is not None:
@@ -652,12 +940,75 @@ class CombinedLoss(nn.Module):
                 losses.update(id_losses)
 
         # Total loss — sum only the top-level aggregate losses to avoid
-        # double-counting (loss_class/bbox/giou are already included in loss_detection)
-        _AGGREGATE_KEYS = ("loss_detection", "loss_detection_aux", "loss_action", "loss_id")
+        # double-counting (loss_class/bbox/giou are already included in loss_detection,
+        # loss_obb_angle/probiou in loss_obb which is inside loss_detection)
+        _AGGREGATE_KEYS = (
+            "loss_detection", "loss_detection_aux", "loss_action", "loss_id", "loss_pose",
+        )
         total = sum(losses[k] for k in _AGGREGATE_KEYS if k in losses)
         losses["total_loss"] = total
 
         return losses
+
+    def _pose_losses(self, model_output, targets) -> Dict[str, torch.Tensor]:
+        """
+        pose head の損失。GT が無い (pose 未アノテーション) なら空を返す。
+
+        pose アノテーションを持たない既存データセットでも学習が止まらないよう、
+        「GT が無ければ損失を作らない」を徹底する。
+        """
+        if model_output.det_results is None:
+            return {}
+        has_kp = any("keypoints" in t for t in targets)
+        has_pol = any("polarity" in t for t in targets)
+        if not has_kp and not has_pol:
+            return {}
+
+        from .matching import collect_matched_gt_tensor
+
+        pred_kp = getattr(model_output, "pred_keypoints", None)
+        pred_pol = getattr(model_output, "pred_polarity", None)
+
+        det_kp = self._gather_det_field(model_output, "keypoints")
+        det_pol = self._gather_det_field(model_output, "polarity")
+
+        gt_kp = collect_matched_gt_tensor(
+            model_output.det_results, targets, "keypoints"
+        ) if has_kp else None
+        gt_pol = collect_matched_gt(
+            model_output.det_results, targets, key="polarity"
+        ) if has_pol else None
+
+        return self.pose_loss(det_kp, gt_kp, det_pol, gt_pol)
+
+    @staticmethod
+    def _gather_det_field(model_output, key: str) -> Optional[torch.Tensor]:
+        """det_results から指定フィールドを全バッチ分 concat する。"""
+        if model_output.det_results is None:
+            return None
+        parts = [d[key] for d in model_output.det_results if key in d]
+        return torch.cat(parts, dim=0) if parts else None
+
+    def _collect_multi_head_targets(
+        self, targets, model_output, head_names: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        multi-head 用の GT を targets から集める。
+
+        targets の各 dict が ``action_<head名>`` というキーを持つことを期待する。
+        欠けている head は学習対象から外れる (部分アノテーション対応)。
+        """
+        from .matching import collect_matched_gt
+
+        out: Dict[str, torch.Tensor] = {}
+        for name in head_names:
+            key = f"action_{name}"
+            if not any(key in t for t in targets):
+                continue
+            gt = collect_matched_gt(model_output.det_results, targets, key=key)
+            if gt.numel() > 0:
+                out[name] = gt
+        return out
 
     def _collect_gt_actions(self, targets, model_output) -> Optional[torch.Tensor]:
         """det_results の各 bbox と GT annotation を IoU マッチングして action_id を収集する。

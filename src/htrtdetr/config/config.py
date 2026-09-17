@@ -50,6 +50,52 @@ class FPNConfig:
     in_channels: List[int] = field(default_factory=lambda: [128, 256, 512])
     out_channels: int = 256
     num_levels: int = 3
+    # --- P2 (stride 4) ---
+    # 小さい個体・密集個体の検出を強化する高解像度レベル。有効にすると backbone の
+    # C2 (stride 4) を取り込み P2/P3/P4/P5 の 4 レベルになる。
+    # トレードオフ: 小物体 AP が上がる代わりに VRAM と latency が増える
+    # (640x640 で decoder memory のトークン数が約 5 倍)。
+    use_p2: bool = False
+    # P2 を decoder の cross-attention memory に含めるか。False にすると FPN の
+    # 特徴強化だけに使い、memory トークンは P3 以上に留めるので追加コストを抑えられる。
+    p2_in_memory: bool = True
+
+
+@dataclass
+class OBBConfig:
+    """Oriented Bounding Box (回転矩形) 検出の設定"""
+    # 角度回帰の有効化。False なら従来どおり完全な AABB detector として動く。
+    enabled: bool = False
+    # 角度の符号化。"sincos2" = [sin(2t), cos(2t)] (推奨)。
+    #   矩形は周期 pi なので 2 倍角が周期と一致し、境界の不連続が原理的に消える。
+    #   "direct" は theta を直接回帰する比較用 (境界問題が残るので ablation 専用)。
+    angle_encoding: str = "sincos2"
+    # 角度損失の重み (loss.w_obb_angle と掛け合わされる)
+    angle_loss_weight: float = 1.0
+    # ProbIoU 損失 (微分可能な rotated IoU) の重み
+    probiou_loss_weight: float = 2.0
+    # Hungarian matching で rotated IoU を使うか (False なら AABB の GIoU)
+    use_rotated_matching: bool = True
+    # 推論時の rotated NMS 閾値
+    nms_threshold: float = 0.5
+
+
+@dataclass
+class PoseHeadConfig:
+    """
+    任意の pose / head-tail polarity head の設定。
+
+    OBB だけでは 180 度回転した個体の頭尾を区別できない。この head はその曖昧さを
+    解消するための拡張点であり、**既定で無効**。pose アノテーションのない既存
+    データセットでも YOAKE は完全に動作する (enabled=False で head 自体を作らない)。
+    """
+    enabled: bool = False
+    # キーポイント数。0 なら head-tail polarity のみ (2 クラス) を学習する。
+    num_keypoints: int = 0
+    keypoint_names: List[str] = field(default_factory=list)
+    # head-tail polarity (OBB の向きを 180 度反転すべきかの 2 値分類)
+    predict_polarity: bool = True
+    hidden_dim: int = 256
 
 
 @dataclass
@@ -67,9 +113,16 @@ class DetectorHeadConfig:
 @dataclass
 class DetectorConfig:
     """Spatial Detector 全体の設定"""
+    # detector backend。将来差し替え可能にするための識別子。
+    #   "rtdetr_aabb" — 従来の軸平行 RT-DETR (既定・完全後方互換)
+    #   "rtdetr_obb"  — RT-DETR + 角度ヘッド (OBB)
+    #   "yolo_aabb" / "yolo_obb" — 外部 YOLO backend (stages プレーン経由)
+    type: str = "rtdetr_aabb"
     backbone: BackboneConfig = field(default_factory=BackboneConfig)
     fpn: FPNConfig = field(default_factory=FPNConfig)
     head: DetectorHeadConfig = field(default_factory=DetectorHeadConfig)
+    obb: OBBConfig = field(default_factory=OBBConfig)
+    pose: PoseHeadConfig = field(default_factory=PoseHeadConfig)
     # HungarianMatcher の cost weights
     cost_class: float = 2.0
     cost_bbox: float = 5.0
@@ -150,6 +203,117 @@ class MemoryIDConfig:
 
 
 # ---------------------------------------------------------------------------
+# Tracking (OBB-aware association)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrackingConfig:
+    """
+    OBB 対応 tracking / identity association の設定。
+
+    association コストは各項の重み付き和:
+        cost = -(w_iou * IoU + w_app * cos_sim + w_motion * motion + w_orient * orient)
+    重みを 0 にすればその手がかりを切れるので、そのまま ablation になる。
+    既定値は既存 MemoryIDHead の挙動 (0.5*sim + 0.5*IoU) を再現する。
+    """
+    # IoU の重み。use_rotated_iou=True かつ OBB が利用可能なら rotated IoU を使い、
+    # OBB が無い (AABB detector) 場合は自動で軸平行 IoU に fallback する。
+    iou_weight: float = 0.5
+    use_rotated_iou: bool = True
+    # appearance embedding の cosine 類似度の重み
+    appearance_weight: float = 0.5
+    # 等速度予測との一致度の重み (0 で無効 = 従来挙動)
+    motion_weight: float = 0.0
+    # OBB の向きの一致度の重み (0 で無効 = 従来挙動)
+    orientation_weight: float = 0.0
+    # 中心距離ゲート: この画素数を超える組は最初から association しない (0 で無効)
+    max_center_distance: float = 0.0
+    # マッチ成立の閾値 (これ未満のスコアは新規 ID)
+    match_threshold: float = 0.5
+    # トラック消失までの猶予フレーム数
+    max_age: int = 30
+    # 消失トラックの特徴を再同定用に保持するフレーム数 (max_age より長くてよい)
+    reid_max_age: int = 90
+    # 再同定を有効にするか (消失後に戻ってきた個体へ同じ ID を戻す)
+    enable_reid: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Behavior (actor + context 2-stream, hierarchical / multi-head)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BehaviorConfig:
+    """
+    行動認識ブランチの設定。
+
+    設計原則: 個体検出は tight OBB (細粒度・orientation-sensitive)、
+    行動認識は expanded context AABB (粗粒度・広い文脈) と役割を分ける。
+
+    use_* フラグはすべて ablation スイッチで、False にするとその特徴群が
+    モデルから完全に外れる (ゼロ埋めではなく次元ごと落とす)。
+    """
+    # --- ROI ---
+    # 個体 OBB を何倍に広げて context ROI にするか
+    context_scale: float = 2.0
+    # actor crop (OBB に沿って回転させ体軸を正規化) の出力解像度
+    actor_roi_size: int = 16
+    # context crop (軸平行) の出力解像度
+    context_roi_size: int = 16
+    # context ROI を正方形にするか (ROIAlign の歪みを避ける)
+    context_square: bool = True
+
+    # --- 特徴ストリームの ON/OFF (ablation) ---
+    use_actor: bool = True         # actor-aligned 回転 crop
+    use_context: bool = True       # 周辺を含む拡大 AABB crop
+    use_detector_feat: bool = True  # detector の query 特徴
+    use_motion: bool = True        # 速度 / 加速度 / 角速度 など kinematics
+    use_orientation: bool = True   # 体軸方向と進行方向の関係
+    use_interaction: bool = True   # 個体間 interaction
+    use_temporal: bool = True      # HTM の時間特徴
+    use_pose: bool = False         # pose (pose head が有効なときのみ)
+
+    # --- 分類器 ---
+    # "single"       — 従来どおり単一 softmax (完全後方互換)
+    # "hierarchical" — 木構造 (粗クラス → 細クラス) で条件付き分類
+    # "multi_head"   — 属性ごとに独立 head (locomotion / social / self-directed)
+    classifier_type: str = "single"
+    hidden_dims: List[int] = field(default_factory=lambda: [512, 256])
+    dropout: float = 0.1
+    feature_dim: int = 256         # 各ストリームを揃える共通次元
+
+    # hierarchical 用: 親ノード名 → 子 action 名のリスト
+    hierarchy: Dict[str, List[str]] = field(default_factory=dict)
+    # multi_head 用: head 名 → その head のクラス名リスト
+    heads: Dict[str, List[str]] = field(default_factory=dict)
+
+    # --- 時間窓 ---
+    temporal_window: int = 16      # track ごとに保持する履歴長
+
+
+@dataclass
+class ExplainabilityConfig:
+    """
+    説明可能性 (evidence decomposition) の設定。
+
+    後付けの可視化ではなく、モデル構造そのものに寄与分解を組み込む:
+        action_logits = Σ_g gate_g * head_g(feature_g)
+    各 feature group g (appearance / motion / interaction / ...) の寄与が
+    logit 空間で加算的に分離されるので、そのまま根拠として提示できる。
+    """
+    enabled: bool = True
+    # evidence 分解を使うか。False なら従来の concat → MLP 単一経路。
+    use_evidence_decomposition: bool = True
+    # FeatureGating による特徴重要度の学習を使うか
+    use_gating: bool = True
+    # gate を出力に記録するか (GUI / API から取得できる)
+    return_gates: bool = True
+    # Integrated Gradients などの勾配ベース説明 (optional dependency 不要の自前実装)
+    enable_gradient_attribution: bool = False
+    integrated_gradients_steps: int = 32
+
+
+# ---------------------------------------------------------------------------
 # Action Head
 # ---------------------------------------------------------------------------
 
@@ -196,6 +360,13 @@ class ModelConfig:
     id_head: MemoryIDConfig = field(default_factory=MemoryIDConfig)
     action_head: ActionHeadConfig = field(default_factory=ActionHeadConfig)
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
+    behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
+    explainability: ExplainabilityConfig = field(default_factory=ExplainabilityConfig)
+    # 時間モデルを track 単位で揃えるか (True) / DETR query 単位か (False)。
+    # DETR の query index はフレーム間で同一個体を保証しないため、既定は track 単位。
+    # False は旧挙動を再現する ablation / 後方互換用で、DeprecationWarning が出る。
+    track_aligned_temporal: bool = True
     # 学習段階 (1-4)
     training_stage: int = 1
 
@@ -244,6 +415,12 @@ class LossConfig:
     w_class: float = 2.0
     w_bbox_l1: float = 5.0
     w_bbox_giou: float = 2.0
+    # OBB losses (detector.obb.enabled=True のときのみ使用)
+    w_obb_angle: float = 2.0       # 角度 (sin2t, cos2t) の回帰損失
+    w_obb_probiou: float = 2.0     # 微分可能な rotated IoU 損失
+    # Pose losses (detector.pose.enabled=True のときのみ使用)
+    w_pose_keypoint: float = 1.0
+    w_pose_polarity: float = 0.5
     # Action loss
     w_action: float = 1.0
     # ID loss
@@ -389,8 +566,22 @@ class InferenceConfig:
     output_path: str = "runs/predict"
     # Video
     fps: Optional[float] = None      # None → 元動画の fps を使用
+    # --- 推論モード ---
+    # "streaming" — 新しいフレームだけ detector に通し、過去は track ごとの
+    #               ring buffer から再利用する (既定・大幅に高速)
+    # "batch"     — 毎フレーム window 全体を detector に通す旧挙動 (比較検証用)
+    mode: str = "streaming"
+    # 高速化オプション (利用できない backend では自動 fallback)
+    use_amp: bool = True             # FP16/BF16 autocast
+    use_channels_last: bool = True   # channels_last memory format
+    use_compile: bool = False        # torch.compile (初回コンパイルに時間がかかる)
     # Visualization overlay
     show_bbox: bool = True
+    show_obb: bool = True            # 個体の回転矩形
+    show_context_box: bool = False   # 行動認識の context 矩形
+    show_trajectory: bool = False    # トラック軌跡
+    show_pose: bool = False
+    show_explanation: bool = False   # evidence 寄与の表示
     show_id: bool = True
     show_action: bool = True
     show_confidence: bool = True
@@ -581,6 +772,100 @@ def validate_config(cfg: "HTRTDETRConfig") -> None:
             f"must match model.detector.fpn.out_channels ({m.detector.fpn.out_channels})"
         )
 
+    # --- Detector backend / OBB / P2 ---
+    _VALID_DETECTORS = ("rtdetr_aabb", "rtdetr_obb", "yolo_aabb", "yolo_obb")
+    if m.detector.type not in _VALID_DETECTORS:
+        errors.append(
+            f"model.detector.type must be one of {_VALID_DETECTORS}, "
+            f"got {m.detector.type!r}"
+        )
+    if m.detector.type == "rtdetr_obb" and not m.detector.obb.enabled:
+        errors.append(
+            "model.detector.type='rtdetr_obb' requires model.detector.obb.enabled=true"
+        )
+    if m.detector.obb.angle_encoding not in ("sincos2", "direct"):
+        errors.append(
+            "model.detector.obb.angle_encoding must be 'sincos2' or 'direct', "
+            f"got {m.detector.obb.angle_encoding!r}"
+        )
+    expected_levels = 4 if m.detector.fpn.use_p2 else 3
+    if m.detector.fpn.num_levels != expected_levels:
+        errors.append(
+            f"model.detector.fpn.num_levels ({m.detector.fpn.num_levels}) must be "
+            f"{expected_levels} when use_p2={m.detector.fpn.use_p2}"
+        )
+
+    # --- Pose ---
+    if m.detector.pose.enabled:
+        if m.detector.pose.num_keypoints < 0:
+            errors.append("model.detector.pose.num_keypoints must be >= 0")
+        if m.detector.pose.num_keypoints == 0 and not m.detector.pose.predict_polarity:
+            errors.append(
+                "model.detector.pose.enabled=true but neither keypoints nor polarity "
+                "is predicted (set num_keypoints>0 or predict_polarity=true)"
+            )
+    if m.behavior.use_pose and not m.detector.pose.enabled:
+        errors.append(
+            "model.behavior.use_pose=true requires model.detector.pose.enabled=true"
+        )
+
+    # --- Behavior ---
+    _VALID_CLASSIFIERS = ("single", "hierarchical", "multi_head")
+    if m.behavior.classifier_type not in _VALID_CLASSIFIERS:
+        errors.append(
+            f"model.behavior.classifier_type must be one of {_VALID_CLASSIFIERS}, "
+            f"got {m.behavior.classifier_type!r}"
+        )
+    if m.behavior.classifier_type == "multi_head" and not m.behavior.heads:
+        errors.append(
+            "model.behavior.classifier_type='multi_head' requires "
+            "model.behavior.heads to be non-empty (head name -> class names)"
+        )
+    if m.behavior.classifier_type == "hierarchical" and not m.behavior.hierarchy:
+        errors.append(
+            "model.behavior.classifier_type='hierarchical' requires "
+            "model.behavior.hierarchy to be non-empty (parent -> child action names)"
+        )
+    if m.behavior.context_scale < 1.0:
+        errors.append(
+            f"model.behavior.context_scale must be >= 1.0 (context box must not be "
+            f"smaller than the individual box), got {m.behavior.context_scale}"
+        )
+    if not any([
+        m.behavior.use_actor, m.behavior.use_context, m.behavior.use_detector_feat,
+        m.behavior.use_motion, m.behavior.use_interaction, m.behavior.use_temporal,
+        m.behavior.use_pose, m.behavior.use_orientation,
+    ]):
+        errors.append(
+            "model.behavior: at least one use_* feature stream must be enabled"
+        )
+
+    # --- Tracking ---
+    tw = m.tracking
+    if tw.iou_weight < 0 or tw.appearance_weight < 0 or tw.motion_weight < 0 \
+            or tw.orientation_weight < 0:
+        errors.append("model.tracking.*_weight must be non-negative")
+    if (tw.iou_weight + tw.appearance_weight
+            + tw.motion_weight + tw.orientation_weight) <= 0:
+        errors.append(
+            "model.tracking: at least one association weight must be > 0"
+        )
+    if tw.orientation_weight > 0 and not m.detector.obb.enabled:
+        errors.append(
+            "model.tracking.orientation_weight > 0 requires "
+            "model.detector.obb.enabled=true (orientation comes from the OBB)"
+        )
+    # 注: use_rotated_iou=True + obb.enabled=False はエラーにしない。
+    # 「OBB があれば rotated IoU、無ければ軸平行 IoU」という graceful fallback として
+    # 定義しているので、既定値のまま AABB モデルでも正しく動く。
+    if tw.max_age < 1:
+        errors.append(f"model.tracking.max_age must be >= 1, got {tw.max_age}")
+    if tw.enable_reid and tw.reid_max_age < tw.max_age:
+        errors.append(
+            f"model.tracking.reid_max_age ({tw.reid_max_age}) must be >= "
+            f"max_age ({tw.max_age})"
+        )
+
     if m.temporal.feature_dim != m.detector.fpn.out_channels:
         errors.append(
             f"model.temporal.feature_dim ({m.temporal.feature_dim}) "
@@ -639,6 +924,17 @@ def validate_config(cfg: "HTRTDETRConfig") -> None:
         errors.append(f"train.stage must be 1-4, got {tr.stage}")
     if tr.max_epochs < 1:
         errors.append(f"train.max_epochs must be >= 1, got {tr.max_epochs}")
+
+    # --- Inference ---
+    if cfg.inference.mode not in ("batch", "streaming"):
+        errors.append(
+            f"inference.mode must be 'batch' or 'streaming', got {cfg.inference.mode!r}"
+        )
+    if m.behavior.temporal_window < 1:
+        errors.append(
+            f"model.behavior.temporal_window must be >= 1, "
+            f"got {m.behavior.temporal_window}"
+        )
 
     if errors:
         msg = f"Config validation failed ({len(errors)} error(s)):\n"
@@ -842,13 +1138,42 @@ def build_model_config(variant: ModelVariant) -> ModelConfig:
         output_dim=s["interaction_output_dim"],
     )
 
+    # behavior ブランチも共通 feature 次元 d に揃える (次元不整合を設定側で潰す)
+    behavior = BehaviorConfig(
+        feature_dim=d,
+        hidden_dims=list(s["hidden_dims"]),
+    )
+
     return ModelConfig(
         detector=detector,
         temporal=temporal,
         id_head=id_head,
         action_head=action_head,
         interaction=interaction,
+        behavior=behavior,
     )
+
+
+def enable_obb(cfg: "HTRTDETRConfig", use_p2: bool = False) -> "HTRTDETRConfig":
+    """
+    既存 config を OBB detector 構成へ切り替えるヘルパー (in-place)。
+
+    `detector.type` と依存フラグ (fpn.num_levels など) をまとめて整合させるので、
+    YAML を手書きするより取りこぼしが起きにくい。
+
+    Example::
+
+        cfg = get_variant_config("small", stage=1)
+        enable_obb(cfg, use_p2=True)
+        validate_config(cfg)
+    """
+    cfg.model.detector.type = "rtdetr_obb"
+    cfg.model.detector.obb.enabled = True
+    cfg.model.tracking.use_rotated_iou = True
+    if use_p2:
+        cfg.model.detector.fpn.use_p2 = True
+        cfg.model.detector.fpn.num_levels = 4
+    return cfg
 
 
 def get_variant_config(

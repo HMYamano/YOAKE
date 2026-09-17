@@ -4,79 +4,100 @@
 
 # YOAKE: Hierarchical Temporal RT-DETR
 
-YOAKE is a PyTorch model for multi-animal tracking and behavior classification in laboratory video recordings, with a primary focus on *Drosophila melanogaster*. It combines a ResNet-18-based RT-DETR spatial detector with a three-branch dilated temporal module (HTM), a GRU memory-based identity tracking head, and an MLP action classification head — producing bounding boxes, persistent track IDs, and per-frame behavior labels from a single forward pass over a 16-frame sliding window. The model is trained in four sequential stages that progressively unlock module complexity, ensuring stable convergence without requiring end-to-end training from scratch.
+YOAKE is a PyTorch model for multi-animal tracking and behavior classification in laboratory video recordings, with a primary focus on *Drosophila melanogaster*. It combines an RT-DETR spatial detector with a three-branch dilated temporal module (HTM), a GRU memory-based identity tracking head, and a behavior branch — producing bounding boxes, persistent track IDs, and per-frame behavior labels. The model is trained in four sequential stages that progressively unlock module complexity, ensuring stable convergence without requiring end-to-end training from scratch.
+
+The architecture reflects one central idea: **individual detection and behavior recognition need different spatial granularity**. Individuals are detected with tight, orientation-sensitive *rotated* boxes (OBB), which separate elongated animals that lie close together. Behavior is recognized from a *wider, axis-aligned context box* around each individual, which keeps the neighbours and surroundings that make a behavior what it is. Time is aligned by **track ID**, never by detector query index.
 
 ---
 
 ## Architecture
 
 ```
-Input frames (B, T, 3, 640, 640)
-        |
-+-------v---------------------+
-|   ResNet-18 Backbone        |  C3, C4, C5 feature maps
-+-------+---------------------+
-        |
-+-------v---------------------+
-|   FPN Neck                  |  P3 + P4 + P5  (256 ch each)
-+-------+---------------------+
-        |
-+-------v---------------------+
-|   AIFI Encoder              |  Self-attention on P5
-+-------+---------------------+
-        |
-+-------v---------------------+
-|   DETR Decoder              |  4-layer transformer, 100 queries
-|   -> (B, T, Q, 256)         |  query features per frame
-+-------+---------------------+
-        |
-+-------v---------------------------------------------+
-|   Hierarchical Temporal Module (HTM)                |
-|                                                     |
-|  +----------------+  +------------+  +-----------+ |
-|  | Short branch   |  | Mid branch |  | Long      | |
-|  | dilation=1     |  | dilation=2 |  | dilation=4| |
-|  | receptive=3 fr |  | recept=8fr |  | recept=16f| |
-|  | depthwise conv |  | dw conv    |  | dw conv   | |
-|  | + residual     |  | + residual |  | + residual| |
-|  +-------+--------+  +-----+------+  +-----+-----+ |
-|          |                 |               |        |
-|          +--------+--------+---------------+        |
-|                   | concat + linear projection      |
-|                   | -> (B, T, Q, 256)               |
-+-------------------+---------------------------------+
-                    |
-        +-----------+----------+
-        |                      |
-+-------v-------+    +---------v-----------+
-| Memory ID Head|    |  Action Head        |
-|               |    |                     |
-| GRU memory    |    | spatial feat        |
-| per track_id  |    | + temporal feat     |
-| -> embedding  |    | + interaction feat  |
-| cosine match  |    | (nn-dist, angle,    |
-| + IoU match   |    |  velocity, overlap) |
-| Hungarian     |    | MLP: 512->256->5    |
-+-------+-------+    +---------+-----------+
-        |                      |
-   track_id               action_id
-   id_confidence          action_confidence
-
-Output per detection: [bbox, det_score, class_id, track_id, id_conf, action_id, action_conf]
+Frame
+  |
+  v
+Shared Backbone (ResNet) + FPN
+  |   P2(stride 4, optional) / P3 / P4 / P5
+  |
+  +---------------------------+
+  |                           |
+  v                           v
+Fine detection            Spatial features
+RT-DETR-OBB                    |
+  | cx, cy, w, h, theta        |
+  v                            |
+OBB detections                 |
+  |                            |
+  v                            |
+OBB-aware tracking             |
+  rotated IoU + appearance     |
+  + motion + orientation       |
+  |                            |
+  v                            |
+track_id                       |
+  |                            |
+  v                            |
+Per-track ring buffer          |
+  (no detector recompute)      |
+  |                            |
+  +-------------+--------------+----------------+
+  |             |              |                |
+  v             v              v                v
+Actor OBB   Context AABB   Kinematics      Interaction
+rotated     expanded       velocity        nn-distance
+crop        ROIAlign       acceleration    approach rate
+(orientation-             angular vel      facing A->B
+ normalized)              orientation      facing B->A
+  |             |              |                |
+  +-------------+------+-------+----------------+
+                       |
+                       v
+       Hierarchical Temporal Module (HTM)
+       short (3f) / mid (8f) / long (16f)
+       --- input is TRACK-aligned history ---
+                       |
+                       v
+         Behavior Evidence Model
+         logits = SUM_g  gate_g * head_g(feature_g)
+           appearance + context + motion
+           + pose + interaction + temporal
+                       |
+                       v
+     single | hierarchical | multi-head output
+                       |
+        +--------------+--------------+
+        |              |              |
+   Prediction     Confidence     Explanation
+                                 (per-group logit
+                                  contributions)
 ```
+
+Two planes coexist and remain independent:
+
+- **Model plane** (`models/`) — the unified `HTRTDETR` network above, trained in 4 stages.
+- **Orchestration plane** (`pipeline/` + `stages/`) — a capability-token DAG that lets you
+  swap backends (`rtdetr` / `yolo` / `bytetrack` / `obb`) from YAML without touching code.
 
 ---
 
 ## Key Features
 
-- **Single-pass inference**: bounding box detection, identity tracking, and behavior classification in one forward pass
+- **Rotated (oriented) box detection**: individuals are detected as OBBs (`cx, cy, w, h, theta`), which separate elongated animals lying close together far better than axis-aligned boxes. Angle is regressed as `sin(2θ), cos(2θ)` so the period matches the box's own period of π — the boundary discontinuity disappears by construction.
+- **Track-aligned temporal modeling**: the HTM consumes per-**track** history, not per-**query** history. DETR query indices do not identify the same individual across frames, so query-aligned sequences silently mix different animals.
+- **True streaming inference**: every frame passes the detector exactly **once**. Past frames are served from per-track ring buffers instead of being re-fed, so cost no longer scales with window size (**~4.5–6.2× faster**, detector calls 78 → 12 at window=16).
+- **Two-stream behavior recognition**: a rotated, orientation-normalized *actor* crop for fine appearance and pose, plus a wider axis-aligned *context* crop for neighbours and surroundings.
+- **Explainability built into the model**: behavior logits are an additive decomposition, `logits = Σ_g gate_g · head_g(feature_g)`, so per-group contributions *are* the prediction rather than a post-hoc approximation.
+- **Hierarchical / multi-head behavior classification**: `single` (backward compatible), `hierarchical` (coarse → fine), or `multi_head` (locomotion / social / self-directed simultaneously).
+- **OBB-aware tracking**: association mixes rotated IoU, appearance embedding, motion prediction, and orientation consistency — each weight independently ablatable.
+- **P2 (stride 4) feature level**: optional high-resolution level for small and densely packed individuals, with the VRAM/latency trade-off exposed in config.
 - **Hierarchical temporal reasoning**: three parallel dilated 1D convolution branches capture motion at 3, 8, and 16-frame scales without 3D convolutions
 - **GRU memory tracking**: per-track hidden states enable persistent identity assignment across frames with configurable TTL
-- **Interaction-aware action classification**: nearest-neighbor distance, relative angle, relative velocity, and pair IoU are fed to the action head alongside visual and temporal features
 - **4-stage training**: each stage freezes previously trained modules to stabilize learning of new components
 - **Config-first design**: all hyperparameters are managed by typed dataclasses and YAML files; no `argparse` in the main API
+- **Research-ready ablation**: P2, OBB, actor, context, motion, orientation, interaction, pose, HTM, and evidence gating can each be disabled from config — and disabling one really removes its parameters
 - **Mixed precision support**: native PyTorch AMP for 1.5–2x training speedup on Ampere+ GPUs
 - **Three model size variants**: `small` (ResNet-18, ~15–20M), `medium` (ResNet-34, ~30–40M), `large` (ResNet-50, ~55–70M) via `get_variant_config()`
+- **Backward compatible**: v1.1 annotations, existing configs, and old checkpoints all still work (see [docs/MIGRATION.md](docs/MIGRATION.md))
 
 ---
 
@@ -133,19 +154,18 @@ If your shell cannot find `python` or `pytest`, use the repository CI workflow a
 ### GUI (Labeling / Training / Video Analysis)
 
 A DearPyGui hub (inspired by [YORU](https://github.com/Kamikouchi-lab/YORU)) bundles
-video **labeling with temporal range annotation**, staged **training with a live metric
-monitor**, and **interactive video analysis** (overlayed playback + per-track action
-timeline). It drives the `yoake` CLI under the hood, so the GUI itself is torch-free.
+video **labeling**, staged **training with a live metric monitor**, and **interactive
+video analysis** (overlayed playback + per-track action timeline). It drives the
+`yoake` CLI under the hood, so the GUI itself is torch-free.
 
 ```bash
 pip install -e ".[gui]"     # dearpygui + opencv-python
 yoake gui                    # or:  python -m htrtdetr.gui  /  gui
 ```
 
-Range labeling lets you assign an action/track over a `[start, end]` frame span and
-linearly interpolates bounding boxes between keyframes (interpolated boxes render dashed),
-so long behaviors don't need per-frame drawing. Output stays in the standard JSON v1.1
-format. See [docs/gui.md](docs/gui.md).
+Boxes are drawn per frame, carried forward with `Space` (propagate) or the
+auto-tracker, and labeled with track ID and action. Output stays in the standard
+JSON v1.1 format. See [docs/gui.md](docs/gui.md).
 
 ### Verify the installation
 
@@ -211,7 +231,12 @@ with torch.no_grad():
 
 ## Dataset Preparation
 
-YOAKE uses a custom JSON annotation format (v1.1) described in full in [docs/DATASET_FORMAT.md](docs/DATASET_FORMAT.md).
+YOAKE uses a custom JSON annotation format described in full in [docs/DATASET_FORMAT.md](docs/DATASET_FORMAT.md).
+
+Schema **v2.0** adds optional `obb` (rotated box) and `keypoints` fields. It is fully
+backward compatible: v1.1 files load unchanged, and a dataset without any OBB is saved
+byte-identically to v1.1 so older tools can still read it. See
+[docs/MIGRATION.md](docs/MIGRATION.md) for the (optional) migration step.
 
 ### Annotation structure (summary)
 
@@ -376,6 +401,48 @@ Results are written to `outputs/eval_unified/results_unified.json`.
 
 Full inference guide: [docs/INFERENCE_GUIDE.md](docs/INFERENCE_GUIDE.md)
 
+### Streaming vs batch
+
+Inference runs in **streaming** mode by default: each frame passes the detector exactly
+once, and past frames are served from per-track ring buffers. The old behaviour — re-feeding
+the whole sliding window every frame — is still available as `inference.mode=batch` for
+numerical comparison.
+
+```bash
+# streaming (default)
+yoake predict source=video.mp4 weights=best.pth
+
+# batch (legacy, for A/B comparison)
+yoake predict source=video.mp4 weights=best.pth inference.mode=batch
+```
+
+**Detections (bbox / score) are identical between the two modes** — streaming only skips
+recomputation, never changes the per-frame detector result. Track IDs can differ, because
+batch rebuilds the tracker per window while streaming keeps one tracker for the whole video.
+
+Measure the difference on your own hardware:
+
+```bash
+python tools/benchmark.py mode=streaming windows=4,8,16 num_frames=24
+```
+
+```
+window=  4: batch 120.20 ms/f | streaming 26.85 ms/f | speedup 4.48x | detector calls 42 -> 12
+window=  8: batch 148.38 ms/f | streaming 25.24 ms/f | speedup 5.88x | detector calls 68 -> 12
+window= 16: batch 173.23 ms/f | streaming 27.98 ms/f | speedup 6.19x | detector calls 78 -> 12
+```
+
+### Explaining a prediction
+
+```python
+out = model(images)
+out.explain_detection(batch_index=0, det_index=2)
+# {'actor': 0.32, 'context': 0.28, 'motion': 0.54, 'interaction': 1.10, 'temporal': 0.41}
+# these sum to the action logit — the explanation IS the prediction, not an approximation
+out.behavior_gates(batch_index=0, det_index=2)
+# {'actor': 0.71, 'motion': 0.83, ...}   learned per-group importance
+```
+
 ### Single video
 
 ```bash
@@ -441,6 +508,10 @@ python tools/analyze.py mode=confidence \
 ---
 
 ## Ablation Studies
+
+Every new component can be switched off from config, and switching one off genuinely
+removes its parameters (not just zeroes its input) so comparisons stay fair. The full
+list and the rationale for each is in [docs/OBB_PIPELINE.md](docs/OBB_PIPELINE.md#7-ablation).
 
 Run variants with different configurations and use the ablation aggregator to compare results:
 
@@ -523,27 +594,41 @@ YOAKE/
 ├── src/
 │   └── htrtdetr/
 │       ├── config/              # HTRTDETRConfig dataclass + YAML loader
+│       ├── geometry/            # OBB geometry: the single source of truth
+│       │   └── obb.py           #   obb<->corners<->aabb, rotated IoU, ProbIoU
 │       ├── data/
-│       │   ├── annotation.py    # JSON v1.1 format: load, save, validate
+│       │   ├── annotation.py    # JSON v1.1/v2.0: load, save, validate, migrate
 │       │   ├── fly_dataset.py   # FlyDataset, build_dataloaders
 │       │   ├── collate.py       # batch collation
 │       │   └── feature_builder.py
+│       ├── tracking/            # OBB-aware tracking + track feature cache
+│       │   ├── associator.py    #   rotated IoU + appearance + motion + orientation
+│       │   ├── track_buffer.py  #   per-track ring buffers (streaming's backbone)
+│       │   ├── tracker.py       #   OnlineTracker (association + re-ID)
+│       │   └── assembly.py      #   track-aligned history construction
 │       ├── models/
-│       │   ├── detector/        # ResNet-18 + FPN + AIFI + DETR decoder
+│       │   ├── detector/        # ResNet + FPN(+P2) + AIFI + DETR decoder (+OBB/pose)
 │       │   ├── temporal/        # HierarchicalTemporalModule (HTM)
 │       │   ├── id_head/         # MemoryIDHead (GRU)
-│       │   ├── action_head/     # ActionHead (MLP)
-│       │   ├── fusion/          # MultiHeadFeatureRouter
+│       │   ├── action_head/     # ActionHead (MLP, legacy-compatible)
+│       │   ├── behavior/        # 2-stream behavior branch
+│       │   │   ├── roi.py       #   actor rotated crop + context expanded crop
+│       │   │   ├── kinematics.py#   motion / orientation / interaction features
+│       │   │   ├── evidence_head.py # additive evidence decomposition + classifiers
+│       │   │   └── branch.py    #   BehaviorBranch
+│       │   ├── fusion/          # TrackTemporalFusion, MultiHeadFeatureRouter
 │       │   └── ht_rtdetr.py     # Unified HTRTDETRModel
 │       ├── training/
 │       │   ├── stage_trainers.py  # Stage1–4 Trainer classes
-│       │   ├── losses.py          # Combined loss functions
-│       │   ├── matching.py        # Hungarian matcher
+│       │   ├── losses.py          # Detection/OBB/pose/action/ID losses
+│       │   ├── matching.py        # Hungarian matcher (rotated-IoU aware)
 │       │   └── optimizer.py       # AdamW + cosine scheduler
 │       ├── evaluation/
-│       │   └── evaluator.py     # DetectionEvaluator, ActionEvaluator, TrackingEvaluator
+│       │   ├── evaluator.py     # DetectionEvaluator, ActionEvaluator, TrackingEvaluator
+│       │   └── advanced.py      # rotated AP, MOTA/IDF1/HOTA, multi-head, latency
 │       ├── inference/
-│       │   └── inferencer.py    # Inferencer class
+│       │   ├── inferencer.py    # Inferencer (batch mode, legacy)
+│       │   └── streaming.py     # StreamingInferencer (default; 1 detector pass/frame)
 │       ├── analysis/
 │       │   └── analyzer.py      # Timeline, distribution, ablation tools
 │       └── utils/
@@ -568,7 +653,9 @@ YOAKE/
 │   └── stage4_unified.yaml      # Stage 4 config overrides
 ├── docs/
 │   ├── MODEL_CARD.md            # HuggingFace-style model card
-│   ├── DATASET_FORMAT.md        # Annotation format specification v1.1
+│   ├── DATASET_FORMAT.md        # Annotation format specification
+│   ├── MIGRATION.md             # v1.1->v2.0, config, checkpoint migration
+│   ├── OBB_PIPELINE.md          # OBB / track-aligned / streaming design rationale
 │   ├── TRAINING_GUIDE.md        # Stage-by-stage training instructions
 │   ├── INFERENCE_GUIDE.md       # Inference, ONNX, and analysis guide
 │   ├── RELEASE_CHECKLIST.md     # Pre-release verification checklist

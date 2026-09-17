@@ -106,6 +106,7 @@ def detections_from_adapter(
     class_ids = _to_np(det.get("class_ids"))
     feats = _to_np(det.get("features")) if with_dense else None
     track_ids = _to_np(det.get("track_ids"))
+    obb = _to_np(det.get("obb"))
 
     out: List[Detection] = []
     for i in range(boxes.shape[0]):
@@ -121,6 +122,14 @@ def detections_from_adapter(
         )
         if feats is not None and i < len(feats):
             d.dense_feature = feats[i].astype(np.float32)
+        # OBB は正規化座標で来るので画素へ戻す (theta はスケール不変なのでそのまま)
+        if obb is not None and i < len(obb):
+            o = obb[i].astype(np.float32).copy()
+            o[0] *= orig_w
+            o[1] *= orig_h
+            o[2] *= orig_w
+            o[3] *= orig_h
+            d.obb = o
         # track_id は L3 (ここでは fused) が付与。raw_score は L1b の所有領域なので触らない。
         if track_ids is not None and i < len(track_ids):
             d.track_id = int(track_ids[i])

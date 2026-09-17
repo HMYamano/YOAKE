@@ -12,7 +12,8 @@ from typing import Optional, Tuple
 
 from ...pipeline.registry import register
 from ...pipeline.schema import (
-    CAP_BOXES, CAP_CLASS, CAP_DENSE_FEATURES, CAP_DET_SCORE, CAP_IMAGE, FrameWindow,
+    CAP_BOXES, CAP_CLASS, CAP_DENSE_FEATURES, CAP_DET_SCORE, CAP_IMAGE, CAP_OBB,
+    FrameWindow,
 )
 from ...pipeline.stage import TIER_DETECTION, PipelineContext, StageBase
 from ._common import (
@@ -40,6 +41,7 @@ class RTDETRStage(StageBase):
         self._model = None
         self._device = "cpu"
         self._size: Tuple[int, int] = (640, 640)
+        self._provides_obb = False
 
     def setup(self, ctx: PipelineContext) -> None:
         import torch
@@ -51,6 +53,8 @@ class RTDETRStage(StageBase):
         self._size = resolve_size(self.image_size, cfg)
         if self.score_threshold is None:
             self.score_threshold = float(cfg.model.detector.score_threshold)
+        # checkpoint が OBB detector かどうかは config から判る
+        self._provides_obb = bool(cfg.model.detector.obb.enabled)
 
     def process(self, window: FrameWindow, ctx: PipelineContext) -> FrameWindow:
         model = self._model
@@ -65,9 +69,13 @@ class RTDETRStage(StageBase):
                 dets = model.det_adapter.extract_valid_detections(
                     det_out.pred_logits, det_out.pred_boxes, det_out.query_features,
                     score_threshold=self.score_threshold,
+                    pred_obb=det_out.pred_obb,
                 )
             fr.detections = detections_from_adapter(dets[0], W0, H0, with_dense=True)
         window.available.update(self.provides)
+        # OBB detector のときだけ obb capability を供給する (下流の resolver がこれを見る)
+        if self._provides_obb:
+            window.available.add(CAP_OBB)
         return window
 
     def teardown(self) -> None:

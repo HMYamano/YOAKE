@@ -35,12 +35,16 @@ CAP_APPEARANCE_EMB = "appearance_embedding" # L3 (任意)
 CAP_KINEMATICS = "kinematics"               # L4: 速度/向き/軌跡
 CAP_POSE = "pose"                           # 姿勢/向き (任意段)
 CAP_DIRECTED_INTER = "directed_interaction" # L5
+CAP_OBB = "obb"                             # L1: 回転矩形 (OBB detector が出す)
+CAP_ACTION = "action"                       # 行動ラベル (behavior 段)
+CAP_EXPLANATION = "explanation"             # 行動判断の evidence 寄与
 
 # 既知 capability トークン (registry / resolver がタイポ検出に使う)
 KNOWN_CAPABILITIES: Set[str] = {
     CAP_IMAGE, CAP_BOXES, CAP_CLASS, CAP_DET_SCORE, CAP_TEMPORAL_STABLE,
     CAP_DENSE_FEATURES, CAP_STATIC_RELATION, CAP_TRACK_ID, CAP_APPEARANCE_EMB,
-    CAP_KINEMATICS, CAP_POSE, CAP_DIRECTED_INTER,
+    CAP_KINEMATICS, CAP_POSE, CAP_DIRECTED_INTER, CAP_OBB, CAP_ACTION,
+    CAP_EXPLANATION,
 }
 
 
@@ -66,6 +70,12 @@ class Detection:
     orientation: Optional[float] = None              # pose段: 体軸方向 rad
     embedding: Optional[np.ndarray] = None           # L3: 見た目埋め込み
     dense_feature: Optional[np.ndarray] = None       # L1(DETR): query特徴 (L3/L5 神経系が使う)
+    # --- OBB / 行動 / 説明 (あれば付く) ---
+    obb: Optional[np.ndarray] = None                 # L1: [cx, cy, w, h, theta] 画素/rad
+    context_box: Optional[np.ndarray] = None         # 行動認識が使った拡大 AABB
+    action_id: Optional[int] = None                  # behavior 段
+    action_score: Optional[float] = None
+    evidence: Optional[dict] = None                  # {group: logit 寄与}
 
     @property
     def cx(self) -> float:
@@ -78,6 +88,26 @@ class Detection:
     @property
     def center(self) -> np.ndarray:
         return np.array([self.cx, self.cy], dtype=np.float32)
+
+    @property
+    def has_obb(self) -> bool:
+        """真の回転矩形を持つか。"""
+        return self.obb is not None
+
+    def get_obb(self) -> np.ndarray:
+        """
+        OBB を返す。未設定なら bbox から theta=0 で導出する。
+
+        下流の段が「OBB があるかどうか」で分岐しなくて済むようにするための
+        安全な fallback (``has_obb`` で真偽は区別できる)。
+        """
+        if self.obb is not None:
+            return self.obb
+        x1, y1, x2, y2 = (float(v) for v in self.bbox[:4])
+        return np.array(
+            [(x1 + x2) * 0.5, (y1 + y2) * 0.5, max(x2 - x1, 0.0), max(y2 - y1, 0.0), 0.0],
+            dtype=np.float32,
+        )
 
 
 @dataclass

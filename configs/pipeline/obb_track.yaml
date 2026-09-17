@@ -1,0 +1,59 @@
+# OBB 検出 + OBB 対応トラッキング + 運動 + 相互作用
+#
+# 細長い個体が接近して並ぶ場面向けの構成。軸平行 IoU だと隣の個体の箱と大きく
+# 重なって ID が入れ替わりやすいので、回転を考慮した重なりと体軸の一致で関連付ける。
+#
+#   yoake pipeline config=configs/pipeline/obb_track.yaml source=data/videos/fly.mp4
+#
+# 前提: checkpoint が OBB detector (detector.type=rtdetr_obb) で学習されていること。
+# AABB の checkpoint を指定した場合、L3_tracking.obb は自動で軸平行 IoU に fallback する。
+
+pipeline:
+  mode: lenient
+  device: auto
+  window_size: 16
+  stride: 8
+  inputs: [image]
+
+  layers:
+    # --- L1: OBB 検出 ---
+    L1_detection:
+      enabled: true
+      backend: rtdetr
+      params:
+        checkpoint: runs/train/stage1/weights/best.pth
+        score_threshold: 0.3
+
+    # --- L1b: 時系列で検出を安定化 (欠損補間 + スコア平滑化) ---
+    L1b_stabilization:
+      enabled: true
+      backend: temporal_nms
+      params:
+        iou_link: 0.5
+
+    # --- L3: OBB 対応トラッキング ---
+    L3_tracking:
+      enabled: true
+      backend: obb
+      params:
+        track_thresh: 0.5
+        low_thresh: 0.1
+        match_thresh: 0.3
+        track_buffer: 30
+        # association コストの重み (0 にするとその手がかりを使わない = ablation)
+        iou_weight: 1.0
+        orientation_weight: 0.5   # 体軸の一致 — すれ違いでの取り違えを減らす
+        motion_weight: 0.3        # 等速度予測 — 速い個体を追いやすくする
+        use_rotated_iou: true
+
+    # --- L4: 運動 (速度 / 向き / 軌跡) ---
+    L4_motion:
+      enabled: true
+      backend: kinematic
+      params:
+        smooth_window: 3
+
+    # --- L5: 有向相互作用 (A→B と B→A を区別する) ---
+    L5_interaction:
+      enabled: true
+      backend: heuristic

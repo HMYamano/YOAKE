@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 def _ask_confirm(message: str) -> bool:
@@ -475,19 +475,103 @@ def run_predict(argv: list) -> None:
     action_names = cfg.eval.action_names
     if len(action_names) != cfg.model.action_head.num_actions:
         action_names = [str(i) for i in range(cfg.model.action_head.num_actions)]
+    class_names = [str(i) for i in range(cfg.model.detector.head.num_classes)]
+    window_size = int(overrides.get("window_size", cfg.data.window_size))
+    max_frames = int(overrides["max_frames"]) if "max_frames" in overrides else None
+
+    if cfg.inference.mode == "streaming":
+        # 各フレームを detector に 1 回だけ通す (既定)。窓長に依存しない。
+        _run_predict_streaming(
+            cfg, model, source, output_dir, img_size,
+            action_names, class_names, window_size, max_frames,
+        )
+        return
+
+    # mode="batch": 毎フレーム窓全体を通す従来実装 (数値比較・回帰検証用)
     inferencer = Inferencer(
         model=model,
         cfg=cfg.inference,
         action_names=action_names,
-        class_names=[str(i) for i in range(cfg.model.detector.head.num_classes)],
-        window_size=int(overrides.get("window_size", cfg.data.window_size)),
+        class_names=class_names,
+        window_size=window_size,
     )
     inferencer.run(
         input_path=source,
         output_dir=output_dir,
         image_size=img_size,
-        max_frames=int(overrides["max_frames"]) if "max_frames" in overrides else None,
+        max_frames=max_frames,
     )
+
+
+def _run_predict_streaming(
+    cfg, model, source: str, output_dir: str, img_size,
+    action_names: list, class_names: list, window_size: int,
+    max_frames: Optional[int],
+) -> None:
+    """streaming 推論で動画/画像ディレクトリを処理し、注釈動画と JSON を書く。"""
+    import json
+
+    from .inference import StreamingInferencer, VideoWriter, draw_detections
+    from .inference.inferencer import read_image_dir_frames, read_video_frames
+
+    src = Path(source)
+    if src.is_dir():
+        frame_gen = read_image_dir_frames(str(src))
+    elif src.exists():
+        frame_gen = read_video_frames(str(src), max_frames=max_frames)
+    else:
+        raise FileNotFoundError(f"Input not found: {src}")
+
+    si = StreamingInferencer(
+        model=model,
+        cfg=cfg.inference,
+        action_names=action_names,
+        class_names=class_names,
+        window_size=window_size,
+        image_size=img_size,
+    )
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    writer: Optional[VideoWriter] = None
+    results: Dict[str, Any] = {}
+
+    for frame_idx, frame_rgb, fps in frame_gen:
+        res = si.process_frame(frame_rgb, frame_index=frame_idx)
+        results[str(frame_idx)] = res.to_json()
+
+        if writer is None:
+            h, w = frame_rgb.shape[:2]
+            writer = VideoWriter(str(out_dir / "output.mp4"), fps, (w, h))
+        writer.write(draw_detections(
+            frame_rgb, res.boxes_xyxy, res.scores, res.class_ids,
+            res.track_ids, res.action_ids, action_names, class_names,
+            show_bbox=cfg.inference.show_bbox,
+            show_id=cfg.inference.show_id,
+            show_action=cfg.inference.show_action,
+            show_confidence=cfg.inference.show_confidence,
+            thickness=cfg.inference.bbox_thickness,
+            font_scale=cfg.inference.font_scale,
+        ))
+
+    if writer is not None:
+        writer.release()
+
+    with open(out_dir / "predictions.json", "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+    stats = si.runtime_stats()
+    with open(out_dir / "runtime_stats.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    print(
+        f"Streaming inference complete. frames={stats.get('frames', 0)} "
+        f"FPS={stats.get('fps', 0):.1f} "
+        f"(detector {stats.get('detector_ms', 0):.1f}ms / "
+        f"tracking {stats.get('tracking_ms', 0):.1f}ms / "
+        f"temporal {stats.get('temporal_ms', 0):.1f}ms / "
+        f"behavior {stats.get('behavior_ms', 0):.1f}ms per frame)"
+    )
+    print(f"Results: {out_dir / 'predictions.json'}")
 
 
 def run_pipeline(argv: list) -> None:

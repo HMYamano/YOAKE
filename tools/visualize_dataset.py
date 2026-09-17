@@ -85,10 +85,10 @@ class DatasetVisualizer:
         # メニューバー
         menubar = tk.Menu(self.root)
         fm = tk.Menu(menubar, tearoff=0)
-        fm.add_command(label="アノテーション JSON を開く...", command=self._open_file)
+        fm.add_command(label="Open annotation JSON...", command=self._open_file)
         fm.add_separator()
-        fm.add_command(label="終了", command=self.root.quit)
-        menubar.add_cascade(label="ファイル", menu=fm)
+        fm.add_command(label="Quit", command=self.root.quit)
+        menubar.add_cascade(label="File", menu=fm)
         self.root.config(menu=menubar)
 
         # ---- 全体レイアウト ----
@@ -118,7 +118,7 @@ class DatasetVisualizer:
         return tk.Label(parent, text=text, bg="#2b2b2b", fg="#cccccc", **kw)
 
     def _build_left_pane(self, parent):
-        self._lbl(parent, "シーケンス", font=("", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        self._lbl(parent, "Sequences", font=("", 10, "bold")).pack(anchor="w", pady=(0, 2))
 
         frame = tk.Frame(parent, bg="#2b2b2b")
         frame.pack(fill=tk.BOTH, expand=True)
@@ -153,18 +153,18 @@ class DatasetVisualizer:
 
         # 再生ボタン
         self.play_btn = tk.Button(
-            ctrl, text="▶ 再生", width=7, command=self._toggle_play,
+            ctrl, text="> Play", width=7, command=self._toggle_play,
             bg="#3a7bd5", fg="white", relief=tk.FLAT, activebackground="#2a5bc5",
         )
         self.play_btn.pack(side=tk.LEFT, padx=(0, 4))
 
-        tk.Button(ctrl, text="|◀", width=3, command=self._goto_first,
+        tk.Button(ctrl, text="|<", width=3, command=self._goto_first,
                   bg="#3c3c3c", fg="#cccccc", relief=tk.FLAT).pack(side=tk.LEFT)
-        tk.Button(ctrl, text="◀", width=3, command=self._prev_frame,
+        tk.Button(ctrl, text="<", width=3, command=self._prev_frame,
                   bg="#3c3c3c", fg="#cccccc", relief=tk.FLAT).pack(side=tk.LEFT)
-        tk.Button(ctrl, text="▶", width=3, command=self._next_frame,
+        tk.Button(ctrl, text=">", width=3, command=self._next_frame,
                   bg="#3c3c3c", fg="#cccccc", relief=tk.FLAT).pack(side=tk.LEFT)
-        tk.Button(ctrl, text="▶|", width=3, command=self._goto_last,
+        tk.Button(ctrl, text=">|", width=3, command=self._goto_last,
                   bg="#3c3c3c", fg="#cccccc", relief=tk.FLAT).pack(side=tk.LEFT)
 
         # フレームスライダー
@@ -184,7 +184,7 @@ class DatasetVisualizer:
                         bg="#1e1e1e", fg="#cccccc", insertbackground="white")
         jump.pack(side=tk.LEFT, padx=(0, 2))
         jump.bind("<Return>", self._on_jump)
-        self._lbl(ctrl, "へ").pack(side=tk.LEFT)
+        self._lbl(ctrl, "Go to").pack(side=tk.LEFT)
 
         # 表示オプション
         opts = tk.Frame(parent, bg="#2b2b2b")
@@ -201,12 +201,12 @@ class DatasetVisualizer:
                 activebackground="#2b2b2b", activeforeground="#ffffff",
             )
 
-        _chk(opts, "Bbox表示", self.show_bbox_var).pack(side=tk.LEFT, padx=4)
-        _chk(opts, "ID表示",   self.show_id_var  ).pack(side=tk.LEFT, padx=4)
-        _chk(opts, "塗りつぶし", self.show_fill_var).pack(side=tk.LEFT, padx=4)
+        _chk(opts, "Show bbox", self.show_bbox_var).pack(side=tk.LEFT, padx=4)
+        _chk(opts, "Show ID",   self.show_id_var  ).pack(side=tk.LEFT, padx=4)
+        _chk(opts, "Fill", self.show_fill_var).pack(side=tk.LEFT, padx=4)
 
         # スピード
-        self._lbl(opts, "再生速度:").pack(side=tk.LEFT, padx=(12, 2))
+        self._lbl(opts, "Speed:").pack(side=tk.LEFT, padx=(12, 2))
         self.speed_var = tk.DoubleVar(value=1.0)
         speed_combo = ttk.Combobox(opts, textvariable=self.speed_var,
                                    values=[0.25, 0.5, 1.0, 2.0, 4.0], width=5, state="readonly")
@@ -215,13 +215,13 @@ class DatasetVisualizer:
         speed_combo.bind("<<ComboboxSelected>>", lambda e: None)
 
         # ステータスバー
-        self.status_var = tk.StringVar(value="アノテーション JSON を開いてください")
+        self.status_var = tk.StringVar(value="Open an annotation JSON to begin")
         tk.Label(parent, textvariable=self.status_var,
                  bg="#1a1a1a", fg="#888888", anchor="w",
                  relief=tk.FLAT, padx=4).pack(fill=tk.X, pady=(4, 0))
 
     def _build_right_pane(self, parent):
-        self._lbl(parent, "物体一覧", font=("", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        self._lbl(parent, "Objects", font=("", 10, "bold")).pack(anchor="w", pady=(0, 2))
 
         frame = tk.Frame(parent, bg="#2b2b2b")
         frame.pack(fill=tk.BOTH, expand=True)
@@ -261,7 +261,7 @@ class DatasetVisualizer:
 
     def _open_file(self):
         path = filedialog.askopenfilename(
-            title="アノテーション JSON を選択",
+            title="Select annotation JSON",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
             initialdir=str(Path.home()),
         )
@@ -273,7 +273,7 @@ class DatasetVisualizer:
             with open(path, "r", encoding="utf-8") as f:
                 self.annotation = json.load(f)
         except Exception as e:
-            messagebox.showerror("読み込みエラー", str(e))
+            messagebox.showerror("Load error", str(e))
             return
 
         self.root.title(f"YOAKE Dataset Visualizer  —  {Path(path).name}")
@@ -323,7 +323,7 @@ class DatasetVisualizer:
         fps  = video.get("fps", 25.0)
         w    = video.get("width", "?")
         h    = video.get("height", "?")
-        self.seq_info_var.set(f"{video['video_id']}\n{w}×{h}  {fps} fps\n{n} フレーム")
+        self.seq_info_var.set(f"{video['video_id']}\n{w}x{h}  {fps} fps\n{n} frames")
         self._render()
 
     # ------------------------------------------------------------------
@@ -408,12 +408,12 @@ class DatasetVisualizer:
 
     def _start_play(self):
         self._playing = True
-        self.play_btn.config(text="⏸ 停止", bg="#c0392b")
+        self.play_btn.config(text="|| Pause", bg="#c0392b")
         self._schedule_next()
 
     def _stop_play(self):
         self._playing = False
-        self.play_btn.config(text="▶ 再生", bg="#3a7bd5")
+        self.play_btn.config(text="> Play", bg="#3a7bd5")
         if self._play_job:
             self.root.after_cancel(self._play_job)
             self._play_job = None
@@ -464,7 +464,7 @@ class DatasetVisualizer:
         except Exception:
             img = Image.new("RGB", (img_w, img_h), (28, 28, 28))
             draw = ImageDraw.Draw(img)
-            draw.text((10, 10), "画像が見つかりません:", fill=(200, 80, 80))
+            draw.text((10, 10), "Image not found:", fill=(200, 80, 80))
             draw.text((10, 30), img_path[:80], fill=(180, 60, 60))
 
         # アノテーション描画
@@ -489,7 +489,7 @@ class DatasetVisualizer:
 
         # ステータスバー
         p = Path(img_path)
-        self.status_var.set(f"{p.parent.name}/{p.name}  |  物体: {len(objects)}個")
+        self.status_var.set(f"{p.parent.name}/{p.name}  |  objects: {len(objects)}")
 
     def _draw_boxes(self, img, objects, class_names, action_names):
         draw  = ImageDraw.Draw(img, "RGBA")
@@ -565,8 +565,8 @@ class DatasetVisualizer:
         if len(ids) > 15:
             id_str += " ..."
         self.stats_var.set(
-            f"物体数: {n}\n"
-            f"ユニークID: {len(ids)} 個\n"
+            f"Objects: {n}\n"
+            f"Unique IDs: {len(ids)}\n"
             f"{id_str}"
         )
 
@@ -588,7 +588,7 @@ def _parse(argv):
 
 def main():
     if not _PIL_OK:
-        print("ERROR: Pillow が必要です。")
+        print("ERROR: Pillow is required.")
         print("  pip install Pillow")
         sys.exit(1)
 

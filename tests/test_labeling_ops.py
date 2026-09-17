@@ -1,5 +1,5 @@
 """
-test_labeling_range.py — 範囲ラベリング (bbox 補間) と JSON ラウンドトリップ
+test_labeling_ops.py — bbox 補間ユーティリティと JSON ラウンドトリップ
 
 dearpygui / torch 非依存で実行できる (純関数 + data/annotation.py の I/O)。
 AnnObject の dict 変換テストのみ dearpygui が必要なので importorskip でガードする。
@@ -13,7 +13,6 @@ from htrtdetr.gui.labeling_ops import (
     clamp_bbox,
     interpolate_bbox,
     interpolate_between,
-    resolve_range_boxes,
     round_bbox,
 )
 
@@ -47,42 +46,6 @@ def test_interpolate_between_reversed_and_single():
     assert single == [(3, [1, 2, 3, 4])]
 
 
-# ─── resolve_range_boxes (apply_range の中核) ──────────────────────────────
-
-def test_resolve_range_two_anchors_midpoint():
-    boxes = resolve_range_boxes([(0, [0, 0, 10, 10]), (4, [40, 40, 50, 50])], 0, 4)
-    assert boxes[2] == [20, 20, 30, 30]
-    assert boxes[0] == [0, 0, 10, 10]
-    assert boxes[4] == [40, 40, 50, 50]
-
-
-def test_resolve_range_single_anchor_holds():
-    boxes = resolve_range_boxes([(2, [5, 5, 15, 15])], 0, 4)
-    assert set(boxes.keys()) == {0, 1, 2, 3, 4}
-    assert all(v == [5, 5, 15, 15] for v in boxes.values())
-
-
-def test_resolve_range_three_anchors_piecewise():
-    anchors = [(0, [0, 0, 10, 10]), (2, [20, 0, 30, 10]), (4, [20, 40, 30, 50])]
-    boxes = resolve_range_boxes(anchors, 0, 4)
-    # 区間 [0,2]: x が 0→20 に線形 (frame1 で x=10)
-    assert boxes[1] == [10, 0, 20, 10]
-    # 区間 [2,4]: y が 0→40 に線形 (frame3 で y=20)
-    assert boxes[3] == [20, 20, 30, 30]
-
-
-def test_resolve_range_empty_anchors():
-    assert resolve_range_boxes([], 0, 5) == {}
-
-
-def test_resolve_range_holds_outside_anchor_span():
-    # アンカーが [2,3] のみ、範囲は [0,5] → 外側は最近傍を保持
-    boxes = resolve_range_boxes([(2, [0, 0, 4, 4]), (3, [10, 10, 14, 14])], 0, 5)
-    assert boxes[0] == [0, 0, 4, 4]     # 前側は最初のアンカー
-    assert boxes[1] == [0, 0, 4, 4]
-    assert boxes[5] == [10, 10, 14, 14]  # 後側は最後のアンカー
-
-
 # ─── clamp / round ─────────────────────────────────────────────────────────
 
 def test_clamp_and_round_bbox():
@@ -95,7 +58,7 @@ def test_clamp_and_round_bbox():
 
 # ─── v1.1 JSON ラウンドトリップ (補間 box を保存 → 読込 → 検証) ────────────
 
-def test_range_labeling_json_roundtrip(tmp_path):
+def test_interpolated_boxes_json_roundtrip(tmp_path):
     from htrtdetr.data.annotation import (
         DatasetAnno,
         FrameAnno,
@@ -107,8 +70,7 @@ def test_range_labeling_json_roundtrip(tmp_path):
     )
 
     W = H = 640
-    anchors = [(0, [10, 10, 30, 30]), (10, [110, 110, 130, 130])]
-    boxes = resolve_range_boxes(anchors, 0, 10)
+    boxes = dict(interpolate_between(0, [10, 10, 30, 30], 10, [110, 110, 130, 130]))
 
     frames = []
     for f in range(0, 11):

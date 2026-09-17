@@ -1,5 +1,15 @@
 # YOAKE Architecture
 
+> **Note (OBB / track-aligned / streaming update)**
+> このドキュメントは基本構成 (AABB detector + query-aligned 時間モデル + batch 推論)
+> を説明しています。現在の既定構成は
+> **OBB 検出 → OBB 対応トラッキング → track 単位の時間モデル → 2-stream 行動認識
+> → evidence 分解**であり、推論は streaming が既定です。
+> 新しいデータフローと設計判断の根拠は [OBB_PIPELINE.md](OBB_PIPELINE.md)、
+> 既存資産の移行は [MIGRATION.md](MIGRATION.md) を参照してください。
+> 以下の記述は `detector.obb.enabled=false` / `track_aligned_temporal=false` /
+> `inference.mode=batch` の構成として今も有効です。
+
 ## Overview
 
 **YOAKE (Hierarchical Temporal RT-DETR)** は、ショウジョウバエなどの小動物を対象とした

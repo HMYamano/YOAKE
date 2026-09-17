@@ -16,7 +16,7 @@ from .stabilization import temporal_nms_stage  # noqa: F401
 # --- 静的関係 (L2) ---
 from .relation import geometric_stage  # noqa: F401
 # --- 追跡 (L3) ---
-from .tracking import bytetrack_stage, memory_id_stage  # noqa: F401
+from .tracking import bytetrack_stage, memory_id_stage, obb_track_stage  # noqa: F401
 # --- 運動 (L4) ---
 from .motion import kinematic_stage  # noqa: F401
 # --- pose (任意) ---

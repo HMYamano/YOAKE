@@ -143,3 +143,38 @@ def collect_matched_gt(
     if not all_labels:
         return torch.zeros(0, dtype=torch.long)
     return torch.cat(all_labels, dim=0)
+
+
+def collect_matched_gt_tensor(
+    det_results: List[Dict],
+    targets: List[Dict],
+    key: str,                # 'keypoints' など多次元の GT
+    iou_threshold: float = 0.5,
+) -> torch.Tensor:
+    """
+    多次元 GT (keypoints など) を検出にマッチさせて concat する。
+
+    ``collect_matched_gt`` はスカラーラベル (action_id / track_id) 用で 1D しか
+    扱えないため、(N, K, 3) のような GT にはこちらを使う。未マッチの検出には
+    ゼロ行が入る (損失側で可視性マスクにより無視される)。
+
+    Returns:
+        (N_total, ...) — GT の後続次元を保った tensor
+    """
+    parts: List[torch.Tensor] = []
+    for det, tgt in zip(det_results, targets):
+        pred_boxes = det.get("boxes", torch.zeros(0, 4))
+        gt_attr = tgt.get(key)
+        n_pred = pred_boxes.shape[0]
+        if gt_attr is None or n_pred == 0:
+            continue
+        gt_attr = gt_attr.to(pred_boxes.device)
+        asgn = assign_gt_to_detections(pred_boxes, tgt, iou_threshold)
+        idx = asgn["matched_gt_idx"]
+        matched = gt_attr[idx.clamp(min=0)]
+        matched[idx < 0] = 0
+        parts.append(matched)
+
+    if not parts:
+        return torch.zeros(0)
+    return torch.cat(parts, dim=0)

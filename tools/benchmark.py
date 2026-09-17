@@ -25,8 +25,11 @@ YOAKE の推論速度・メモリ使用量を計測し、
       repeats=100
 
 mode:
-  image_size | clip_length | batch_size | decoder_layers | single
-  single: 1 解像度での全モジュール breakdown 計測
+  image_size | clip_length | batch_size | decoder_layers | single | streaming
+  single:    1 解像度での全モジュール breakdown 計測
+  streaming: 旧 sliding-window 再計算 vs 新 streaming (ring buffer) の速度比較。
+             本改修の中心的な高速化を測る:
+                 python tools/benchmark.py mode=streaming windows=4,8,16 num_frames=24
 """
 
 from __future__ import annotations
@@ -133,7 +136,7 @@ def _load_model(checkpoint_path: Optional[str], device: torch.device):
         load_checkpoint(checkpoint_path, model)
         print(f"  Loaded checkpoint: {checkpoint_path}")
     else:
-        print(f"  No checkpoint — using random weights.")
+        print("  No checkpoint - using random weights.")
 
     model.eval()
     return model
@@ -383,6 +386,132 @@ def _print_table(rows: List[Dict], title: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Streaming vs sliding-window (旧方式) の比較
+# ---------------------------------------------------------------------------
+
+def _bench_streaming_vs_batch(
+    checkpoint: Optional[str],
+    device: torch.device,
+    image_size: int,
+    num_frames: int,
+    windows: List[int],
+) -> List[Dict[str, Any]]:
+    """
+    **本改修の中心的な高速化**を測る:
+
+        旧: 毎フレーム窓全体を detector に通す (sliding-window で再計算)
+        新: 各フレームを 1 回だけ通し、過去は track ごとの ring buffer から再利用
+
+    detector の呼び出し回数も併記する。旧方式は window にほぼ比例して増え、
+    新方式はフレーム数に等しく一定であることが、そのまま速度差の説明になる。
+    """
+    import numpy as np
+
+    from htrtdetr.config.config import InferenceConfig, get_stage1_config
+    from htrtdetr.inference import StreamingInferencer
+    from htrtdetr.models import build_model
+    from htrtdetr.utils.misc import load_checkpoint
+
+    cfg = get_stage1_config()
+    model = build_model(cfg.model)
+    if checkpoint and Path(checkpoint).exists():
+        load_checkpoint(checkpoint, model)
+        print(f"  Loaded checkpoint: {checkpoint}")
+    else:
+        # ランダム重みでは class head の prior により検出が 1 つも閾値を超えず、
+        # tracking / temporal / behavior が丸ごとスキップされてしまう。それでは
+        # 段別 breakdown が全て 0 になり比較にならないので、閾値を下げて
+        # 下流段も実際に走らせる (検出内容に意味は無いが計算量は代表的になる)。
+        cfg.model.detector.score_threshold = 0.0
+        model.cfg.detector.score_threshold = 0.0
+        print("  No checkpoint - using random weights "
+              "(score_threshold=0 so downstream stages still run).")
+    model.to(device).eval()
+    model.set_stage(4)
+
+    rng = np.random.default_rng(0)
+    frames = [
+        rng.integers(0, 255, (image_size, image_size, 3), dtype=np.uint8)
+        for _ in range(num_frames)
+    ]
+
+    rows: List[Dict[str, Any]] = []
+    for window in windows:
+        si = StreamingInferencer(
+            model, InferenceConfig(use_amp=False),
+            window_size=window, image_size=(image_size, image_size),
+            device=device,
+        )
+
+        # --- 旧方式: sliding window で毎回窓全体を通す ---
+        calls = {"n": 0}
+        orig = model.detector.forward
+
+        def _counting(x, _orig=orig, _c=calls):
+            _c["n"] += 1
+            return _orig(x)
+
+        model.detector.forward = _counting
+        try:
+            _reset_peak()
+            buf: List = []
+            _sync()
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                for f in frames:
+                    buf.append(si.preprocess(f))
+                    if len(buf) > window:
+                        buf.pop(0)
+                    _ = model(torch.cat(buf, dim=0).unsqueeze(0))
+            _sync()
+            t_batch = time.perf_counter() - t0
+            batch_calls = calls["n"]
+            batch_mem = _peak_gpu_memory_mb()
+
+            # --- 新方式: streaming ---
+            calls["n"] = 0
+            si.reset()
+            _reset_peak()
+            _sync()
+            t0 = time.perf_counter()
+            for i, f in enumerate(frames):
+                si.process_frame(f, frame_index=i)
+            _sync()
+            t_stream = time.perf_counter() - t0
+            stream_calls = calls["n"]
+            stream_mem = _peak_gpu_memory_mb()
+        finally:
+            model.detector.forward = orig
+
+        breakdown = si.runtime_stats()
+        rows.append({
+            "window": window,
+            "frames": num_frames,
+            "batch_ms_per_frame": round(t_batch / num_frames * 1000, 2),
+            "streaming_ms_per_frame": round(t_stream / num_frames * 1000, 2),
+            "speedup": round(t_batch / max(t_stream, 1e-9), 2),
+            "batch_detector_calls": batch_calls,
+            "streaming_detector_calls": stream_calls,
+            "call_reduction": round(batch_calls / max(stream_calls, 1), 2),
+            "batch_fps": round(num_frames / max(t_batch, 1e-9), 2),
+            "streaming_fps": round(num_frames / max(t_stream, 1e-9), 2),
+            "batch_peak_gpu_mb": batch_mem,
+            "streaming_peak_gpu_mb": stream_mem,
+            "detector_ms": breakdown.get("detector_ms", 0.0),
+            "tracking_ms": breakdown.get("tracking_ms", 0.0),
+            "temporal_ms": breakdown.get("temporal_ms", 0.0),
+            "behavior_ms": breakdown.get("behavior_ms", 0.0),
+        })
+        print(
+            f"  window={window:>3}: batch {rows[-1]['batch_ms_per_frame']:>8.2f} ms/f | "
+            f"streaming {rows[-1]['streaming_ms_per_frame']:>8.2f} ms/f | "
+            f"speedup {rows[-1]['speedup']:>5.2f}x | "
+            f"detector calls {batch_calls} -> {stream_calls}"
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = _parse(sys.argv[1:])
@@ -410,6 +539,14 @@ def main() -> None:
         print("\nSweeping decoder layers (builds separate models)...")
         rows = _sweep_decoder_layers(checkpoint, device, warmup, repeats)
         title = "Decoder Layers Comparison"
+    elif mode == "streaming":
+        windows = [int(w) for w in args.get("windows", "4,8,16").split(",")]
+        num_frames = int(args.get("num_frames", "24"))
+        print(f"\nStreaming vs sliding-window (frames={num_frames}, windows={windows})...")
+        rows = _bench_streaming_vs_batch(
+            checkpoint, device, image_size, num_frames, windows
+        )
+        title = "Streaming vs Sliding-Window Inference"
     else:
         model = _load_model(checkpoint, device)
 
@@ -435,8 +572,10 @@ def main() -> None:
             title = f"Single Benchmark ({image_size}px, bs={batch_size})"
 
         else:
-            raise ValueError(f"Unknown mode: {mode!r}. "
-                             "Choose: single | image_size | clip_length | batch_size | decoder_layers")
+            raise ValueError(
+                f"Unknown mode: {mode!r}. Choose: single | image_size | "
+                "clip_length | batch_size | decoder_layers | streaming"
+            )
 
     _print_table(rows, title)
 

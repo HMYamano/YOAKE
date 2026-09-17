@@ -413,3 +413,134 @@ def move_batch_to_device(batch: Any, device: torch.device) -> Any:
         converted = [move_batch_to_device(x, device) for x in batch]
         return type(batch)(converted)
     return batch
+
+
+# ---------------------------------------------------------------------------
+# Legacy checkpoint 互換ロード
+# ---------------------------------------------------------------------------
+
+# 旧 → 新 のキー名対応。構造変更でリネームしたモジュールをここに集約する。
+_LEGACY_KEY_RENAMES: Dict[str, str] = {
+    # query-aligned → track-aligned fusion へ改称 (どちらもパラメータを持たないため
+    # 実害はないが、キーが残っていると unexpected 扱いになるので明示的に対応づける)
+    "query_temporal_fusion.": "track_temporal_fusion.",
+}
+
+
+class CheckpointReport:
+    """``load_legacy_checkpoint`` の結果サマリ。"""
+
+    def __init__(
+        self,
+        loaded: List[str],
+        missing: List[str],
+        unexpected: List[str],
+        renamed: List[Tuple[str, str]],
+        shape_mismatched: List[Tuple[str, Any, Any]],
+    ):
+        self.loaded = loaded
+        self.missing = missing
+        self.unexpected = unexpected
+        self.renamed = renamed
+        self.shape_mismatched = shape_mismatched
+
+    @property
+    def ok(self) -> bool:
+        """既存パラメータが 1 つ以上読めたか。"""
+        return len(self.loaded) > 0
+
+    def __str__(self) -> str:
+        lines = [
+            "Legacy checkpoint load report",
+            f"  loaded:            {len(self.loaded)} tensors",
+            f"  randomly init'd:   {len(self.missing)} (new heads/modules)",
+            f"  ignored:           {len(self.unexpected)} (removed modules)",
+        ]
+        if self.renamed:
+            lines.append(f"  renamed:           {len(self.renamed)}")
+            lines.extend(f"    {o} -> {n}" for o, n in self.renamed[:5])
+        if self.shape_mismatched:
+            lines.append(f"  shape mismatch:    {len(self.shape_mismatched)} (skipped)")
+            lines.extend(
+                f"    {k}: ckpt {tuple(a)} vs model {tuple(b)}"
+                for k, a, b in self.shape_mismatched[:5]
+            )
+        if self.missing:
+            lines.append("  newly initialized (expected for new features):")
+            lines.extend(f"    {k}" for k in self.missing[:15])
+            if len(self.missing) > 15:
+                lines.append(f"    ... and {len(self.missing) - 15} more")
+        return "\n".join(lines)
+
+
+def load_legacy_checkpoint(
+    path: str,
+    model: nn.Module,
+    verbose: bool = True,
+    map_location: str = "cpu",
+) -> CheckpointReport:
+    """
+    旧 YOAKE checkpoint を新しいモデル構造へ安全に読み込む。
+
+    OBB 角度ヘッド / pose ヘッド / BehaviorBranch など**今回追加した部分は旧
+    checkpoint に存在しない**ので、それらは明示的に報告したうえでランダム初期化の
+    ままにする (silent に壊れた重みを入れない)。形状が変わったパラメータも
+    読み飛ばして報告する。
+
+    Args:
+        path: checkpoint のパス
+        model: 読み込み先モデル
+        verbose: レポートを標準出力へ出すか
+
+    Returns:
+        CheckpointReport — 何が読まれ、何が新規初期化されたか
+
+    Example::
+
+        model = build_model(cfg.model)
+        report = load_legacy_checkpoint("runs/old/best.pth", model)
+        print(report)   # 新規 head が一覧される
+    """
+    ckpt = torch.load(path, map_location=map_location, weights_only=True)
+    state = ckpt.get("model_state", ckpt)
+
+    # --- キー名のリネーム ---
+    renamed: List[Tuple[str, str]] = []
+    remapped: Dict[str, Any] = {}
+    for k, v in state.items():
+        new_k = k
+        for old_prefix, new_prefix in _LEGACY_KEY_RENAMES.items():
+            if k.startswith(old_prefix):
+                new_k = new_prefix + k[len(old_prefix):]
+                renamed.append((k, new_k))
+                break
+        remapped[new_k] = v
+
+    # --- 形状が一致するものだけ採用 ---
+    model_state = model.state_dict()
+    loaded: List[str] = []
+    shape_mismatched: List[Tuple[str, Any, Any]] = []
+    filtered: Dict[str, Any] = {}
+
+    for k, v in remapped.items():
+        if k not in model_state:
+            continue
+        if hasattr(v, "shape") and tuple(v.shape) != tuple(model_state[k].shape):
+            shape_mismatched.append((k, v.shape, model_state[k].shape))
+            continue
+        filtered[k] = v
+        loaded.append(k)
+
+    missing_keys, _ = model.load_state_dict(filtered, strict=False)
+    unexpected = [k for k in remapped if k not in model_state]
+
+    report = CheckpointReport(
+        loaded=loaded,
+        missing=list(missing_keys),
+        unexpected=unexpected,
+        renamed=renamed,
+        shape_mismatched=shape_mismatched,
+    )
+    if verbose:
+        print(report)
+    return report

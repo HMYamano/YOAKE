@@ -27,18 +27,36 @@ class DetectionOutput:
     """
     Detector の *学習/内部* 出力をまとめる dataclass (RT-DETR デコーダの生出力)。
 
+    OBB / pose のフィールドはすべて Optional で、既定 (AABB detector) では None に
+    なる。よって既存の消費側 (損失 / 評価 / 推論) は変更なしで動き続ける。
+
     Attributes:
-        pred_logits: (B, num_queries, num_classes) — class logits
+        pred_logits: (B, num_queries, num_classes+1) — class logits
         pred_boxes:  (B, num_queries, 4) — [cx, cy, w, h] in [0, 1]
+                     OBB 有効時も**外接矩形として常に埋まる** (AABB 互換の保証)。
         query_features: (B, num_queries, hidden_dim) — per-query features
-        encoder_features: List[(B, H*W, C)] — multi-scale encoder outputs
-                          (Hierarchical Temporal Module に渡す)
+        encoder_features: List[(B, C, H_i, W_i)] — multi-scale encoder outputs
+        pred_angles: (B, num_queries, 2) — [sin(2t), cos(2t)] 未正規化。OBB 時のみ。
+        pred_obb:    (B, num_queries, 5) — [cx, cy, w, h, theta] 正規化座標系。
+                     w/h は**回転前の tight なサイズ**で、pred_boxes の外接矩形とは異なる。
+        pred_keypoints: (B, num_queries, K, 3) — [x, y, logit] pose head 有効時のみ。
+        pred_polarity:  (B, num_queries, 2) — head-tail 反転の 2 値 logit。
     """
     pred_logits: torch.Tensor
     pred_boxes: torch.Tensor
     query_features: torch.Tensor
     encoder_features: Optional[List[torch.Tensor]] = None
     aux_outputs: Optional[List[Dict]] = None  # 各中間デコーダ層の予測 (auxiliary loss 用)
+    # --- OBB (detector.obb.enabled=True のときのみ) ---
+    pred_angles: Optional[torch.Tensor] = None
+    pred_obb: Optional[torch.Tensor] = None
+    # --- Pose (detector.pose.enabled=True のときのみ) ---
+    pred_keypoints: Optional[torch.Tensor] = None
+    pred_polarity: Optional[torch.Tensor] = None
+
+    @property
+    def has_obb(self) -> bool:
+        return self.pred_obb is not None
 
 
 # ---------------------------------------------------------------------------

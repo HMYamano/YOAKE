@@ -1,0 +1,668 @@
+"""Batch results, project review and guided continuation actions."""
+
+from __future__ import annotations
+
+import copy
+import tempfile
+import threading
+import time
+from dataclasses import replace
+from pathlib import Path
+
+from ..annotation import intervals, quality, review_queue, tracklet
+from ..annotation.batch import BatchRunner, VideoInput, check_video
+from . import auto_label
+
+
+class WorkspaceOperations:
+    def _queue_tracker_step(self, frame_idx, frame_bgr):
+        """Legacy A-mode tracker updates run off-thread and return candidates."""
+        video, project = self._video_session, self.project
+        if video.transient.get("tracker_busy"):
+            self._status(
+                "Tracker is still working. Wait for its suggestions before stepping again."
+            )
+            return
+        trackers = list(self._trackers.items())
+        seeds = {}
+        for tid, _tracker in trackers:
+            if video.transient.get("tracker_frames", {}).get(tid) != frame_idx - 1:
+                continue
+            seed = video.transient.get("tracker_seeds", {}).get(tid)
+            for obj in video.annotations.get(frame_idx - 1, []):
+                if obj.track_id == tid:
+                    seed = obj
+                    break
+            if seed is not None:
+                seeds[tid] = copy.deepcopy(seed)
+        image = frame_bgr.copy()
+        video.transient["tracker_busy"] = True
+
+        def work():
+            candidates = []
+            failed = []
+            for tid, tracker in trackers:
+                seed = seeds.get(tid)
+                if seed is None:
+                    failed.append(tid)
+                    continue
+                try:
+                    ok, xywh = tracker.update(image)
+                    if not ok:
+                        failed.append(tid)
+                        continue
+                    x, y, w, h = (int(v) for v in xywh)
+                    box = [max(0, x), max(0, y), min(video.width, x + w), min(video.height, y + h)]
+                    if box[2] - box[0] < 5 or box[3] - box[1] < 5:
+                        failed.append(tid)
+                        continue
+                    obb = None
+                    if seed.obb is not None:
+                        obb = [
+                            (box[0] + box[2]) / 2,
+                            (box[1] + box[3]) / 2,
+                            box[2] - box[0],
+                            box[3] - box[1],
+                            seed.obb[4],
+                        ]
+                    candidates.append(
+                        auto_label.Candidate(
+                            box,
+                            obb=obb,
+                            track_id=tid,
+                            class_id=seed.class_id,
+                            action_id=seed.action_id,
+                            source="track",
+                            provenance={
+                                "operation": "next_frame_tracking",
+                                "human_review": "pending",
+                            },
+                        )
+                    )
+                except Exception:  # noqa: BLE001 — native tracker failure stays local to its track.
+                    failed.append(tid)
+
+            def finish():
+                video.transient["tracker_busy"] = False
+                if self.project is not project:
+                    return
+                for tid in failed:
+                    video.transient.get("_trackers", {}).pop(tid, None)
+                for candidate in candidates:
+                    video.transient.setdefault("tracker_frames", {})[candidate.track_id] = frame_idx
+                self._merge_video_candidates(video, {frame_idx: candidates})
+                video.touch()
+                self._save_due = time.time() + 4
+                if video is self._video_session:
+                    self._refresh_candidate_ui()
+                    self._render_canvas()
+                    self._render_timeline()
+                if failed:
+                    self._status(f"Tracking stopped for {failed}; select a box and continue again.")
+
+            self._post(finish)
+
+        threading.Thread(target=work, daemon=True, name="yoake-next-frame-track").start()
+
+    def _sam_frame_id(self, index):
+        """A helper's frame cache is global; give each video a disjoint range."""
+        project = self._ensure_project()
+        namespaces = getattr(self, "_sam_namespaces", None)
+        if namespaces is None:
+            namespaces = self._sam_namespaces = {}
+        key = (project.identity, self._video_session.video_id)
+        namespace = namespaces.setdefault(key, len(namespaces) + 1)
+        return (namespace << 32) + int(index)
+
+    def _set_end_behavior(self, value):
+        self.project.settings["end_of_video"] = (
+            "next_unfinished" if value == "Open next unfinished video" else "stay"
+        )
+        self._mark_dirty()
+
+    def _set_continue_method(self, value):
+        self.project.settings["continue_method"] = value
+        self._mark_dirty()
+
+    def show_onboarding(self):
+        from .onboarding import show_guide
+
+        show_guide(self)
+
+    def continue_animal(self, method=None):
+        from ..annotation.objects import AnnObject
+
+        obj = self._selected
+        if obj is None or self.cap is None:
+            self._status("Select an animal first. Press W to draw or C to click an animal.")
+            return
+        method = method or self.project.settings.get("continue_method", "Automatic")
+        if method == "Automatic":
+            method = (
+                "Accurate propagation"
+                if self.video_capability().available
+                else "Fast tracking" if self._capability().can_track else "Copy to next frame"
+            )
+        # Fast tracking and accurate propagation both carry one animal's
+        # identity forward, which a project without track ids has not claimed.
+        # Copying the box to the next frame is the part that still means
+        # something, so that is what Continue does there.
+        if not self.use_track_ids and method != "Copy to next frame":
+            method = "Copy to next frame"
+        if method == "Accurate propagation":
+            self.propagate_selection()
+            return
+        project, video = self.project, self._video_session
+        seed = copy.deepcopy(obj)
+        frame = self.current_frame_idx
+        if method == "Copy to next frame":
+            if frame + 1 >= self.num_frames:
+                self._status("This animal is already on the last frame.")
+                return
+            existing = self.annotations.get(frame + 1, [])
+            if seed.track_id >= 0 and any(o.track_id == seed.track_id for o in existing):
+                self.goto_frame(frame + 1)
+                self._status("This track already has an annotation on the next frame.")
+                return
+            self._push_undo(frames=[frame, frame + 1])
+            record = seed.to_dict()
+            record.pop("object_id", None)
+            copied = AnnObject.from_dict(record)
+            self.annotations.setdefault(frame + 1, []).append(copied)
+            self.goto_frame(frame + 1)
+            self._select(copied)
+            self._mark_dirty()
+            return
+        if method != "Fast tracking":
+            self._status(f"Unknown continuation method: {method}")
+            return
+        running = getattr(self, "_fast_track_thread", None)
+        if running is not None and running.is_alive():
+            self._status("Fast tracking is already running.")
+            return
+        if not self._capability().can_track:
+            self._show_unavailable("Fast tracking", self._capability().tracker_reason)
+            return
+        self._fast_track_stop = threading.Event()
+        stop = self._fast_track_stop
+        path, width, height, num_frames = video.path, video.width, video.height, video.num_frames
+
+        def work():
+            import cv2
+
+            cap = cv2.VideoCapture(str(path))
+            try:
+
+                def read(index):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                    ok, image = cap.read()
+                    return image if ok else None
+
+                rows, reason = auto_label.track_forward(
+                    read,
+                    frame,
+                    seed.bbox,
+                    min(100, num_frames - frame - 1),
+                    width,
+                    height,
+                    should_stop=stop.is_set,
+                )
+                candidates = {}
+                for index, box in rows:
+                    obb = None
+                    if seed.obb is not None:
+                        x1, y1, x2, y2 = box
+                        obb = [(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1, seed.obb[4]]
+                    candidates[index] = [
+                        auto_label.Candidate(
+                            box,
+                            obb=obb,
+                            track_id=seed.track_id,
+                            class_id=seed.class_id,
+                            action_id=seed.action_id,
+                            source="track",
+                            provenance={"operation": "fast_tracking", "human_review": "pending"},
+                        )
+                    ]
+
+                def finish():
+                    if self.project is not project:
+                        return
+                    self._merge_video_candidates(video, candidates)
+                    self._check_session(video)
+                    video.touch()
+                    self._save_due = time.time() + 4
+                    self._refresh_workspace()
+                    if video is self._video_session:
+                        self.inbox.set_queue(video.queue, fps=video.fps)
+                        self._render_canvas()
+                        self._render_timeline()
+                        self._refresh_inspector()
+                    self._status(
+                        f"{len(rows)} tracking suggestions for {video.video_id}. Review before accepting. {reason}"
+                    )
+
+                self._post(finish)
+            except Exception as exc:  # noqa: BLE001 - isolate native tracking failures.
+                message = str(exc)
+                self._post(lambda: self._status(f"Fast tracking failed: {message}"))
+            finally:
+                cap.release()
+
+        self._fast_track_thread = threading.Thread(
+            target=work, daemon=True, name="yoake-fast-track"
+        )
+        self._fast_track_thread.start()
+        self._status("Following this animal; results will appear as suggestions.")
+
+    def _finish_video_propagation(self, project, video, result, request):
+        from .video_segment import build_candidates
+
+        if self.project is not project:
+            return
+        candidates = build_candidates(result, track_id=request.track_id)
+        for row in candidates.values():
+            for candidate in row:
+                candidate.class_id = request.class_id
+                candidate.action_id = request.action_id
+                candidate.provenance.update(
+                    operation="accurate_propagation", human_review="pending"
+                )
+        self._merge_video_candidates(video, candidates)
+        self._check_session(video)
+        video.touch()
+        self._save_due = time.time() + 4
+        if video is self._video_session:
+            self.inbox.set_queue(video.queue, fps=video.fps)
+            self._refresh_candidate_ui()
+            self._render_canvas()
+            self._render_timeline()
+        self._refresh_workspace()
+        self._status(result.describe(request.track_id))
+
+    def open_batch_dialog(self, mode="auto"):
+        from .batch_progress import BatchDialog
+
+        self._ensure_project()
+        if not hasattr(self, "batch_dialog"):
+            self.batch_dialog = BatchDialog(self)
+        self.batch_dialog.show(mode)
+
+    def _batch_inputs(self, scope):
+        result = []
+        for video in self.project.scope(scope, self._video_session.video_id):
+            candidates = (
+                {f: [c.copy() for c in video.review.candidates(f)] for f in video.review.frames}
+                if video.review is not None
+                else {}
+            )
+            result.append(
+                VideoInput(
+                    video.video_id,
+                    video.path,
+                    candidates,
+                    copy.deepcopy(video.annotations),
+                    video.fps,
+                    video.num_frames,
+                )
+            )
+        return result
+
+    def start_project_batch(self, scope, options):
+        from ..annotator import _repo_root
+
+        thread = getattr(self, "_batch_thread", None)
+        if thread is not None and thread.is_alive():
+            self._status("A project operation is already running.")
+            return False
+        project = self._sync_project()
+        videos = self._batch_inputs(scope)
+        if not videos:
+            self._status("No videos in this scope. Select videos in Project Videos first.")
+            return False
+        if options.detect:
+            capability = auto_label.check_backend(_repo_root(), options.weights)
+            if not capability.ok:
+                self._show_unavailable("Automatic detection", capability.message)
+                return False
+        cache_dir = project.directory or Path(tempfile.gettempdir()) / "YOAKE" / project.identity
+        runner = BatchRunner(
+            _repo_root(), cache_dir, encoder=self.embedding_provider() if options.sample else None
+        )
+        self._batch_runner = runner
+
+        def emit(event):
+            self._post(lambda e=event: self._batch_event(project, e, options))
+
+        self._batch_thread = threading.Thread(
+            target=runner.run, args=(videos, options, emit), daemon=True, name="yoake-project-batch"
+        )
+        self._batch_thread.start()
+        return True
+
+    def stop_project_batch(self):
+        runner = getattr(self, "_batch_runner", None)
+        if runner is not None:
+            runner.cancel.set()
+
+    def _batch_event(self, project, event, options):
+        if self.project is not project:
+            return  # Late results cannot land in another project.
+        dialog = getattr(self, "batch_dialog", None)
+        if dialog is not None:
+            dialog.event(event)
+        if getattr(self, "_smart_running", False) and event["kind"] == "progress":
+            self.smart_dialog.set_progress(
+                event["overall"], f"{event['video_id']}: {event['operation']}"
+            )
+        if event["kind"] == "video":
+            result = event["result"]
+            video = project.videos[result.video_id]
+            if result.status == "failed":
+                video.ui["last_failure"] = result.error
+                return
+            video.ui.pop("last_failure", None)
+            video.fps, video.num_frames = result.fps, result.num_frames
+            video.width, video.height = result.width, result.height
+            if options.detect:
+                self._merge_video_candidates(video, result.candidates)
+            self._check_session(video)
+            video.touch()
+            self._dirty = True
+            self._save_due = time.time() + 4
+            self._refresh_workspace()
+            if video is self._video_session:
+                self.inbox.set_queue(video.queue, fps=video.fps)
+                self._refresh_candidate_ui()
+                self._render_canvas()
+                self._render_timeline()
+        elif event["kind"] == "finished":
+            for result in event["results"]:
+                if result.selection is not None:
+                    video = project.videos[result.video_id]
+                    video.selection = result.selection
+                    video.touch()
+                    project.sampling_log.append(
+                        {
+                            **options.request.to_metadata(),
+                            "video_id": video.video_id,
+                            "frames": list(result.selection.frames),
+                            "clips": [(c.start, c.end) for c in result.selection.clips],
+                            "balanced": options.balanced,
+                            "time": time.time(),
+                        }
+                    )
+            if getattr(self, "_smart_running", False):
+                self._smart_running = False
+                if event["cancelled"]:
+                    self.smart_dialog.stopped("Stopped. Results from completed videos were kept.")
+                else:
+                    selected = [
+                        (r.video_id, r.selection)
+                        for r in event["results"]
+                        if r.selection is not None
+                    ]
+                    self._smart_selections = dict(selected)
+                    if selected:
+                        first = self._smart_selections.get(
+                            self._video_session.video_id, selected[0][1]
+                        )
+                        for index in range(5):
+                            self.smart_dialog.set_step(index, "done")
+                        self.smart_dialog.finish(
+                            first,
+                            total_samples=sum(selection.total for _, selection in selected),
+                            summary=f"Across {len(selected)} videos. Details below show the starting video.",
+                            predictions=sum(v.pending for v in project.videos.values()),
+                            issues=sum(len(v.queue) for v in project.videos.values()),
+                        )
+                    else:
+                        self.smart_dialog.fail(
+                            "No readable videos in the scope. Check Project Videos for missing files."
+                        )
+            self._save_due = time.time() + 4
+            self._render_timeline()
+            self._refresh_workspace()
+            self._status(
+                "Project operation cancelled; completed videos kept."
+                if event["cancelled"]
+                else "Project operation finished. Review suggestions or open a sampled frame."
+            )
+
+    def _merge_video_candidates(self, video, candidates):
+        if video.review is None:
+            video.review = auto_label.ReviewSession()
+        for frame, row in candidates.items():
+            existing = video.review.candidates(frame)
+            verified = video.annotations.get(frame, [])
+            additions = []
+            for candidate in row:
+                # Preserve prior Accept/Reject decisions on cache hits and reruns.
+                duplicate = any(
+                    c.class_id == candidate.class_id
+                    and auto_label.iou_any(c.bbox, candidate.bbox, c.obb, candidate.obb) >= 0.95
+                    for c in existing + additions
+                )
+                overlaps_verified = any(
+                    o.class_id == candidate.class_id
+                    and auto_label.iou_any(o.bbox, candidate.bbox, o.obb, candidate.obb) >= 0.5
+                    for o in verified
+                )
+                if not duplicate and not overlaps_verified:
+                    additions.append(candidate)
+            video.review.add_frame(frame, additions)
+
+    def _check_session(self, video):
+        candidates = video.review.pending_candidates() if video.review is not None else {}
+        parts = tracklet.build_tracklets(candidates, max_gap=self.quality_config.fragment_gap)
+        items = check_video(candidates, video.annotations, self.quality_config, video.num_frames)
+        items = [replace(i, video_id=video.video_id) for i in items]
+        carried = {
+            (video.video_id, *key) if len(key) == 4 else key: value
+            for key, value in video.queue.decisions().items()
+        }
+        video.queue = review_queue.ReviewQueue(items)
+        video.queue.carry_over(carried)
+        video.tracklets = tracklet.TrackletIndex(parts)
+        human = [i for i in video.intervals if i.source == "human"]
+        derived = intervals.merge_to_intervals(candidates)
+        video.intervals = intervals.IntervalTrack(
+            human
+            + [
+                i
+                for i in derived
+                if not any(h.track_id == i.track_id and h.overlaps(i) for h in human)
+            ]
+        )
+
+    def run_project_quality(self, scope="Entire project"):
+        self._ensure_project()
+        # Quality-only batches do not require the source video to be present.
+        inputs = self._batch_inputs(scope)
+        project, config = self.project, self.quality_config
+        revisions = {v.video_id: v.revision for v in project.videos.values()}
+        if not inputs:
+            self._status("Select videos in Project Videos before checking quality.")
+            return
+
+        def work():
+            rows = []
+            for video in inputs:
+                try:
+                    items = check_video(
+                        video.candidates, video.annotations, config, video.num_frames
+                    )
+                    rows.append((video.video_id, items, ""))
+                except Exception as exc:  # noqa: BLE001 - isolate checks per video.
+                    rows.append((video.video_id, [], str(exc)))
+
+            def finish():
+                if self.project is not project:
+                    return
+                for vid, items, error in rows:
+                    video = project.videos[vid]
+                    if video.revision != revisions[vid]:
+                        self._check_session(video)
+                        continue
+                    if error:
+                        video.ui["last_failure"] = error
+                        continue
+                    carried = video.queue.decisions()
+                    video.queue = review_queue.ReviewQueue(
+                        [replace(i, video_id=vid) for i in items]
+                    )
+                    video.queue.carry_over(carried)
+                    video.touch()
+                self.inbox.set_queue(self._queue, fps=self.fps)
+                self._save_due = time.time() + 4
+                self._refresh_workspace()
+                self.show_project_review()
+
+            self._post(finish)
+
+        threading.Thread(target=work, daemon=True, name="yoake-project-quality").start()
+
+    def project_review_items(self):
+        items = []
+        for video in self._ensure_project().videos.values():
+            for item in video.queue.items:
+                if not video.queue.decision(item).done:
+                    items.append(replace(item, video_id=video.video_id))
+            if video.review is not None:
+                for frame in video.review.pending_frames():
+                    row = video.review.candidates(frame)
+                    ids = tuple(
+                        sorted(
+                            {
+                                c.track_id
+                                for i, c in enumerate(row)
+                                if c.track_id >= 0
+                                and video.review.state(frame, i) == auto_label.PENDING
+                            }
+                        )
+                    )
+                    items.append(
+                        quality.ReviewItem(
+                            "suggestion",
+                            frame,
+                            frame,
+                            ids,
+                            detail="Accept or reject the suggestions on this frame.",
+                            video_id=video.video_id,
+                        )
+                    )
+        return items
+
+    def review_next_project(self):
+        items = self.project_review_items()
+        if not items:
+            self._status("No pending project review items.")
+            return False
+        last = getattr(self, "_project_review_key", None)
+        start = next((i + 1 for i, item in enumerate(items) if item.key == last), 0)
+        for item in items[start:] + items[:start]:
+            if self.switch_video(item.video_id):
+                self._project_review_key = item.key
+                if item.kind == "suggestion":
+                    self.goto_frame(item.start)
+                    self._sel_issue = None
+                    self._refresh_inspector()
+                else:
+                    self.jump_to_issue(item)
+                self._status(f"Review: {item.video_id} / frame {item.start} — {item.label}")
+                return True
+        self._status("Review items remain in missing videos. Use Locate file in Project Videos.")
+        return False
+
+    def show_project_review(self):
+        import dearpygui.dearpygui as dpg
+
+        from .widgets import place_dialog
+
+        if dpg.does_item_exist("project_review"):
+            dpg.delete_item("project_review")
+        items = self.project_review_items()
+        with dpg.window(tag="project_review", label="Project Review Inbox", width=760, height=480):
+            dpg.add_text(f"{len(items)} items across {len(self.project.videos)} videos")
+            # Review Next and Refresh sit above the list, not after it: a
+            # project with 300 review items used to put them 300 buttons down.
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Review Next", callback=self.review_next_project, width=160, height=30
+                )
+                dpg.add_button(
+                    label="Refresh", callback=self.show_project_review, width=140, height=30
+                )
+            dpg.add_separator()
+            with dpg.child_window(width=-1, height=-1, border=False):
+                for item in items:
+                    dpg.add_button(
+                        label=f"{item.video_id}: {item.describe()}",
+                        callback=lambda s, a, i: self._open_project_issue(i),
+                        user_data=item,
+                        width=-1,
+                    )
+        place_dialog("project_review", 760, 480)
+
+    def _open_project_issue(self, item):
+        if self.switch_video(item.video_id):
+            if item.kind == "suggestion":
+                self.goto_frame(item.start)
+            else:
+                self.jump_to_issue(item)
+
+    def _setup_add_files(self):
+        import tkinter as tk
+        from tkinter import filedialog
+
+        import dearpygui.dearpygui as dpg
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            paths = filedialog.askopenfilenames(
+                title="Project videos",
+                filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v")],
+            )
+        finally:
+            root.destroy()
+        self._setup_videos = list(
+            dict.fromkeys(getattr(self, "_setup_videos", []) + [Path(p) for p in paths])
+        )
+        dpg.set_value("setup_video_count", f"{len(self._setup_videos)} videos selected")
+
+    def _setup_add_folder(self):
+        import dearpygui.dearpygui as dpg
+
+        from ..annotation.project import scan_folder
+        from ..annotator import _tk_ask_dir
+
+        folder = _tk_ask_dir("Project videos folder")
+        if folder is not None:
+            paths = scan_folder(folder, recursive=dpg.get_value("setup_recursive"))
+            self._setup_videos = list(dict.fromkeys(getattr(self, "_setup_videos", []) + paths))
+            dpg.set_value("setup_video_count", f"{len(self._setup_videos)} videos selected")
+
+    def _shutdown_workspace(self):
+        self.stop_project_batch()
+        batch = getattr(self, "_batch_thread", None)
+        if batch is not None:
+            batch.join(timeout=5)
+        if hasattr(self, "_fast_track_stop"):
+            self._fast_track_stop.set()
+        self._propagate_stop = True
+        self._analysis_stop = True
+        thread = getattr(self, "_workspace_save_thread", None)
+        if thread is not None:
+            thread.join()
+        self._pump_ui()
+        project = self._sync_project()
+        if project.videos:
+            directory = (
+                project.directory
+                or Path(tempfile.gettempdir()) / "YOAKE" / "recovery" / project.identity
+            )
+            try:
+                project.save(directory / "project.yoake.json")
+            except OSError as exc:
+                print(f"Could not save workspace on exit: {exc}")

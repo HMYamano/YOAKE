@@ -1,7 +1,10 @@
 # YOAKE GUI スイート
 
+Annotatorの複数動画Project、動画切替、一括候補生成とレビューの操作は
+[ANNOTATOR_GUIDE.md](ANNOTATOR_GUIDE.md) を参照してください。
+
 YORU (github.com/Kamikouchi-lab/YORU) を参考にした DearPyGui 製の統一 GUI。
-**Labeling（範囲ラベリング対応）/ Training（ライブモニタ）/ Video Analysis（重畳再生）**
+**Labeling（動画アノテータ）/ Training（ライブモニタ）/ Video Analysis（重畳再生）**
 を 1 つのハブから利用できます。学習・推論・解析は既存の `yoake` CLI を裏で呼び出すため、
 GUI 本体は torch 非依存で起動します（torch は学習/推論を実行する GPU 環境にのみ必要）。
 
@@ -16,33 +19,31 @@ yoake gui                    # または:  python -m htrtdetr.gui  /  gui
 
 | ページ | 内容 |
 |--------|------|
-| **Labeling** | 動画アノテータを別ウィンドウで起動（範囲ラベリング対応） |
+| **Labeling** | 動画アノテータを別ウィンドウで起動 |
 | **Training** | Dataset 準備 / Stage 1–4 学習・評価 / analyze + ライブ学習モニタ |
 | **Video Analysis** | 動画を推論 or 予測 JSON を読み込み、bbox/ID/action を重畳再生 |
 
 > DearPyGui は 1 プロセス 1 コンテキストのため、アノテータはハブから別プロセスで
 > 起動します（YORU の `app.py` が各モジュールを起動するのと同じ設計）。
 
-## Labeling — 範囲ラベリング
+## Labeling — 動画アノテータ
 
-従来のフレーム毎の bbox 描画・track ID・行動(action)・CSRT 自動追跡に加え、
-サイドバー **「Range Labeling」** で時間区間の一括付与ができます。
+フレーム毎の bbox 描画・track ID・行動(action)付与に加え、前フレームからの
+box 伝播（Space）と OpenCV 自動追跡が使えます。
 
-1. 開始フレームで対象個体の box を描く（キーフレーム＝実線）。
-2. 終了フレームへ移動し、同じ track ID で box を描く（キーフレーム）。
-3. 「開始/終了」に区間を設定（「現在」ボタンで現フレームを設定）。
-4. Track ID と Action を選び、**「範囲に適用」**。
+1. 動画を開き、キャンバス上でドラッグして box を作る（C を押して個体をクリック
+   すれば box を自動フィットさせることもできます。`C` は 1 回 1 箱で、作ったあとは
+   Select に戻りその箱が選択されます）。
+2. Track ID と Action を割り当てる（Track ID を使わない Project では Action だけ）。
+3. 次フレームへ進み、**Space**（前フレームから伝播）または自動追跡で box を運び、
+   ずれた分だけ手で直す。
 
-- **bbox を補間する**（既定 ON）: キーフレーム間を線形補間し、中間フレームの box を
-  自動生成します（**破線**表示＝補間 box）。全フレームを手描きする必要はありません。
-  区間内に手動キーフレームが 3 個以上あれば、それぞれの間を区分線形で補間します。
-- キーフレームが 1 個だけなら、その box を区間全体に保持します。
-- box が無い区間では行動(action)だけを既存 box に付与します。
-- 補間 box を手動でドラッグ/リサイズすると、その box はキーフレーム（実線）に昇格します。
+- 自動生成された box（伝播・自動追跡・予測の取り込み）は**破線**、手で描いた／
+  編集した box は**実線**で描画され、区別できます。
+- 破線 box をドラッグ/リサイズすると実線（手動確定）に昇格します。
 
-保存形式は **YOAKE JSON v1.1 のまま**（補間 box も通常の per-frame object として保存）。
-`keyframe` フラグはエディタ内部用で JSON には出力しません。そのため既存の学習
-パイプラインは無変更で読み込めます。
+保存形式は **YOAKE JSON v1.1**（回転矩形を使った場合のみ v2.0）。`keyframe` フラグは
+エディタ内部用で JSON には出力しないため、既存の学習パイプラインは無変更で読み込めます。
 
 ## Training — ライブ学習モニタ
 
@@ -60,6 +61,28 @@ Stage 1–4 の学習フォームから `yoake train` を起動し、`runs/train
 - 動画を重畳再生（bbox/ID/action）、フレームスライダ/ジャンプ、表示 score しきい値、
   **個体別 行動タイムライン**（縦線＝現在フレーム）を表示。
 
+### Use track identity in this analysis
+
+個体の同一性をこの解析で使うかどうかのチェックボックス（既定オン）。Annotator 側の
+Project 設定 `use_track_ids` と対になる、解析側の同じ質問です。
+
+オフにすると
+
+- Track ID / Trajectory / Show only the selected track をロック（隠さず理由を出す）
+- Inspector から Track 行と「前後の出現フレームへ飛ぶ」を外す
+- タイムラインは個体ごとのレーンではなく、フレームごとの行動を示す **1 本**になる
+- `yoake predict` に `inference.show_id=False` / `inference.show_trajectory=False` を渡し、
+  オーバーレイ動画から ID ラベルと軌跡を落とす
+
+**これは「読み方」の宣言であって、モデルの tracking を止めるものではありません。**
+時間モデルは track 単位で整列している（`model.track_aligned_temporal`）ので、そこを
+切ることは表示設定ではなく別の推論です。`predictions.json` の `track_ids` はそのまま
+書かれます。
+
+読み込んだ `predictions.json` に `track_id >= 0` の検出が 1 つも無い場合は、
+チェックボックスが自動でオフになり、その旨を Run log に残します。存在しないものを
+「表示できる」と見せないためです。
+
 > リアルタイム/Webカメラ解析・クローズドループ（外部機器制御）は本スイートの対象外です。
 
 ## 構成（開発者向け）
@@ -67,11 +90,19 @@ Stage 1–4 の学習フォームから `yoake train` を起動し、`runs/train
 `src/htrtdetr/gui/`
 
 - 純モジュール（dearpygui 非依存・単体テスト対象）
-  - `labeling_ops.py` … bbox 補間 (`interpolate_between` / `resolve_range_boxes`)
+  - `labeling_ops.py` … bbox 補間 (`interpolate_between`) / クランプ・丸め
   - `predictions.py` … `predictions.json` ローダ・行動タイムライン構築
   - `monitor.py` … `results.csv` / `metrics_latest.json` パーサ + ポーラ
-  - `commands.py` … `yoake` コマンド生成（`visualize`→`inference.show_*` 等のマッピング）
+  - `commands.py` … `yoake` コマンド生成（`visualize`/`track`→`inference.show_*` のマッピング）
 - UI モジュール（dearpygui）
   - `hub.py` / `canvas.py` / `training_panel.py` / `analysis_panel.py` / `runner.py` / `dialogs.py`
 
-テスト: `tests/test_labeling_range.py`, `tests/test_gui_commands.py`（いずれも torch 不要）。
+- ダイアログの幾何
+  - `widgets.place_dialog` / `refit_dialogs` … ウィンドウをビューポート内に収める
+  - `widgets.dialog_body` / `dialog_footer` … 「伸びる本体はスクロール、ボタン列は固定」
+    の分割。固定サイズのウィンドウに内容が収まらなくなったとき、**押したいボタンだけが
+    画面外に出る**という壊れ方をしないための型で、ダイアログは全てこれに従う。
+
+テスト: `tests/test_labeling_ops.py`, `tests/test_gui_commands.py`（いずれも torch 不要）、
+`tests/test_gui_dialogs.py`（900x600 ＝ アノテータの最小ウィンドウで、各ダイアログと
+その主ボタンが画面内にあることを実測で確認）、`tests/test_track_identity.py`。

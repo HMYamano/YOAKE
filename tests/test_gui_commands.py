@@ -36,6 +36,24 @@ def test_predict_command_visualize_on_has_no_show_or_visualize():
     assert "inference.show_" not in joined
 
 
+def test_predict_command_without_tracking_drops_the_id_overlay():
+    """"Use track identity" off means the overlay video stops labelling boxes
+    with an ID and stops drawing trajectories. It does **not** claim to stop
+    the model tracking: the temporal heads are aligned by track, so switching
+    that off would be a different inference run, not a display setting."""
+    cmd = commands.predict_command("v.mp4", "w.pth", "out", track=False)
+    assert "inference.show_id=False" in cmd
+    assert "inference.show_trajectory=False" in cmd
+    # The boxes, behaviors and scores are all still drawn.
+    assert "inference.show_bbox=False" not in cmd
+    assert "inference.show_action=False" not in cmd
+
+
+def test_predict_command_with_tracking_says_nothing_extra():
+    cmd = commands.predict_command("v.mp4", "w.pth", "out", track=True)
+    assert not any(a.startswith("inference.show_") for a in cmd)
+
+
 def test_predict_command_max_frames_optional():
     assert any(a.startswith("max_frames=") for a in
                commands.predict_command("v", "w", "o", max_frames=100))

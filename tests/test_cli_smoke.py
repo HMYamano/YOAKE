@@ -12,12 +12,23 @@ PYTHON = sys.executable
 
 class TestCLIHelp:
     def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        # The child is told to write UTF-8 and the parent is told to read it.
+        # Without the pair, the CLI's Japanese banner meets the console
+        # codepage (cp932 here), the reader thread dies with a
+        # UnicodeDecodeError, ``stdout`` comes back as **None**, and three
+        # tests fail with a TypeError that has nothing to do with the CLI.
         return subprocess.run(
             [PYTHON, "-m", "htrtdetr.cli"] + args,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(REPO_ROOT),
-            env={**os.environ, "PYTHONPATH": str(SRC_ROOT)},
+            env={
+                **os.environ,
+                "PYTHONPATH": str(SRC_ROOT),
+                "PYTHONIOENCODING": "utf-8",
+            },
         )
 
     def test_help_exits_zero(self):
@@ -135,6 +146,8 @@ class TestPredictAnalyzeEntryPoints:
                 f"weights={ckpt}",
                 f"output_dir={tmp_path / 'out'}",
                 "window_size=8",
+                # streaming が既定になったので、Inferencer 経路は明示的に選ぶ
+                "inference.mode=batch",
             ]
         )
 
@@ -190,6 +203,7 @@ class TestPredictAnalyzeEntryPoints:
                 f"source={tmp_path}",
                 f"weights={ckpt}",
                 f"output_dir={tmp_path / 'out'}",
+                "inference.mode=batch",
             ]
         )
 
@@ -197,6 +211,51 @@ class TestPredictAnalyzeEntryPoints:
         assert calls["init"]["window_size"] == 12
         assert calls["init"]["action_names"] == ["idle", "walk", "groom"]
         assert calls["run"]["image_size"] == (320, 512)
+
+    def test_run_predict_defaults_to_streaming(self, monkeypatch, tmp_path):
+        """
+        既定の推論モードは streaming (各フレームを detector に 1 回だけ通す)。
+
+        mode を指定しない呼び出しが従来の Inferencer ではなく streaming 経路へ
+        行くことを固定する。
+        """
+        from htrtdetr.cli import run_predict
+        import htrtdetr.models as models_mod
+        import htrtdetr.utils.misc as misc_mod
+        import htrtdetr.cli as cli_mod
+
+        calls = {}
+
+        class DummyModel:
+            def set_stage(self, stage):
+                calls["stage"] = stage
+
+        def fake_streaming(cfg, model, source, output_dir, img_size,
+                           action_names, class_names, window_size, max_frames):
+            calls["streaming"] = {
+                "output_dir": output_dir,
+                "window_size": window_size,
+                "mode": cfg.inference.mode,
+            }
+
+        monkeypatch.setattr(models_mod, "build_model", lambda cfg: DummyModel())
+        monkeypatch.setattr(cli_mod, "load_runtime_config_from_checkpoint", lambda path: None)
+        monkeypatch.setattr(misc_mod, "load_model_weights", lambda *a, **k: ([], []))
+        monkeypatch.setattr(cli_mod, "_run_predict_streaming", fake_streaming)
+
+        ckpt = tmp_path / "model.pth"
+        ckpt.write_bytes(b"dummy")
+        run_predict([
+            f"source={tmp_path}",
+            f"weights={ckpt}",
+            f"output_dir={tmp_path / 'out'}",
+            "window_size=8",
+        ])
+
+        assert calls["stage"] == 4
+        assert calls["streaming"]["mode"] == "streaming"
+        assert calls["streaming"]["window_size"] == 8
+        assert calls["streaming"]["output_dir"] == str(tmp_path / "out")
 
     def test_run_analyze_uses_existing_analysis_wrappers(self, monkeypatch, tmp_path):
         from htrtdetr.cli import run_analyze

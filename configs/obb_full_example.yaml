@@ -1,0 +1,306 @@
+# YOAKE — OBB + P2 + pose + multi-head behavior のフル構成例
+#
+# `config.enable_obb()` などで生成したものをそのまま保存したファイル。
+# 全ての新機能を有効にしているので、各機能のキーの位置と既定値の確認に使える。
+#
+#   python scripts/train_stage1.py config=configs/obb_full_example.yaml
+#
+# 個々の機能だけ試したい場合は、この中の該当ブロックを既存 config へコピーする。
+# ablation は model.behavior.use_* / model.tracking.*_weight /
+# model.detector.fpn.use_p2 / model.detector.obb.enabled を切り替える。
+
+data:
+  annotation_format: json
+  aug_brightness: 0.2
+  aug_contrast: 0.2
+  aug_hflip: true
+  aug_saturation: 0.1
+  aug_scale_range:
+  - 0.8
+  - 1.2
+  aug_vflip: false
+  augment_train: true
+  batch_size: 4
+  classes_file: ''
+  image_size:
+  - 640
+  - 640
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+  test_root: data/test
+  train_root: data/train
+  val_root: data/val
+  window_size: 16
+  window_stride: 8
+eval:
+  action_names:
+  - idle
+  - walk
+  - groom
+  - interact
+  - other
+  checkpoint: weights/full_model_best.pth
+  iou_thresholds:
+  - 0.5
+  - 0.75
+  min_track_length: 5
+  output_dir: runs/val
+  save_predictions: true
+  save_visualizations: false
+  split: val
+inference:
+  bbox_thickness: 2
+  checkpoint: weights/full_model_best.pth
+  font_scale: 0.5
+  fps: null
+  input_path: ''
+  mode: streaming
+  output_path: runs/predict
+  reset_memory_on_scene_change: true
+  scene_change_threshold: 0.5
+  show_action: true
+  show_bbox: true
+  show_confidence: true
+  show_context_box: false
+  show_explanation: false
+  show_id: true
+  show_obb: true
+  show_pose: false
+  show_trajectory: false
+  use_amp: true
+  use_channels_last: true
+  use_compile: false
+loss:
+  class_weight_clip_max: 10.0
+  class_weight_clip_min: 0.1
+  class_weight_smoothing: 1.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  imbalance_strategy: class_weight
+  w_action: 1.0
+  w_bbox_giou: 2.0
+  w_bbox_l1: 5.0
+  w_class: 2.0
+  w_id_cls: 1.0
+  w_id_metric: 0.5
+  w_obb_angle: 2.0
+  w_obb_probiou: 2.0
+  w_pose_keypoint: 1.0
+  w_pose_polarity: 0.5
+  w_temporal_smooth: 0.1
+metrics:
+  composite_ap50: 0.4
+  composite_idf1: 0.3
+  composite_macro_f1: 0.3
+  stage2_primary: macro_f1
+  stage3_primary: idf1
+  stage4_primary: composite
+model:
+  action_head:
+    dropout: 0.1
+    feature_dim: 128
+    hidden_dims:
+    - 256
+    - 128
+    interaction_dim: 32
+    num_actions: 5
+    temporal_dim: 128
+    use_interaction: true
+    use_nn_distance: true
+    use_overlap: true
+    use_relative_angle: true
+    use_relative_velocity: true
+  behavior:
+    actor_roi_size: 16
+    classifier_type: multi_head
+    context_roi_size: 16
+    context_scale: 2.0
+    context_square: true
+    dropout: 0.1
+    feature_dim: 128
+    heads:
+      locomotion:
+      - stationary
+      - walking
+      - running
+      self_directed:
+      - none
+      - grooming
+      - feeding
+      social:
+      - none
+      - courtship
+      - chase
+      - aggression
+    hidden_dims:
+    - 256
+    - 128
+    hierarchy: {}
+    temporal_window: 16
+    use_actor: true
+    use_context: true
+    use_detector_feat: true
+    use_interaction: true
+    use_motion: true
+    use_orientation: true
+    use_pose: true
+    use_temporal: true
+  detector:
+    backbone:
+      freeze_bn: false
+      name: resnet18
+      out_channels:
+      - 128
+      - 256
+      - 512
+      out_strides:
+      - 8
+      - 16
+      - 32
+      pretrained: true
+    cost_bbox: 5.0
+    cost_class: 2.0
+    cost_giou: 2.0
+    fpn:
+      in_channels:
+      - 128
+      - 256
+      - 512
+      num_levels: 4
+      out_channels: 128
+      p2_in_memory: true
+      use_p2: true
+    head:
+      dropout: 0.1
+      ffn_dim: 512
+      hidden_dim: 128
+      num_classes: 1
+      num_decoder_layers: 2
+      num_heads: 4
+      num_queries: 100
+    nms_threshold: 0.5
+    obb:
+      angle_encoding: sincos2
+      angle_loss_weight: 1.0
+      enabled: true
+      nms_threshold: 0.5
+      probiou_loss_weight: 2.0
+      use_rotated_matching: true
+    pose:
+      enabled: true
+      hidden_dim: 256
+      keypoint_names:
+      - head
+      - thorax
+      - abdomen
+      num_keypoints: 3
+      predict_polarity: true
+    score_threshold: 0.3
+    type: rtdetr_obb
+  explainability:
+    enable_gradient_attribution: false
+    enabled: true
+    integrated_gradients_steps: 32
+    return_gates: true
+    use_evidence_decomposition: true
+    use_gating: true
+  id_head:
+    embedding_dim: 64
+    feature_dim: 128
+    max_ids: 50
+    memory_dim: 128
+    memory_ttl: 30
+    metric_loss_margin: 0.3
+    new_id_threshold: 0.5
+    num_species: 1
+    use_action_summary: false
+    use_appearance: true
+    use_geometry: true
+    use_metric_loss: false
+    use_motion: true
+    use_species_separated_pools: false
+  interaction:
+    angle_bins: 8
+    distance_bins: 16
+    feature_dim: 128
+    max_neighbors: 5
+    output_dim: 32
+  temporal:
+    feature_dim: 128
+    fusion_method: concat_proj
+    long_branch:
+      dilation: 4
+      kernel_size: 3
+      num_frames: 16
+      use_channel_attention: false
+      use_depthwise: true
+      use_residual: true
+    mid_branch:
+      dilation: 2
+      kernel_size: 3
+      num_frames: 8
+      use_channel_attention: false
+      use_depthwise: true
+      use_residual: true
+    output_dim: 128
+    short_branch:
+      dilation: 1
+      kernel_size: 3
+      num_frames: 3
+      use_channel_attention: false
+      use_depthwise: true
+      use_residual: true
+  track_aligned_temporal: true
+  tracking:
+    appearance_weight: 0.5
+    enable_reid: true
+    iou_weight: 0.5
+    match_threshold: 0.5
+    max_age: 30
+    max_center_distance: 0.0
+    motion_weight: 0.2
+    orientation_weight: 0.3
+    reid_max_age: 90
+    use_rotated_iou: true
+  training_stage: 1
+optimizer:
+  backbone_lr_factor: 0.1
+  grad_clip_norm: 1.0
+  lr: 0.0001
+  momentum: 0.9
+  optimizer: adamw
+  weight_decay: 0.001
+outputs:
+  save_confusion_matrix: true
+  save_epoch_metrics_json: true
+  save_plots: true
+scheduler:
+  eta_min: 1.0e-06
+  gamma: 0.1
+  milestones:
+  - 60
+  - 80
+  scheduler: cosine
+  step_size: 30
+  total_epochs: 100
+  warmup_epochs: 5
+train:
+  deterministic: false
+  early_stopping_patience: 200
+  ema_decay: 0.9999
+  log_interval: 10
+  max_epochs: 500
+  output_dir: runs/train/obb_full
+  resume: null
+  save_best: true
+  save_last: true
+  seed: 42
+  stage: 1
+  use_amp: true
+  use_ema: true
+  use_wandb: false
+  val_interval: 1
+  wandb_project: ht-rtdetr
+  wandb_run_name: run

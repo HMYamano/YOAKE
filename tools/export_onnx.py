@@ -14,13 +14,19 @@ ONNX にエクスポートし、PyTorch / ONNX Runtime での出力一致を検�
       verify=1
 
 mode:
-  detector    — forward_single_frame(image) を export (Stage 1)
-  geo_stage2  — forward_geo_sequence → action_logits (Stage 2)
-  geo_stage3  — forward_geo_sequence → id_embeddings + id_logits (Stage 3)
+  detector      — forward_single_frame(image) → pred_logits + pred_boxes (Stage 1)
+  obb_detector  — 上記 + pred_obb [cx, cy, w, h, theta] (OBB detector 用)
+  geo_stage2    — forward_geo_sequence → action_logits (Stage 2)
+  geo_stage3    — forward_geo_sequence → id_embeddings + id_logits (Stage 3)
 
 動的 axes:
-  detector  : batch (N), height (H), width (W)
-  geo_*     : batch (N), time (T)
+  detector / obb_detector : batch (N), height (H), width (W)
+  geo_*                   : batch (N), time (T)
+
+注: behavior ブランチは track ごとの可変長履歴と動的な ROI 抽出に依存するため、
+    単一の静的グラフとしては export していない (TensorRT のために本体設計を
+    歪めないことを優先)。detector を export し、tracking / behavior は
+    PyTorch 側で回す構成を想定している。
 
 verify=1 の場合:
   - ONNXRuntime でランダム入力を推論
@@ -77,8 +83,40 @@ class DetectorWrapper(nn.Module):
             pred_logits : (N, num_queries, num_classes + 1)
             pred_boxes  : (N, num_queries, 4)  cxcywh normalized
         """
+        # HTRTDETROutput は dataclass 風の属性アクセス型 (subscript 不可)
         out = self.model.forward_single_frame(image)
-        return out["pred_logits"], out["pred_boxes"]
+        return out.pred_logits, out.pred_boxes
+
+
+class OBBDetectorWrapper(nn.Module):
+    """
+    OBB detector を ONNX-friendly にラップする。
+
+    ``pred_boxes`` (外接 AABB) に加えて ``pred_obb`` を出す。角度は
+    ``decode_angle`` (atan2) を通した後の theta なので、後段は追加の復号なしで
+    そのまま回転矩形として扱える。
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self, image: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            pred_logits : (N, Q, num_classes + 1)
+            pred_boxes  : (N, Q, 4)  cxcywh normalized (OBB の外接矩形)
+            pred_obb    : (N, Q, 5)  [cx, cy, w, h, theta]
+        """
+        out = self.model.forward_single_frame(image)
+        if out.pred_obb is None:
+            raise ValueError(
+                "この checkpoint は OBB detector ではありません "
+                "(detector.obb.enabled=false)。mode=detector を使ってください。"
+            )
+        return out.pred_logits, out.pred_boxes, out.pred_obb
 
 
 class GeoStage2Wrapper(nn.Module):
@@ -185,8 +223,35 @@ def _build(
             "id_logits": {0: "batch"},
         }
 
+    elif mode == "obb_detector":
+        # OBB detector は checkpoint の config から復元する必要がある
+        # (角度ヘッドの有無で state_dict の形が変わるため)
+        from htrtdetr.config.config import enable_obb
+
+        cfg = get_stage1_config()
+        enable_obb(cfg)
+        raw = build_model(cfg.model)
+        raw.set_stage(1)
+        if checkpoint and Path(checkpoint).exists():
+            load_checkpoint(checkpoint, raw)
+        raw.to(device).eval()
+        wrapper = OBBDetectorWrapper(raw)
+
+        dummy = torch.randn(1, 3, 640, 640, device=device)
+        input_names = ["image"]
+        output_names = ["pred_logits", "pred_boxes", "pred_obb"]
+        dynamic_axes = {
+            "image": {0: "batch", 2: "height", 3: "width"},
+            "pred_logits": {0: "batch"},
+            "pred_boxes": {0: "batch"},
+            "pred_obb": {0: "batch"},
+        }
+
     else:
-        raise ValueError(f"Unknown mode: {mode!r}. Choose: detector | geo_stage2 | geo_stage3")
+        raise ValueError(
+            f"Unknown mode: {mode!r}. "
+            "Choose: detector | obb_detector | geo_stage2 | geo_stage3"
+        )
 
     return wrapper, dummy, input_names, output_names, dynamic_axes
 

@@ -18,14 +18,24 @@ Video Analysis GUI とテストの両方から使う純モジュール。
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class FrameDetections:
-    """1 フレーム分の検出結果 (並列リスト、全て同じ長さ)。"""
+    """
+    1 フレーム分の検出結果 (並列リスト、全て同じ長さ)。
 
-    __slots__ = ("boxes", "scores", "track_ids", "action_ids", "class_ids")
+    v2.0 で ``obb`` / ``context_boxes`` / ``evidence`` / ``gates`` /
+    ``head_predictions`` を任意フィールドとして追加した。いずれも無いファイル
+    (旧 predictions.json) は空リストとして読まれるので、GUI は分岐なしで扱える。
+    """
+
+    __slots__ = (
+        "boxes", "scores", "track_ids", "action_ids", "class_ids",
+        "obb", "context_boxes", "evidence", "gates", "head_predictions",
+    )
 
     def __init__(
         self,
@@ -34,15 +44,43 @@ class FrameDetections:
         track_ids: List[int],
         action_ids: List[int],
         class_ids: List[int],
+        obb: Optional[List[List[float]]] = None,
+        context_boxes: Optional[List[List[float]]] = None,
+        evidence: Optional[List[Dict[str, float]]] = None,
+        gates: Optional[List[Dict[str, float]]] = None,
+        head_predictions: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         self.boxes = boxes
         self.scores = scores
         self.track_ids = track_ids
         self.action_ids = action_ids
         self.class_ids = class_ids
+        self.obb = obb or []
+        self.context_boxes = context_boxes or []
+        self.evidence = evidence or []
+        self.gates = gates or []
+        self.head_predictions = head_predictions or []
 
     def __len__(self) -> int:
         return len(self.boxes)
+
+    @property
+    def has_obb(self) -> bool:
+        return bool(self.obb)
+
+    def obb_of(self, i: int) -> Optional[List[float]]:
+        """i 番目の OBB [cx, cy, w, h, theta]。無ければ None。"""
+        return self.obb[i] if i < len(self.obb) else None
+
+    def evidence_of(self, i: int) -> Dict[str, float]:
+        """i 番目の判断根拠 {group: logit 寄与}。無ければ空。"""
+        return self.evidence[i] if i < len(self.evidence) else {}
+
+    def gates_of(self, i: int) -> Dict[str, float]:
+        return self.gates[i] if i < len(self.gates) else {}
+
+    def heads_of(self, i: int) -> Dict[str, str]:
+        return self.head_predictions[i] if i < len(self.head_predictions) else {}
 
 
 def load_predictions(path: str) -> Dict[int, FrameDetections]:
@@ -68,7 +106,69 @@ def load_predictions(path: str) -> Dict[int, FrameDetections]:
             track_ids=_as_list(val.get("track_ids"), n, -1, int),
             action_ids=_as_list(val.get("action_ids"), n, -1, int),
             class_ids=_as_list(val.get("class_ids"), n, 0, int),
+            obb=[[float(v) for v in o] for o in (val.get("obb") or [])],
+            context_boxes=[
+                [float(v) for v in b] for b in (val.get("context_boxes") or [])
+            ],
+            evidence=list(val.get("evidence") or []),
+            gates=list(val.get("gates") or []),
+            head_predictions=list(val.get("head_predictions") or []),
         )
+    return out
+
+
+def obb_corners(obb: List[float]) -> List[Tuple[float, float]]:
+    """
+    [cx, cy, w, h, theta] → 4 頂点 (反時計回り)。GUI 描画用の純関数。
+
+    ``geometry/obb.py`` の ``obb_to_corners`` と同じ定義 (torch 非依存の純 Python 版)。
+    """
+    cx, cy, w, h, th = (float(v) for v in obb[:5])
+    hw, hh = w / 2, h / 2
+    c, s = math.cos(th), math.sin(th)
+    return [
+        (cx + lx * c - ly * s, cy + lx * s + ly * c)
+        for lx, ly in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))
+    ]
+
+
+def build_track_trajectories(
+    preds: Dict[int, FrameDetections],
+    max_points: int = 120,
+) -> Dict[int, List[Tuple[int, float, float]]]:
+    """
+    個体ごとの軌跡 ``{track_id: [(frame_index, cx, cy), ...]}`` を作る。
+
+    Video Analysis GUI の trajectory 表示に使う。長すぎる軌跡は末尾
+    ``max_points`` 点に切る (描画負荷を抑えるため)。
+    """
+    traj: Dict[int, List[Tuple[int, float, float]]] = {}
+    for fi in sorted(preds):
+        fd = preds[fi]
+        for i, (tid, box) in enumerate(zip(fd.track_ids, fd.boxes)):
+            o = fd.obb_of(i)
+            if o is not None:
+                cx, cy = float(o[0]), float(o[1])
+            else:
+                cx = (float(box[0]) + float(box[2])) / 2
+                cy = (float(box[1]) + float(box[3])) / 2
+            traj.setdefault(int(tid), []).append((fi, cx, cy))
+    return {k: v[-max_points:] for k, v in traj.items()}
+
+
+def build_head_timelines(
+    preds: Dict[int, FrameDetections],
+) -> Dict[str, Dict[int, Dict[int, str]]]:
+    """
+    multi-head 用のタイムライン ``{head: {track_id: {frame: class_name}}}``。
+
+    locomotion / social / self-directed を別レーンとして表示するために使う。
+    """
+    out: Dict[str, Dict[int, Dict[int, str]]] = {}
+    for fi, fd in preds.items():
+        for i, tid in enumerate(fd.track_ids):
+            for head, cls in fd.heads_of(i).items():
+                out.setdefault(head, {}).setdefault(int(tid), {})[fi] = cls
     return out
 
 

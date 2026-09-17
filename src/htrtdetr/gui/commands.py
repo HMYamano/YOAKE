@@ -83,12 +83,20 @@ def predict_command(
     window_size: Optional[int] = None,
     max_frames: Optional[int] = None,
     visualize: bool = True,
+    track: bool = True,
 ) -> List[str]:
     """``yoake predict`` コマンドを生成する。
 
     ``visualize=False`` のとき、存在しない ``visualize`` フィールドではなく実在する
     ``inference.show_bbox/show_id/show_action/show_confidence`` を false にする
     (旧 GUI の ``visualize=`` バグを修正)。
+
+    ``track=False`` は「この解析では個体同一性を使わない」という宣言で、
+    オーバーレイ動画から ID ラベルと軌跡を落とす
+    (``inference.show_id/show_trajectory``)。**モデルの tracking 自体は止めない**
+    —— 時間モデルは track 単位で整列しているので、そこを切ることは推論結果を
+    別物にすることであり、表示の設定が担ってよい範囲を超える。
+    ``predictions.json`` の ``track_ids`` はそのまま書かれる。
     """
     overrides: Dict[str, Any] = {}
     if score_threshold is not None:
@@ -102,6 +110,9 @@ def predict_command(
         overrides["inference.show_id"] = False
         overrides["inference.show_action"] = False
         overrides["inference.show_confidence"] = False
+    elif not track:
+        overrides["inference.show_id"] = False
+        overrides["inference.show_trajectory"] = False
     return build_predict_command(source, weights, output_dir, **overrides)
 
 

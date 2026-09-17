@@ -1,3 +1,13 @@
-from .fusion import QueryTemporalFusion, DetectionFeatureAdapter, MultiHeadFeatureRouter
+from .fusion import (
+    TrackTemporalFusion,
+    QueryTemporalFusion,
+    DetectionFeatureAdapter,
+    MultiHeadFeatureRouter,
+)
 
-__all__ = ["QueryTemporalFusion", "DetectionFeatureAdapter", "MultiHeadFeatureRouter"]
+__all__ = [
+    "TrackTemporalFusion",
+    "QueryTemporalFusion",
+    "DetectionFeatureAdapter",
+    "MultiHeadFeatureRouter",
+]

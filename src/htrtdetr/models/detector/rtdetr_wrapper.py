@@ -26,6 +26,7 @@ from torchvision.models import resnet18, resnet34, resnet50, ResNet18_Weights
 
 from .base import BaseDetector, DetectionOutput
 from ...config.config import DetectorConfig
+from ...geometry.obb import decode_angle, obb_to_cxcywh
 
 
 # ---------------------------------------------------------------------------
@@ -263,10 +264,27 @@ class TransformerDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DetectionPredHead(nn.Module):
-    """Query → bbox + class logits の予測ヘッド"""
+    """
+    Query → bbox + class logits (+ 任意で angle / pose) の予測ヘッド。
 
-    def __init__(self, d_model: int = 256, num_classes: int = 1):
+    角度・pose のブランチは ``obb=True`` / ``num_keypoints>0`` のときだけ作られる。
+    作らなければ state_dict にキー自体が現れないので、AABB 学習済み checkpoint との
+    互換が完全に保たれる (逆方向は新規 head のみ missing key になる)。
+    """
+
+    def __init__(
+        self,
+        d_model: int = 256,
+        num_classes: int = 1,
+        obb: bool = False,
+        num_keypoints: int = 0,
+        predict_polarity: bool = False,
+    ):
         super().__init__()
+        self.obb = bool(obb)
+        self.num_keypoints = int(num_keypoints)
+        self.predict_polarity = bool(predict_polarity)
+
         # bbox head: 3-layer MLP → [cx, cy, w, h] in [0,1]
         self.bbox_head = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -278,19 +296,55 @@ class DetectionPredHead(nn.Module):
         # class head: 線形分類器 (+ 1 for "no object" / background)
         self.class_head = nn.Linear(d_model, num_classes + 1)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # angle head: → [sin(2*theta), cos(2*theta)] (sigmoid を通さない生の 2 次元)
+        # 2 倍角にすることで矩形の周期 pi と一致し、角度の境界不連続が原理的に消える。
+        if self.obb:
+            self.angle_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(inplace=True),
+                nn.Linear(d_model, 2),
+            )
+
+        # pose head (任意): キーポイント座標 + 可視性
+        if self.num_keypoints > 0:
+            self.keypoint_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(inplace=True),
+                nn.Linear(d_model, self.num_keypoints * 3),
+            )
+        # head-tail polarity (任意): OBB の向きを 180 度反転すべきかの 2 値分類
+        if self.predict_polarity:
+            self.polarity_head = nn.Linear(d_model, 2)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
         """
         Args:
             x: (B, Q, d_model)
         Returns:
-            logits: (B, Q, num_classes + 1)
-            boxes:  (B, Q, 4) — sigmoid でクランプ済み [cx, cy, w, h]
+            dict:
+              logits:    (B, Q, num_classes + 1)
+              boxes:     (B, Q, 4) — sigmoid でクランプ済み [cx, cy, w, h]
+              angles:    (B, Q, 2) — [sin2t, cos2t] 未正規化 (obb=False なら None)
+              keypoints: (B, Q, K, 3) — [x, y, logit] (pose 無効なら None)
+              polarity:  (B, Q, 2) — head-tail 反転 logit (無効なら None)
         """
-        logits = self.class_head(x)
-        boxes = self.bbox_head(x).sigmoid()
-        return logits, boxes
+        out: Dict[str, Optional[torch.Tensor]] = {
+            "logits": self.class_head(x),
+            "boxes": self.bbox_head(x).sigmoid(),
+            "angles": None,
+            "keypoints": None,
+            "polarity": None,
+        }
+        if self.obb:
+            out["angles"] = self.angle_head(x)
+        if self.num_keypoints > 0:
+            B, Q = x.shape[:2]
+            kp = self.keypoint_head(x).reshape(B, Q, self.num_keypoints, 3)
+            # x, y は [0,1] 正規化座標、3 列目は可視性 logit (sigmoid は損失側で適用)
+            out["keypoints"] = torch.cat([kp[..., :2].sigmoid(), kp[..., 2:]], dim=-1)
+        if self.predict_polarity:
+            out["polarity"] = self.polarity_head(x)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -299,20 +353,32 @@ class DetectionPredHead(nn.Module):
 
 class ResNetBackbone(nn.Module):
     """
-    torchvision の ResNet から C3, C4, C5 を取り出す wrapper。
-    ResNet-18: C3=128ch, C4=256ch, C5=512ch
-    ResNet-34: C3=128ch, C4=256ch, C5=512ch
-    ResNet-50: C3=512ch, C4=1024ch, C5=2048ch (layer2,3,4 に対応)
+    torchvision の ResNet から C3, C4, C5 (+ 任意で C2) を取り出す wrapper。
+
+    ResNet-18/34: C2=64ch,  C3=128ch, C4=256ch, C5=512ch
+    ResNet-50:    C2=256ch, C3=512ch, C4=1024ch, C5=2048ch
+
+    ``return_c2=True`` のとき stride 4 の C2 を先頭に含めて返す。小さい個体・
+    密集個体の検出を強化するための高解像度レベルで、VRAM と latency の増加と
+    引き換えになる (config の ``detector.fpn.use_p2`` で切り替える)。
     """
 
-    # ResNet-18/34 の各層の出力チャネル
+    # stride 8/16/32 (C3, C4, C5) の出力チャネル
     CHANNEL_MAP = {
         "resnet18": [128, 256, 512],
         "resnet34": [128, 256, 512],
         "resnet50": [512, 1024, 2048],
     }
+    # stride 4 (C2 = layer1 出力) の出力チャネル
+    C2_CHANNELS = {"resnet18": 64, "resnet34": 64, "resnet50": 256}
 
-    def __init__(self, name: str = "resnet18", pretrained: bool = True, freeze_bn: bool = False):
+    def __init__(
+        self,
+        name: str = "resnet18",
+        pretrained: bool = True,
+        freeze_bn: bool = False,
+        return_c2: bool = False,
+    ):
         super().__init__()
         if name == "resnet18":
             weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
@@ -332,12 +398,15 @@ class ResNetBackbone(nn.Module):
         self.stem = nn.Sequential(
             backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool
         )
-        self.layer1 = backbone.layer1  # stride 4 → stride 4
+        self.layer1 = backbone.layer1  # stride 4 → stride 4  (C2)
         self.layer2 = backbone.layer2  # stride 4 → stride 8  (C3)
         self.layer3 = backbone.layer3  # stride 8 → stride 16 (C4)
         self.layer4 = backbone.layer4  # stride 16 → stride 32 (C5)
 
-        self.out_channels = self.CHANNEL_MAP[name]
+        self.return_c2 = bool(return_c2)
+        self.out_channels = list(self.CHANNEL_MAP[name])
+        if self.return_c2:
+            self.out_channels = [self.C2_CHANNELS[name]] + self.out_channels
 
         if freeze_bn:
             for m in self.modules():
@@ -348,14 +417,20 @@ class ResNetBackbone(nn.Module):
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
-        Returns: [C3, C4, C5] — stride 8, 16, 32
+        Returns:
+            return_c2=False: [C3, C4, C5] — stride 8, 16, 32
+            return_c2=True:  [C2, C3, C4, C5] — stride 4, 8, 16, 32
         """
         x = self.stem(x)
-        x = self.layer1(x)
-        c3 = self.layer2(x)  # stride 8
-        c4 = self.layer3(c3) # stride 16
-        c5 = self.layer4(c4) # stride 32
-        return [c3, c4, c5]
+        c2 = self.layer1(x)   # stride 4
+        c3 = self.layer2(c2)  # stride 8
+        c4 = self.layer3(c3)  # stride 16
+        c5 = self.layer4(c4)  # stride 32
+        return [c2, c3, c4, c5] if self.return_c2 else [c3, c4, c5]
+
+    def get_out_strides(self) -> List[int]:
+        """各出力レベルの stride を返す。"""
+        return [4, 8, 16, 32] if self.return_c2 else [8, 16, 32]
 
 
 # ---------------------------------------------------------------------------
@@ -387,14 +462,26 @@ class RTDETRDetector(BaseDetector):
         self.cfg = cfg
         hcfg = cfg.head
 
+        # --- OBB / pose / P2 の有効化フラグ (config が唯一の真実) ---
+        self.obb_enabled = bool(getattr(cfg, "obb", None) and cfg.obb.enabled)
+        pose_cfg = getattr(cfg, "pose", None)
+        self.pose_enabled = bool(pose_cfg and pose_cfg.enabled)
+        self.num_keypoints = int(pose_cfg.num_keypoints) if self.pose_enabled else 0
+        self.predict_polarity = bool(
+            self.pose_enabled and pose_cfg.predict_polarity
+        )
+        self.use_p2 = bool(getattr(cfg.fpn, "use_p2", False))
+        self.p2_in_memory = bool(getattr(cfg.fpn, "p2_in_memory", True))
+
         # Backbone
         self.backbone = ResNetBackbone(
             name=cfg.backbone.name,
             pretrained=cfg.backbone.pretrained,
             freeze_bn=cfg.backbone.freeze_bn,
+            return_c2=self.use_p2,
         )
 
-        # FPN
+        # FPN (P2 有効時は 4 レベル)
         self.fpn = FPN(
             in_channels=self.backbone.out_channels,
             out_channels=cfg.fpn.out_channels,
@@ -423,11 +510,18 @@ class RTDETRDetector(BaseDetector):
         )
 
         # Detection head (最終層 + 各中間層用)
-        self.pred_head = DetectionPredHead(hcfg.hidden_dim, hcfg.num_classes)
+        def _make_head() -> DetectionPredHead:
+            return DetectionPredHead(
+                hcfg.hidden_dim, hcfg.num_classes,
+                obb=self.obb_enabled,
+                num_keypoints=self.num_keypoints,
+                predict_polarity=self.predict_polarity,
+            )
+
+        self.pred_head = _make_head()
         # auxiliary loss 用 head (各デコーダ層)
         self.aux_heads = nn.ModuleList([
-            DetectionPredHead(hcfg.hidden_dim, hcfg.num_classes)
-            for _ in range(hcfg.num_decoder_layers - 1)
+            _make_head() for _ in range(hcfg.num_decoder_layers - 1)
         ])
 
         # Positional encoding (query に使わないが、encoder 側で使用)
@@ -461,6 +555,13 @@ class RTDETRDetector(BaseDetector):
                 aux_head.class_head.bias[:-1] = fg_bias
                 aux_head.class_head.bias[-1]  = 0.0
 
+            # angle head: theta=0 (sin2t=0, cos2t=1) を初期姿勢にする。
+            # 回転アノテーションが無い / 少ないデータでも AABB 相当から学習が始まる。
+            if self.obb_enabled:
+                for head in [self.pred_head, *self.aux_heads]:
+                    head.angle_head[-1].weight.zero_()
+                    head.angle_head[-1].bias.copy_(torch.tensor([0.0, 1.0]))
+
     def forward(self, images: torch.Tensor) -> DetectionOutput:
         """
         Args:
@@ -480,12 +581,18 @@ class RTDETRDetector(BaseDetector):
         fpn_features[-1] = self.aifi(fpn_features[-1])
 
         # 4. flatten して concat → memory
-        # encoder_features は Hierarchical Temporal Module に渡す
+        # encoder_features は Hierarchical Temporal Module / behavior ROI に渡す
         encoder_features = fpn_features  # List[(B, C, H_i, W_i)]
 
+        # P2 (stride 4) は解像度が高くトークン数が支配的になる。p2_in_memory=False なら
+        # FPN の特徴強化だけに使い、decoder の cross-attention memory からは外して
+        # 計算量を抑える (精度と latency のトレードオフを config で選べるようにする)。
+        mem_sources = fpn_features
+        if self.use_p2 and not self.p2_in_memory:
+            mem_sources = fpn_features[1:]
+
         mem_list = []
-        for f in fpn_features:
-            B, C, H, W = f.shape
+        for f in mem_sources:
             pos = self.pos_enc(f)
             f_pos = (f + pos).flatten(2).permute(0, 2, 1)  # (B, H*W, C)
             mem_list.append(f_pos)
@@ -501,21 +608,54 @@ class RTDETRDetector(BaseDetector):
 
         # 6. 最終予測
         final_out = decoder_outputs[-1]                  # (B, Q, hidden_dim)
-        final_logits, final_boxes = self.pred_head(final_out)
+        head_out = self.pred_head(final_out)
+
+        pred_obb = None
+        pred_boxes = head_out["boxes"]
+        if self.obb_enabled:
+            # angle と tight な w/h から OBB を組み、その外接矩形で pred_boxes を
+            # 置き換える。こうすると pred_boxes は OBB 有効時も「軸平行な外接矩形」
+            # という一貫した意味を保ち、既存の AABB 経路がそのまま動く。
+            pred_obb = self._assemble_obb(head_out["boxes"], head_out["angles"])
+            pred_boxes = obb_to_cxcywh(pred_obb)
 
         # auxiliary 予測 (損失計算時に使用)
         aux_outputs = []
         for i, layer_out in enumerate(decoder_outputs[:-1]):
-            logits, boxes = self.aux_heads[i](layer_out)
-            aux_outputs.append({"pred_logits": logits, "pred_boxes": boxes})
+            aux = self.aux_heads[i](layer_out)
+            aux_entry = {"pred_logits": aux["logits"], "pred_boxes": aux["boxes"]}
+            if self.obb_enabled:
+                aux_obb = self._assemble_obb(aux["boxes"], aux["angles"])
+                aux_entry["pred_obb"] = aux_obb
+                aux_entry["pred_angles"] = aux["angles"]
+                aux_entry["pred_boxes"] = obb_to_cxcywh(aux_obb)
+            aux_outputs.append(aux_entry)
 
         return DetectionOutput(
-            pred_logits=final_logits,          # (B, Q, num_classes+1)
-            pred_boxes=final_boxes,            # (B, Q, 4) [cx, cy, w, h]
-            query_features=final_out,          # (B, Q, hidden_dim)
-            encoder_features=encoder_features, # List[(B, C, H_i, W_i)]
-            aux_outputs=aux_outputs,           # List[{pred_logits, pred_boxes}] 中間層
+            pred_logits=head_out["logits"],     # (B, Q, num_classes+1)
+            pred_boxes=pred_boxes,              # (B, Q, 4) [cx, cy, w, h] 外接矩形
+            query_features=final_out,           # (B, Q, hidden_dim)
+            encoder_features=encoder_features,  # List[(B, C, H_i, W_i)]
+            aux_outputs=aux_outputs,            # List[{pred_logits, pred_boxes, ...}]
+            pred_angles=head_out["angles"],     # (B, Q, 2) or None
+            pred_obb=pred_obb,                  # (B, Q, 5) or None
+            pred_keypoints=head_out["keypoints"],
+            pred_polarity=head_out["polarity"],
         )
+
+    @staticmethod
+    def _assemble_obb(boxes: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+        """
+        bbox 回帰 (cx, cy, w, h) と角度符号 (sin2t, cos2t) から OBB を組む。
+
+        Args:
+            boxes:  (B, Q, 4) sigmoid 済み [cx, cy, w, h] ∈ [0,1]
+            angles: (B, Q, 2) 未正規化 [sin(2t), cos(2t)]
+        Returns:
+            (B, Q, 5) [cx, cy, w, h, theta]
+        """
+        theta = decode_angle(angles)                    # (B, Q)
+        return torch.cat([boxes, theta.unsqueeze(-1)], dim=-1)
 
     def get_hidden_dim(self) -> int:
         return self.cfg.head.hidden_dim
@@ -524,16 +664,11 @@ class RTDETRDetector(BaseDetector):
         return self.cfg.head.num_queries
 
     def get_encoder_channels(self) -> List[int]:
-        return [self.cfg.fpn.out_channels] * self.cfg.fpn.num_levels
+        return [self.cfg.fpn.out_channels] * len(self.backbone.out_channels)
 
-    def get_aux_outputs(
-        self, images: torch.Tensor
-    ) -> Tuple[DetectionOutput, List[Dict]]:
-        """
-        auxiliary loss のために中間層の出力も返す版。
-        学習ループで使う。
-        """
-        # forward を再実装するのは冗長なため、ここでは aux_heads の出力を
-        # DetectionOutput に含める方式を取る。
-        # (将来的に auxiliary head の参照を外部化できるよう設計)
-        raise NotImplementedError("Use forward() and access aux_heads directly")
+    def get_encoder_strides(self) -> List[int]:
+        """encoder_features の各レベルの stride (behavior ROIAlign が使う)。"""
+        return self.backbone.get_out_strides()
+
+    def supports_obb(self) -> bool:
+        return self.obb_enabled
