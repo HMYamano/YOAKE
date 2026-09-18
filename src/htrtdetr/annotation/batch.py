@@ -6,6 +6,7 @@ One failed video is a result, not an exception that loses the rest of the batch.
 
 from __future__ import annotations
 
+import bisect
 import subprocess
 import sys
 import tempfile
@@ -61,6 +62,11 @@ class VideoResult:
     num_frames: int = 0
     width: int = 0
     height: int = 0
+    #: Frames a human has already annotated, carried through from the input so
+    #: :func:`sample_project` can score novelty against them. A frame counts as
+    #: annotated when it is present, including with no boxes: an empty frame is
+    #: a decision a human made and a sample the training set already has.
+    annotated: tuple[int, ...] = ()
 
 
 def connect_detections(candidates: dict, threshold=0.3) -> dict:
@@ -175,6 +181,52 @@ def predict_video(video, options, root, output, cancel, progress):
     )
 
 
+
+def known_vectors(results: list[VideoResult]) -> list[tuple[float, ...]]:
+    """Appearance vectors for the parts of the project a human has already done.
+
+    Novelty is distance to the nearest of these, so without them
+    :class:`~htrtdetr.annotation.sampling.SamplingContext` takes its constant
+    branch and the signal contributes nothing - which is what used to happen at
+    every call site, making a second Smart Annotate run a re-roll rather than a
+    step.
+
+    An annotated frame usually has no vector of its own: features are scanned
+    every ``stride`` frames, so frame 17 is absent when the stride is 15. Each
+    annotated frame is snapped to the nearest *scanned* frame instead, at most
+    ``stride / 2`` away.
+
+    That is the right resolution rather than a compromise. The sampler can only
+    ever select a scanned frame, so "already covered" has to be expressed in the
+    units the selection is made in. Snapping says *this part of the video is
+    done*, which is what novelty needs; a frame-exact answer would be a
+    precision the scan cannot support and would change no decision.
+    """
+    out: list[tuple[float, ...]] = []
+    seen: set[tuple[float, ...]] = set()
+    for r in results:
+        if not r.annotated or not r.features:
+            continue
+        frames = [f.frame for f in r.features]
+        for target in r.annotated:
+            i = bisect.bisect_left(frames, target)
+            # The two scanned frames bracketing the annotated one; whichever is
+            # closer wins, and a tie takes the earlier so the result is stable.
+            best = None
+            for j in (i - 1, i):
+                if 0 <= j < len(frames):
+                    gap = abs(frames[j] - target)
+                    if best is None or gap < best[0]:
+                        best = (gap, j)
+            if best is None:
+                continue
+            vector = tuple(r.features[best[1]].embedding)
+            if vector and vector not in seen:
+                seen.add(vector)
+                out.append(vector)
+    return out
+
+
 def sample_project(results: list[VideoResult], request, *, balanced=True):
     """One total budget across videos, with a minimum share before global ranks.
 
@@ -183,6 +235,10 @@ def sample_project(results: list[VideoResult], request, *, balanced=True):
     duration does not determine its score or override the explicit budget.
     """
     valid = [r for r in results if r.features and r.status != "failed"]
+    # Project-wide, not per-video: a frame is worth annotating when it is
+    # unlike anything already labelled *anywhere* in the study, and the budget
+    # this function spends is project-wide too.
+    known = known_vectors(valid)
     frame_budget, clip_budget = request.budget.counts(
         target=request.target, model=request.workload, prelabelled=request.prelabelled
     )
@@ -193,14 +249,16 @@ def sample_project(results: list[VideoResult], request, *, balanced=True):
     all_features = [f for r in valid for f in r.features]
     if all_features:
         combined = sampling.SamplingContext(
-            all_features, seed=request.seed, weights=request.weights
+            all_features, seed=request.seed, weights=request.weights, known=known
         ).combined()
         offset = 0
         for r in valid:
             scores[r.video_id] = {f.frame: combined[offset + i] for i, f in enumerate(r.features)}
             offset += len(r.features)
     for r in valid:
-        ctx = sampling.SamplingContext(r.features, seed=request.seed, weights=request.weights)
+        ctx = sampling.SamplingContext(
+            r.features, seed=request.seed, weights=request.weights, known=known
+        )
         frames = (
             [
                 r.features[i].frame
@@ -331,6 +389,7 @@ class BatchRunner:
                 width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                 height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
             )
+            result.annotated = tuple(sorted(video.annotations))
             candidates = {f: [c.copy() for c in cs] for f, cs in video.candidates.items()}
             if options.detect:
                 key = CacheKey.for_video(

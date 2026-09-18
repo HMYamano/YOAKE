@@ -13,7 +13,7 @@
 > |---|---|---|
 > | エンジン (`local` / `model` / mask→OBB) | [click_segment.py](../src/htrtdetr/gui/click_segment.py) | 完了・実測で検証 |
 > | プロトコル + クライアント | [sidecar.py](../src/htrtdetr/gui/sidecar.py) | 完了・別インタプリタ間で実走確認 |
-> | ヘルパー本体 + stub | [tools/sam_sidecar.py](../tools/sam_sidecar.py) | stub は完了、**実モデルのアダプタは未検証** (§6.7) |
+> | ヘルパー本体 + stub | [tools/sam_sidecar.py](../tools/sam_sidecar.py) | 完了。SAM 2 (point/box/video/embedding) と OWLv2 (`concept`) を実測で検証 (§6.7) |
 > | アノテータ結線 (ツール・バックエンド選択・候補レビュー) | [annotator.py](../src/htrtdetr/annotator.py) | 完了 |
 > | テスト | [test_gui_click_segment.py](../tests/test_gui_click_segment.py) 62 + [test_gui_sidecar.py](../tests/test_gui_sidecar.py) 35 | 97 tests、全 green |
 >
@@ -43,16 +43,24 @@ GUI_DESIGN.md §0 と同じ流儀で、**この機械で測った事実**だけ�
 |---|---|---|
 | GUI の python | 3.14、torch **無し** | SAM を GUI プロセスに入れる案は不可能 |
 | torch のある環境 | `miniconda3/envs/` の `yoru` / `yoake` / `SUPPORT` の 3 つ (Python 3.9、torch 2.8.0+cu128) | サイドカーは**別インタプリタ**で起動する必要がある |
-| **GPU** | **Intel Arc 140T (iGPU)。NVIDIA GPU は無い** | `torch.cuda.is_available()` も `torch.xpu.is_available()` も False。`nvidia-smi.exe` は system32 にあるが実機が無いだけ。**CUDA は今後も使えない** |
-| CPU | 16 スレッド | SAM は CPU で回すしかない |
+| **GPU** | **NVIDIA GeForce RTX 5070 Ti** (2026-09-18 再実測) | `torch.cuda.is_available()` が True。helper は `device=auto` を自分で解決して `cuda` を返す |
+| CPU | 16 スレッド | CPU 経路は残してあるが、もはや唯一の選択肢ではない |
 | **SAM ViT-B 相当の encode** | **1024x1024 で約 1.6 s/frame** (86.4M param、windowed attention 9 + global 3 の実測) | 先読み encode が必須。クリックそのものは数十 ms |
 | インタプリタ探索 | 7 個を 1.8 s で判定 | 遅延起動なら体感に出ない |
 | cv2 / numpy / scipy / skimage | GUI 側に有り | `local` バックエンドは追加依存ゼロで書ける |
 | `segment_anything` / `sam2` / `transformers` / `onnxruntime` | **どの環境にも無し**（7 インタプリタを実測） | SAM は「今すぐ動くもの」ではない。§6.7 |
 
-`torch.cuda` と `torch.xpu` がどちらも False なのは、入っている torch が CUDA ビルド
-(`2.8.0+cu128`) だからです。Arc を使いたいなら XPU ビルドを別途入れる必要がありますが、
-**それは本設計の前提ではありません** — CPU で成立するように組んであります。
+> **2026-09-18 の訂正**: この表はもともと「Intel Arc の iGPU だけで NVIDIA GPU は無い、
+> CUDA は今後も使えない」と書いていました。**現在は誤りです。** RTX 5070 Ti があり、
+> `yoake` env の torch 2.10.0+cu128 で `torch.cuda.is_available()` は True で、
+> サイドカーは実際に `device=cuda` で起動します。設計そのものは変わりません —— CPU で
+> 成立するように組んであるので GPU は速さの話であり、成否の話ではありません。
+> ただし「CPU で回すしかない」を前提に判断しないでください。
+
+なお `yoake` env は **dearpygui + opencv + torch を同時に**持ちます。「GUI の python に
+torch は入らない」という §1 の前提はこの env には当てはまりません。torch-free の
+純粋性契約 (`src/htrtdetr/annotation/`) は引き続き正しい設計ですが、それは
+「両側からテストできる」ためであって、このマシンの制約ではありません。
 
 **この表から出る最重要の結論**: サイドカーに渡す python は `sys.executable` では**ない**。
 既存の `auto_label.predict_argv` が `[sys.executable, *argv]` を前提にしているのと、ここが
@@ -416,11 +424,62 @@ pip install sam2 huggingface_hub
 実測は `docs/ANNOTATION_COPILOT.md` §11 に、回帰テストは
 `tests/test_gui_video_segment.py` の `live_model` ブロックにあります。
 
-`concept` (テキストから全個体) を名乗るアダプタは**まだありません**。
-3 つとも `capabilities` は `("point", "box")` を返し、`concept` 要求には
-`unsupported` を返します。GUI はその返事を見て機能を閉じます —— バックエンドの
-名前から推測はしません (P20)。`stub` だけが `concept` を名乗るので、
-レビュー動線は stub で完全にテストされています。
+### `concept` (テキストから全個体) — 実装済み (2026-09-18)
+
+SAM 系アダプタ 3 つは今も `capabilities` に `("point", "box")` しか持ちません。
+**それが正しい**からです: SAM / SAM 2 は promptable で、「この点にあるものは何か」
+には答えられても「ハエはどこか」には答えられません。`concept` が長らくプロトコル
+だけ存在して stub しか実装者がいなかったのは、この一点が埋まっていなかったためです。
+
+埋め方は**置き換えではなく合成**です:
+
+```
+  OwlGroundingAdapter (OWLv2 / OWL-ViT, transformers)
+      -> テキスト 1 本で軸並行 box を N 個            ← 「どこか」を決める
+  Session.ground: 各 box + その中心点で image adapter を prompt
+      -> SAM 2 が mask を返す
+  handle(): mask -> cs.mask_to_obb
+      -> 回転込みの OBB                                ← 「向き」を決める
+```
+
+どちらのモデルも単独では成立しません。SAM 2 は自力で何も見つけられず、OWLv2 は
+向きの概念を持たない (細長い動物ではそれがラベルの大半です)。
+
+* 能力申告は `Session.extra_capabilities()` が `video` / `embedding` と同じ流儀で
+  行い、`importlib.util.find_spec` だけを見てモデルはロードしません。GUI は
+  `hello` の `capabilities` を見るだけで、名前から推測しません (P20)。
+* image adapter が box prompt を取れない場合 (stub 等) は軸並行 box を
+  `theta = 0` の OBB として返します。**向きが分からないから何も返さない**のでは
+  なく、人が回せる box を返します。精緻化が例外を投げた場合も同じ経路です。
+* `transformers` が無ければ `unsupported` を返し、`detail` に
+  `pip install transformers` と「それまで C と Continue は使える」を書きます。
+* 閾値はリクエストの `threshold` で上書きできます (既定 0.05)。OWLv2 のスコアは
+  確率ではなく低めに出るため、recall を残して人が捨てる側に倒してあります。
+
+**実測** (RTX 5070 Ti, `google/owlv2-base-patch16-ensemble` + `sam2-hiera-tiny`,
+512x512 の合成シーン、`tests/test_sidecar_grounding.py` の `live_model`):
+
+| | |
+|---|---|
+| 中心誤差 | 0.3 px (真値 (300,300) に対し (300.2, 300.2)) |
+| サイズ | 93.4 x 33.5 (描画した本体は 92 x 32) |
+| 角度 | -0.70 rad = -40.1 deg (描画角度 -40 deg) |
+| recall | planted 3 個のうち **1 個** |
+
+recall が低いのは**合成画像だから**です。OWLv2 は写真のモデルで、平坦な背景に
+描いたグレーの楕円には自信を持ちません。テストが固定しているのは合成の正しさ
+(検出器が位置を決め、SAM 2 が向きを決めている) で、recall ではありません。
+実素材での recall は閾値と語句で調整してください。
+
+`stub` も引き続き `concept` を名乗るので、レビュー動線はモデル無しでテストできます。
+
+**発見して直したバグ**: `concept` 分岐だけ `session.load()` を呼んでおらず、
+helper にフレームが渡っていませんでした。stub は `session.shape` から箱を合成して
+256x256 にフォールバックするので何も気づかず、実モデルでは**常に空リスト**が
+返り、UI では「このフレームに動物はいない」と区別できませんでした。
+capability 判定を先、フレーム読み込みを後にしてあります —— 逆だと検出器が未
+インストールの環境で「フレームが届いていない」と出て、唯一の解決策である
+インストール手順が表示されません。
 
 ---
 

@@ -171,8 +171,11 @@ class AnalysisPanel:
     _SHARED_ACTIONS = ("nav.prev", "nav.next", "nav.first", "nav.last",
                        "view.fit", "view.zoom_in", "view.zoom_out")
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, project: Optional[Path] = None) -> None:
         self.root = Path(root)
+        #: The project folder predictions and overlays are written into.
+        #: ``None`` falls back to the source checkout's ``runs/predict``.
+        self.project = Path(project) if project else None
         self.runner = CommandRunner("ana_log", "ana_status", cwd=self.root)
         self.canvas = FrameCanvas("ana_canvas", "ana_frame_tex", "ana_tex_reg")
 
@@ -219,6 +222,31 @@ class AnalysisPanel:
         self._reserve = _VIEWER_RESERVE
         self._cap_probe: Optional[auto_label.Capability] = None
         self._built = False
+
+    # ── where this page writes ──────────────────────────────────────────
+    def _default_outdir(self) -> str:
+        """``<project>/analysis/predict`` when a project is open.
+
+        Predictions are a *result of this study*, not of the source checkout.
+        Writing them next to the code is how a laptop ends up with six
+        predictions.json files and no way to tell which video each came from.
+        """
+        if self.project is None:
+            return str(self.root / "runs" / "predict")
+        from ..annotation.layout import ProjectLayout
+
+        return str(ProjectLayout(self.project).predictions)
+
+    def set_project(self, path: Optional[Path]) -> None:
+        """Follow the hub's active project, without discarding a typed path."""
+        previous = self._default_outdir()
+        self.project = Path(path) if path else None
+        if not dpg.does_item_exist("ana_outdir"):
+            return
+        existing = dpg.get_value("ana_outdir") or ""
+        if not existing or existing == previous:
+            dpg.set_value("ana_outdir", self._default_outdir())
+            widgets.refresh_all_indicators(["ana_outdir"])
 
     # ══════════════════════════════════════════════════════════════════
     # build
@@ -283,7 +311,7 @@ class AnalysisPanel:
             widgets.path_field(
                 "Output folder", "ana_outdir",
                 field_key="predict_output_dir",
-                default=str(self.root / "runs" / "predict"),
+                default=self._default_outdir(),
                 browse=self._pick_outdir,
                 tooltip_text=(
                     "Receives predictions.json and the overlay video. "
@@ -861,7 +889,7 @@ class AnalysisPanel:
             widgets.status_text("ana_status", f"Checkpoint not found: {weights}", "error")
             return
         if not outdir:
-            outdir = str(self.root / "runs" / "predict")
+            outdir = self._default_outdir()
             dpg.set_value("ana_outdir", outdir)
 
         recents.add("video", source)

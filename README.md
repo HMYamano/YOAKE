@@ -167,6 +167,26 @@ Boxes are drawn per frame, carried forward with `Space` (propagate) or the
 auto-tracker, and labeled with track ID and action. Output stays in the standard
 JSON v1.1 format. See [docs/gui.md](docs/gui.md).
 
+#### Projects are folders
+
+A study is one folder: annotations, the training data built from them, every run
+and every analysis result live inside it, and every path it stores is relative —
+so the folder can be moved, copied or handed to someone else and still work.
+
+```
+<project>/  project.yoake.json  annotations.json
+            videos/  datasets/  runs/  analysis/
+```
+
+```bash
+yoake project new dir="D:/studies" name="courtship 2026" videos=D:/captures
+yoake project info path="D:/studies/courtship 2026"     # what resolves, what does not
+annotate --project "D:/studies/courtship 2026"
+```
+
+Full description, including what happens when the videos move too:
+[docs/PROJECT_FOLDER.md](docs/PROJECT_FOLDER.md).
+
 ### Verify the installation
 
 ```bash
@@ -653,6 +673,7 @@ YOAKE/
 │   └── stage4_unified.yaml      # Stage 4 config overrides
 ├── docs/
 │   ├── MODEL_CARD.md            # HuggingFace-style model card
+│   ├── PROJECT_FOLDER.md        # The project folder layout and why it survives a move
 │   ├── DATASET_FORMAT.md        # Annotation format specification
 │   ├── MIGRATION.md             # v1.1->v2.0, config, checkpoint migration
 │   ├── OBB_PIPELINE.md          # OBB / track-aligned / streaming design rationale

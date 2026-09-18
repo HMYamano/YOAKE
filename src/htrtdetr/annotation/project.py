@@ -3,6 +3,12 @@
 Opening a project never opens a capture. Project files reference a committed
 dataset snapshot; a killed save cannot pair new review decisions with old GT.
 The conventional annotations.json is the training/export copy of that snapshot.
+
+A project is a **folder**, whose shape :mod:`htrtdetr.annotation.layout` owns:
+annotations beside the manifest, training data under ``datasets/`` and
+``runs/``, analysis output under ``analysis/``. Everything written into it is
+relative to its root, and every capture outside it is additionally remembered
+by absolute path, so the folder keeps working after it is moved or copied.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,6 +31,17 @@ from ..data.annotation import (
 )
 from ..gui.auto_label import Candidate, ReviewSession
 from .intervals import BehaviorInterval, IntervalTrack
+from .layout import (
+    PROJECT_FILE,
+    ProjectLayout,
+    anchor_path,
+    find_project,
+    is_project_root,
+    locate_media,
+    portable_path,
+    project_folder_name,
+    resolve_media,
+)
 from .objects import AnnObject
 from .quality import ReviewItem
 from .review_queue import ReviewQueue
@@ -62,12 +80,8 @@ def scan_folder(folder: Path, *, recursive: bool = False) -> list[Path]:
 
 
 def relative_path(path: Path | None, base: Path) -> str:
-    if path is None:
-        return ""
-    try:
-        return Path(os.path.relpath(path, base)).as_posix()
-    except ValueError:  # Different Windows drives cannot have a relative path.
-        return str(path)
+    """Deprecated alias kept for callers outside this package."""
+    return portable_path(path, base)
 
 
 def resolve_path(value: str, base: Path) -> Path | None:
@@ -103,6 +117,80 @@ class ProjectSession:
     selected_videos: set = field(default_factory=set)
     sampling_log: list = field(default_factory=list)
     identity: str = field(default_factory=lambda: uuid.uuid4().hex)
+    #: Videos this open had to find again by name, so the UI can say so once
+    #: instead of letting the user wonder whether it opened the right file.
+    relocated: list = field(default_factory=list)
+
+    # ── the folder ───────────────────────────────────────────────────────
+    @property
+    def layout(self) -> ProjectLayout | None:
+        """Where everything this project owns belongs. ``None`` until it has a home."""
+        return ProjectLayout(self.directory) if self.directory is not None else None
+
+    @classmethod
+    def create(cls, parent: Path, name: str, **kwargs) -> ProjectSession:
+        """Make ``<parent>/<name>/`` with the full skeleton and save the manifest.
+
+        Creating the folder here rather than at the first save is what lets the
+        rest of the workflow — training, analysis, caches — address a project
+        folder from the moment it is named, instead of guessing at one.
+        """
+        folder = Path(parent).expanduser() / project_folder_name(name)
+        if is_project_root(folder):
+            raise FileExistsError(f"{folder} already contains a YOAKE project.")
+        project = cls(name=str(name).strip() or "untitled", directory=folder.resolve(), **kwargs)
+        project.save(folder / PROJECT_FILE)
+        return project
+
+    # ── locating captures again ──────────────────────────────────────────
+    @property
+    def search_roots(self) -> list[Path]:
+        """Folders the user has pointed at before, newest first.
+
+        Relinking one video usually answers the question for all of them: the
+        capture drive was remounted, or the study was restored beside its
+        videos. Remembering the folder turns the second, third and twentieth
+        broken link into no question at all.
+        """
+        return [Path(p) for p in self.settings.get("search_roots", []) if p]
+
+    def remember_search_root(self, folder: Path) -> None:
+        folder = Path(folder)
+        folder = folder if folder.is_dir() else folder.parent
+        known = [str(folder)] + [str(p) for p in self.search_roots if p != folder]
+        self.settings["search_roots"] = known[:8]
+
+    def import_media(self, *, move: bool = False) -> tuple[int, list[str]]:
+        """Copy (or move) every referenced capture into ``videos/``.
+
+        This is the difference between a folder that travels and a folder that
+        merely remembers where things were. Returns ``(imported, failures)``.
+        """
+        layout = self.layout
+        if layout is None:
+            raise ValueError("The project has no folder yet. Save it first.")
+        layout.videos.mkdir(parents=True, exist_ok=True)
+        imported, failures = 0, []
+        for video in self.videos.values():
+            if video.path is None or layout.contains(video.path) or not video.path.is_file():
+                continue
+            target = layout.videos / video.path.name
+            stem, suffix, index = target.stem, target.suffix, 2
+            while target.exists() and not target.samefile(video.path):
+                target = layout.videos / f"{stem}_{index}{suffix}"
+                index += 1
+            try:
+                if move:
+                    shutil.move(str(video.path), target)
+                else:
+                    shutil.copy2(video.path, target)
+            except OSError as exc:
+                failures.append(f"{video.video_id}: {exc}")
+                continue
+            video.path = target.resolve()
+            video.touch()
+            imported += 1
+        return imported, failures
 
     def add_video(self, path: Path) -> VideoSession:
         path = Path(path).resolve()
@@ -149,6 +237,30 @@ class ProjectSession:
             raise ValueError("This file already belongs to another project video.")
         self.videos[video_id].path = path
         self.videos[video_id].touch()
+        self.remember_search_root(path.parent)
+
+    def relink_missing(self, folder: Path) -> list[str]:
+        """Point every missing video at a same-named file under ``folder``.
+
+        The one-at-a-time Locate dialog is the right tool for one broken link
+        and the wrong tool for forty: a restored backup breaks all of them for
+        the same reason, and answering "the videos are over here" once should
+        fix all of them.
+        """
+        folder = Path(folder)
+        self.remember_search_root(folder)
+        relinked = []
+        for video in self.videos.values():
+            if not video.missing:
+                continue
+            name = video.path.name if video.path is not None else f"{video.video_id}.mp4"
+            found = locate_media(name, [folder])
+            if found is None or self.find_path(found) is not None:
+                continue
+            video.path = found.resolve()
+            video.touch()
+            relinked.append(video.video_id)
+        return relinked
 
     def scope(self, scope: str, current: str = "") -> list[VideoSession]:
         if scope not in SCOPES:
@@ -276,7 +388,10 @@ class ProjectSession:
             rows.append(
                 {
                     "video_id": video.video_id,
-                    "path": relative_path(video.path, base),
+                    "path": portable_path(video.path, base),
+                    # Only for captures outside the folder, and only as a
+                    # fallback: see layout.resolve_media for the order.
+                    "abs_path": anchor_path(video.path, base),
                     "last_frame": video.current_frame,
                     "active_track_id": video.active_track_id,
                     "next_track_id": video.next_track_id,
@@ -298,8 +413,12 @@ class ProjectSession:
                 }
             )
         state = {
+            # Still 1: the manifest only gained optional keys, and a reader of
+            # either version ignores what it does not know. Bumping it would
+            # make an older YOAKE refuse a project it can in fact open.
             "schema_version": 1,
             "name": self.name,
+            "identity": self.identity,
             "last_video": self.last_video,
             "settings": copy.deepcopy(self.settings),
             "videos": rows,
@@ -309,15 +428,23 @@ class ProjectSession:
 
     def save(self, path: Path) -> None:
         path = Path(path).resolve()
+        layout = ProjectLayout(path.parent).create()
         data, state = self.snapshot(path.parent)
         save_snapshot(path, data, state)
+        layout.write_readme(self.name)
         self.directory = path.parent
         for video in self.videos.values():
             video.dirty = False
 
     @classmethod
     def open(cls, path: Path) -> ProjectSession:
-        path = Path(path).resolve()
+        """Open a manifest, a project folder, or a bare annotations.json."""
+        path = Path(path).expanduser().resolve()
+        if path.is_dir():
+            manifest = find_project(path)
+            if manifest is None:
+                raise FileNotFoundError(f"{path} is not a YOAKE project folder.")
+            path = manifest
         raw = json.loads(path.read_text(encoding="utf-8"))
         if "schema_version" not in raw or "annotations" not in raw:
             return cls.from_annotation(path)
@@ -329,12 +456,26 @@ class ProjectSession:
         project = cls.from_annotation(annotation)
         project.directory = path.parent
         project.name = raw.get("name", path.stem)
+        project.identity = raw.get("identity", project.identity)
         project.last_video = raw.get("last_video", project.last_video)
         project.settings.update(raw.get("settings", {}))
         project.sampling_log = raw.get("sampling_log", [])
+        project.relocated = []
         for row in raw.get("videos", []):
             video = project.videos[row["video_id"]]
-            video.path = resolve_path(row.get("path", ""), path.parent)
+            # The project may have been moved, or the captures may have been,
+            # or both. resolve_media decides in that order; a name search that
+            # succeeds is written back on the next save, so it happens once.
+            found, how = resolve_media(
+                row.get("path", ""),
+                row.get("abs_path", ""),
+                path.parent,
+                search_roots=project.search_roots,
+            )
+            video.path = found
+            if how == "found":
+                project.relocated.append(video.video_id)
+                video.touch()
             video.current_frame = max(0, int(row.get("last_frame", 0)))
             video.next_track_id = max(video.next_track_id, int(row.get("next_track_id", 1)))
             video.active_track_id = row.get("active_track_id", video.next_track_id)
@@ -387,13 +528,14 @@ class ProjectSession:
 def save_snapshot(path: Path, data: DatasetAnno, state: dict) -> None:
     """Commit snapshot first, then atomically move the manifest to it."""
     base = path.parent
-    generation = base / ".yoake" / "snapshots" / f"{uuid.uuid4().hex}.json"
+    layout = ProjectLayout(base)
+    generation = layout.snapshots / f"{uuid.uuid4().hex}.json"
     # Dataset paths remain relative to the project directory. The manifest's
     # per-video paths are authoritative when reopening the internal snapshot.
     save_annotation(data, str(generation), preserve_derived=True)
-    save_annotation(data, str(base / "annotations.json"), preserve_derived=True)
-    state = {**state, "annotations": relative_path(generation, base)}
-    atomic_json(base / "sampling_log.json", state.get("sampling_log", []))
+    save_annotation(data, str(layout.annotations), preserve_derived=True)
+    state = {**state, "annotations": portable_path(generation, base)}
+    atomic_json(layout.sampling_log, state.get("sampling_log", []))
     atomic_json(path, state)
     # Keep the committed generation and one predecessor, without growing on
     # every autosave. This directory holds only workspace-owned snapshots.

@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 
+from ..annotation.layout import PROJECT_FILE, ProjectLayout
 from ..annotation.project import ProjectSession, save_snapshot, scan_folder
 from ..annotation.session import VideoSession
 from .workspace_operations import WorkspaceOperations
@@ -159,7 +160,7 @@ class WorkspaceMixin(WorkspaceOperations):
             project.directory
             or Path(tempfile.gettempdir()) / "YOAKE" / "recovery" / project.identity
         )
-        project.save(directory / "project.yoake.json")
+        project.save(directory / PROJECT_FILE)
 
     def open_project(self, path: Path):
         try:
@@ -175,13 +176,21 @@ class WorkspaceMixin(WorkspaceOperations):
             # Do not overwrite the very file about to be loaded with the old session.
             self._preserve_project_to_recovery()
             self._adopt_project(project)
-            self.annotation_path = path.parent / "annotations.json"
+            self.annotation_path = ProjectLayout(project.directory).annotations
             target = project.videos.get(project.last_video)
             if target is not None and not target.missing:
                 self.switch_video(target.video_id)
             else:
                 self._refresh_workspace()
                 self._status("Project opened. Locate missing files in Project Videos.")
+            if project.relocated:
+                # The folder moved and the videos were found again by name. Say
+                # so: silently opening a different file with the right name is
+                # the one failure the search fallback could cause.
+                names = ", ".join(project.relocated[:3])
+                more = f" and {len(project.relocated) - 3} more" if len(project.relocated) > 3 else ""
+                self._status(f"Relocated {names}{more} by file name. Check they are the right ones.")
+                self._save_due = time.time() + 2
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self._status(f"Could not open project: {exc}")
             return False
@@ -191,7 +200,7 @@ class WorkspaceMixin(WorkspaceOperations):
         project = self._sync_project()
         if project.videos:
             folder = Path(tempfile.gettempdir()) / "YOAKE" / "recovery" / project.identity
-            project.save(folder / "project.yoake.json")
+            project.save(folder / PROJECT_FILE)
 
     def _adopt_project(self, project):
         self.stop_project_batch()
@@ -244,7 +253,7 @@ class WorkspaceMixin(WorkspaceOperations):
 
         save_annotation(project.dataset(path.parent), str(path), preserve_derived=True)
         # A Save As still includes a manifest beside the exported dataset.
-        project.save(path.parent / "project.yoake.json")
+        project.save(path.parent / PROJECT_FILE)
         self.annotation_path = path
         self.project_dir = path.parent
         self._dirty = False
@@ -263,7 +272,7 @@ class WorkspaceMixin(WorkspaceOperations):
         thread = getattr(self, "_workspace_save_thread", None)
         if thread is not None and thread.is_alive():
             return
-        path = self.project_dir / "project.yoake.json"
+        path = self.project_dir / PROJECT_FILE
         data, state = project.snapshot(path.parent)
         revisions = {v.video_id: v.revision for v in project.videos.values()}
         position_revision = self._workspace_revision
@@ -358,6 +367,51 @@ class WorkspaceMixin(WorkspaceOperations):
                 self.switch_video(added[0].video_id)
         self._refresh_workspace()
 
+    def collect_videos(self):
+        """Copy every referenced capture into ``<project>/videos/``.
+
+        Relative paths already survive moving the *whole* tree, and the
+        recorded absolute path survives moving the project alone. Copying the
+        captures in is what survives both at once - a folder handed to someone
+        else, or restored onto a machine that never had the capture drive.
+        """
+        project = self._sync_project()
+        if project.directory is None:
+            self._status("Set a project folder first (File > Set Project Folder).")
+            return
+        outside = [
+            v
+            for v in project.videos.values()
+            if v.path is not None and not ProjectLayout(project.directory).contains(v.path)
+        ]
+        if not outside:
+            self._status("Every video is already inside the project folder.")
+            return
+        self._status(f"Copying {len(outside)} video(s) into the project folder...")
+
+        def work():
+            try:
+                imported, failures = project.import_media()
+            except (OSError, ValueError) as exc:  # reported on the UI thread
+                message = str(exc)
+                self._post(lambda: self._status(f"Could not copy videos: {message}"))
+                return
+            note = f"Copied {imported} video(s) into the project folder."
+            if failures:
+                note += " Failed: " + "; ".join(failures[:3])
+
+            def finish():
+                self._status(note)
+                self._save_due = time.time() + 1
+                self._refresh_workspace()
+
+            self._post(finish)
+
+        self._collect_thread = threading.Thread(
+            target=work, daemon=True, name="yoake-collect-videos"
+        )
+        self._collect_thread.start()
+
     def locate_video(self, video_id):
         from ..annotator import _tk_open_file
 
@@ -380,8 +434,17 @@ class WorkspaceMixin(WorkspaceOperations):
                 video.frame_metadata.setdefault(index, {})[
                     "image_path"
                 ] = f"images/{video.video_id}/{index:06d}.jpg"
-        self._save_workspace(out / "annotations.json")
-        project = self.project
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+        # The export is a self-contained copy: it carries its own manifest so
+        # it can be opened on its own. It must NOT become the live project's
+        # home, or exporting into <project>/datasets would quietly move the
+        # study one level down and leave the real folder behind.
+        if self.project_dir is not None:
+            self._save_workspace(ProjectLayout(self.project_dir).annotations)
+        data, state = project.snapshot(out)
+        save_snapshot(out / PROJECT_FILE, data, state)
+        self._status(f"Exporting frames to {out}")
         videos = [(v.video_id, v.path, sorted(v.annotations)) for v in project.videos.values()]
 
         def work():

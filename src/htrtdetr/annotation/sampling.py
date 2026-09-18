@@ -573,9 +573,14 @@ def _strategy_diversity(ctx: SamplingContext, k: int) -> List[int]:
     if ctx.size == 0 or k <= 0:
         return []
     # The seed picks the traversal's starting frame, which is the only free
-    # choice in an otherwise deterministic algorithm.
+    # choice in an otherwise deterministic algorithm - and only while nothing
+    # has been annotated yet. Once ``known`` is populated the traversal starts
+    # from what is already labelled, so a second pass continues the first
+    # instead of re-rolling it. This is the cold-start path, where no model
+    # exists and appearance is the only signal there is, so it is the one that
+    # has to iterate on its own.
     first = random.Random(ctx.seed).randrange(ctx.size)
-    return sorted(farthest_point_order(ctx.vectors, k, first=first))
+    return sorted(farthest_point_order(ctx.vectors, k, first=first, seeds=ctx.known))
 
 
 def _strategy_uncertainty(ctx: SamplingContext, k: int) -> List[int]:
@@ -608,7 +613,7 @@ def _spread_over_top(ctx: SamplingContext, k: int, scores: Sequence[float],
     if not any(sub):
         return sorted(pool[:k])   # no appearance vectors: ranking is all there is
     first = random.Random(ctx.seed).randrange(len(pool))
-    picked = farthest_point_order(sub, k, first=first)
+    picked = farthest_point_order(sub, k, first=first, seeds=ctx.known)
     return sorted(pool[p] for p in picked)
 
 

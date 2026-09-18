@@ -786,7 +786,44 @@ collapses the timeline to one lane, and passes `inference.show_id=False` /
 `track_ids`. Loading a file with no `track_id >= 0` in it switches the box off by itself and
 says so in the run log — offering a view of data that is not there is worse than not offering it.
 
-## §0.3.10 Every dialog: scrolling body, pinned footer
+## §0.3.10 A project is a folder, and the folder can be moved
+
+A project used to be `annotations.json` plus an *optional* autosave directory, and everything
+else a study produced went somewhere unrelated: runs under the source checkout's `runs/`,
+figures under `outputs/`, caches wherever the caller pointed them. Three of those four are not
+paths a user chose; they are paths the code defaulted to. Archiving a study meant remembering
+all four, and one of them was a git checkout.
+
+`htrtdetr.annotation.layout.ProjectLayout` owns one shape, derived from one root:
+
+```
+<project>/  project.yoake.json  annotations.json  sampling_log.json  README.txt
+            videos/  datasets/  runs/  analysis/  .yoake/  .yoake_cache/
+```
+
+| Rule | Why |
+|---|---|
+| The shape is fixed, not configurable | A path the user supplies is a path they can supply *differently* next session. The result is a study whose halves no longer know about each other. |
+| The folder is created when the project is **named**, not at the first save | Anything run in between — a batch detection, a training run — has to have somewhere to write, and "somewhere" is the bug. |
+| The folder field on the setup screen is pre-filled (`~/YOAKE/<name>`) and follows the name until edited | Optional was the default, and optional is how output scatters. Still overridable: clearing it restores the old temporary-recovery behaviour. |
+| Creating a project on top of an existing one **opens it instead** | The alternative is overwriting a study with an empty one, from a screen whose button says "Create". |
+| Every page's path fields come from one table (`TrainingPanel._defaults`) | Two panels that both want "the folder for stage 2" must not be able to disagree about its name. |
+| Switching projects rewrites only fields still holding a suggestion | A field the user typed into is an instruction, not a default. |
+| Export writes a manifest but **never** relocates the live session | The default destination is inside the project (`datasets/frames`), so adopting the export as the new home would move the study one level into itself. |
+| `annotations.json` is unchanged, and `schema_version` stays 1 | The new manifest keys are optional; a bump would make an older YOAKE refuse a project it can in fact read. |
+
+**Portability.** Every stored path is relative to the root, and a capture *outside* the folder
+additionally records its absolute path. `layout.resolve_media` tries relative, then absolute,
+then a name search under the project and under folders the user has located files in before —
+and the order is the design. Relative wins first because it is the only answer that is right
+when the whole tree was copied: a stale absolute path can still resolve on the old machine and
+quietly open **the wrong file**. When the name search is what answered, the status line says
+so, because that is the one failure this fallback can cause. A relink remembers the folder it
+was given (`settings.search_roots`), so a restored backup is answered once rather than forty
+times. `Project > Copy Videos into Project Folder` copies captures into `videos/`, which is
+what makes a folder survive being handed to someone who never had the capture drive.
+
+## §0.3.11 Every dialog: scrolling body, pinned footer
 
 A dialog is created with a fixed `width` and `height`. Its content grows — one more threshold,
 one more phase, one more option — and the button the user opened it for ends up below the

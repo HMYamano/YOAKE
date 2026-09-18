@@ -49,6 +49,49 @@ def test_export_rewrites_imported_image_paths_and_keeps_all_videos(app, tmp_path
     assert reopened.videos["a"].frame_metadata[0]["image_path"] == "images/a/000000.jpg"
 
 
+def test_export_into_the_project_never_moves_the_project(app, tmp_path):
+    """Export writes a self-contained copy; the study stays where it lives.
+
+    The default destination is inside the project (``datasets/frames``), and the
+    export writes a manifest so the copy can be opened on its own. Those two
+    facts together used to mean the live session quietly adopted the export as
+    its home and left the real folder behind.
+    """
+    home = tmp_path / "study"
+    app.project_dir = home
+    app._create_object([5, 5, 25, 25])
+    app.save_annotation()
+    assert (home / "project.yoake.json").is_file()
+
+    out = home / "datasets" / "frames"
+    app.export_project(out)
+    wait_for_ui(app, lambda: not app._export_thread.is_alive())
+
+    assert app.project_dir == home
+    assert app.project.directory == home
+    assert (home / "annotations.json").is_file()
+    # The copy stands on its own, and opening it does not disturb the original.
+    assert ProjectSession.open(out / "project.yoake.json").videos
+    assert ProjectSession.open(home / "project.yoake.json").videos
+
+
+def test_collect_videos_copies_the_captures_into_the_folder(app, tmp_path):
+    home = tmp_path / "study"
+    app.project_dir = home
+    app._create_object([5, 5, 25, 25])
+    app.save_annotation()
+    outside = [v.path for v in app.project.videos.values()]
+    assert all(not str(p).startswith(str(home)) for p in outside)
+
+    app.collect_videos()
+    wait_for_ui(app, lambda: not app._collect_thread.is_alive())
+    wait_for_ui(app, lambda: all(str(v.path).startswith(str(home))
+                                 for v in app.project.videos.values()))
+    assert sorted(p.name for p in (home / "videos").glob("*.avi")) == ["a.avi", "b.avi"]
+    for original in outside:
+        assert original.is_file()  # a copy, never a move: the source is untouched
+
+
 def test_async_native_tracker_keeps_class_and_origin_video(app):
     seed = app._create_object([5, 5, 25, 25])
     seed.class_id, seed.action_id = 1, 1

@@ -291,6 +291,298 @@ class WorkspaceOperations:
         self._refresh_workspace()
         self._status(result.describe(request.track_id))
 
+    # ─── Clips: one export, every animal in it ───────────────────────────
+    #
+    # Continue follows one animal. A clip is the span a human already agreed to
+    # look at, and it usually holds every animal at once, so following them one
+    # at a time re-exported and re-encoded the same frames per animal - and the
+    # encode is the whole cost of a propagation. Measured on 40 frames with two
+    # animals: 5.98 s for the first, 3.09 s for the second over the same
+    # export. The saving lives entirely in exporting once, which is why one
+    # worker owns the whole clip.
+
+    def _clip_propagation_ready(self, retry=None) -> bool:
+        """The same gate Continue's accurate path uses, with clip wording.
+
+        ``retry`` is what the press meant. Starting the helper is asynchronous,
+        so the gate cannot answer yes on the first press; it remembers the
+        operation instead and replays it once the helper is up.
+        """
+        if not self.use_track_ids:
+            # A propagation's output is a tracklet; a tracklet with no identity
+            # cannot be accepted as one animal. Same reason continue_animal
+            # drops to a plain copy here.
+            self._status(
+                "Following a clip needs track IDs, which this project has "
+                "turned off. Turn them on in Project > Tracking, or use "
+                "Continue to copy boxes forward one frame at a time."
+            )
+            return False
+        if not self._sam_ready():
+            self._start_sam(
+                on_done=lambda ok: retry() if (ok and retry is not None) else None
+            )
+            if not self._sam_ready():
+                self._status(
+                    "Starting the segmentation helper. Following the clip "
+                    "will begin as soon as it answers."
+                )
+                return False
+        capability = self.video_capability()
+        if not capability.available:
+            self._show_unavailable("Clip propagation", capability.reason)
+            return False
+        if self.cap is None:
+            self._status("Open a video first.")
+            return False
+        running = getattr(self, "_propagate_thread", None)
+        if running is not None and running.is_alive():
+            # Pressing again is how a minutes-long job stops (P6). Exact about
+            # when, because the pass already inside the helper cannot be cut
+            # short from here.
+            self._propagate_stop = True
+            self._status(
+                "Stopping after the pass that is already running. Nothing "
+                "after it will start."
+            )
+            return False
+        return True
+
+    def _clip_job(self, video, start, end, preferred=None):
+        """``(first, last, requests)`` for one clip, or ``None`` with a reason."""
+        from . import video_segment as vs
+
+        seed = vs.clip_seed_frame(
+            start, end, video.annotations,
+            preferred=preferred, num_frames=video.num_frames,
+        )
+        if seed is None:
+            return None, "no boxes inside it"
+        prompts = vs.prompts_from_objects(
+            video.annotations.get(seed, []),
+            fallback_track=max(1, int(self.active_track_id)),
+        )
+        requests = vs.clip_requests(
+            start, end, prompts, preferred_frame=seed, num_frames=video.num_frames,
+        )
+        if not requests:
+            return None, "no box in it could prompt anything"
+        first, last = vs.clip_window(start, end, video.num_frames)
+        return (first, last, requests), ""
+
+    def propagate_clip(self, start, end, prompt_frame=None):
+        """Follow every animal on one frame of a clip across the whole clip."""
+        # Resolved before the gate, so a replay seeds from the frame the user
+        # was on when they pressed rather than wherever the playhead drifted.
+        preferred = prompt_frame if prompt_frame is not None else self.current_frame_idx
+        if not self._clip_propagation_ready(
+            retry=lambda: self.propagate_clip(start, end, preferred)
+        ):
+            return False
+        video = self._video_session
+        job, why = self._clip_job(video, start, end, preferred)
+        if job is None:
+            self._status(
+                f"This clip has {why}. Draw a box (W), click an animal (C), or "
+                "use Find all in frame on one frame of it, then try again."
+            )
+            return False
+        return self._start_clip_jobs([job], clips=1)
+
+    def clip_at(self, frame):
+        """The sampled clip containing ``frame``, or ``None``.
+
+        Sampled clips, not behavior intervals: a clip is a span Smart Annotate
+        proposed and nobody has labelled yet, which is exactly what there is
+        something to propose into. An interval is already a human's answer.
+        """
+        selection = getattr(self, "_selection", None)
+        for clip in getattr(selection, "clips", ()) or ():
+            if int(clip.start) <= int(frame) <= int(clip.end):
+                return clip
+        return None
+
+    def propagate_clip_here(self):
+        """The sampled clip under the playhead."""
+        frame = self.current_frame_idx
+        clip = self.clip_at(frame)
+        if clip is None:
+            self._status(
+                "The playhead is not inside a sampled clip. Run Smart Annotate "
+                "with a behavior or 'both' target, or use Continue to follow "
+                "one animal from here."
+            )
+            return False
+        return self.propagate_clip(clip.start, clip.end, frame)
+
+    def propagate_sampled_clips(self):
+        """Every clip Smart Annotate proposed for this video, in order."""
+        if not self._clip_propagation_ready(retry=self.propagate_sampled_clips):
+            return False
+        selection = getattr(self, "_selection", None)
+        clips = list(getattr(selection, "clips", ()) or ())
+        if not clips:
+            self._status(
+                "No sampled clips yet. Run Smart Annotate with a behavior or "
+                "'both' target first."
+            )
+            return False
+        video = self._video_session
+        jobs, skipped = [], 0
+        for clip in clips:
+            job, _why = self._clip_job(video, clip.start, clip.end)
+            if job is None:
+                skipped += 1
+                continue
+            jobs.append(job)
+        if not jobs:
+            self._status(
+                f"None of the {len(clips)} sampled clips has a box to follow. "
+                "Annotate one frame in a clip first - the propagation can only "
+                "follow animals it was prompted with."
+            )
+            return False
+        return self._start_clip_jobs(jobs, clips=len(jobs), skipped=skipped)
+
+    def _start_clip_jobs(self, jobs, *, clips=1, skipped=0):
+        self._propagate_stop = False
+        context = (self.project, self._video_session, self._sam_client)
+        self._propagate_thread = threading.Thread(
+            target=self._clip_propagate_worker,
+            args=(jobs, clips, skipped, context),
+            name="yoake-clip-propagate",
+            daemon=True,
+        )
+        self._propagate_thread.start()
+        total = sum(len(requests) for _f, _l, requests in jobs)
+        where = "this clip" if clips <= 1 else f"{clips} clips"
+        self._status(f"Following {total} animal(s) across {where}...")
+        return True
+
+    def _clip_propagate_worker(self, jobs, clips, skipped, context):
+        """One export per clip, reused by every animal in it. Off-thread."""
+        import shutil
+
+        import cv2
+
+        from . import video_segment as vs
+
+        project, video, client = context
+        pairs = []
+        cap = None
+        try:
+            # Its own capture: seeking one VideoCapture from two threads is not
+            # safe, and sharing the annotator's would make the canvas jump.
+            cap = cv2.VideoCapture(str(video.path))
+            if not cap.isOpened():
+                self._post(lambda: self._status("The video could not be opened."))
+                return
+
+            def read_frame(index):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+                ok, frame = cap.read()
+                return frame if ok else None
+
+            for ordinal, (first, last, requests) in enumerate(jobs, 1):
+                if self._propagate_stop:
+                    break
+                folder = None
+                try:
+                    label = "" if clips <= 1 else f"clip {ordinal}/{clips}: "
+                    folder, written = vs.export_window(
+                        read_frame, first, last,
+                        should_stop=lambda: self._propagate_stop,
+                        on_progress=lambda done, total, lb=label: (
+                            self._post(
+                                lambda d=done, t=total, l=lb: self._status(
+                                    f"{l}preparing frames {d}/{t}..."
+                                )
+                            )
+                            if done % 25 == 0
+                            else None
+                        ),
+                    )
+                    if folder is None or written == 0:
+                        continue
+                    for index, request in enumerate(requests, 1):
+                        if self._propagate_stop:
+                            break
+                        self._post(
+                            lambda i=index, n=len(requests), t=request.track_id, lb=label:
+                            self._status(f"{lb}following animal {i}/{n} (track {t})...")
+                        )
+                        forward = self._one_clip_pass(client, folder, first, request, False)
+                        backward = None
+                        if first < request.frame and not self._propagate_stop:
+                            backward = self._one_clip_pass(client, folder, first, request, True)
+                        if forward is None and backward is None:
+                            pairs.append((request, None))
+                        else:
+                            # Forward first: both passes return the prompt
+                            # frame, and the forward one should win it.
+                            pairs.append((request, vs.merge_results(forward, backward)))
+                finally:
+                    if folder is not None:
+                        shutil.rmtree(folder, ignore_errors=True)
+
+            self._post(
+                lambda p=pairs, c=clips, s=skipped: self._finish_clip_propagation(
+                    project, video, p, c, s
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            message = f"{type(exc).__name__}: {exc}"
+            self._post(lambda m=message: self._status(f"Clip propagation failed. {m}"))
+        finally:
+            if cap is not None:
+                cap.release()
+
+    def _one_clip_pass(self, client, folder, first, request, backward):
+        from . import video_segment as vs
+
+        req_id = client.propagate(
+            frames_dir=str(folder),
+            first_frame=first,
+            prompt_frame=request.frame,
+            points=[list(p) for p in request.points] or None,
+            box=list(request.box) if request.box else None,
+            obj_id=max(1, int(request.track_id)),
+            backward=backward,
+        )
+        reply = client.wait_for(req_id, timeout=600.0)
+        return None if reply is None else vs.result_from_reply(reply)
+
+    def _finish_clip_propagation(self, project, video, pairs, clips, skipped=0):
+        from .video_segment import build_candidates, describe_clip_run
+
+        if self.project is not project:
+            return
+        for request, result in pairs:
+            if result is None or not result.count:
+                continue
+            candidates = build_candidates(
+                result, track_id=request.track_id, action_id=request.action_id
+            )
+            for row in candidates.values():
+                for candidate in row:
+                    candidate.class_id = request.class_id
+                    candidate.provenance.update(
+                        operation="clip_propagation", human_review="pending"
+                    )
+            self._merge_video_candidates(video, candidates)
+        # Once, not once per animal: the checks rebuild every tracklet and
+        # re-run nine detectors over the whole pending set.
+        self._check_session(video)
+        video.touch()
+        self._save_due = time.time() + 4
+        if video is self._video_session:
+            self.inbox.set_queue(video.queue, fps=video.fps)
+            self._refresh_candidate_ui()
+            self._render_canvas()
+            self._render_timeline()
+        self._refresh_workspace()
+        self._status(describe_clip_run(pairs, clips=clips, skipped=skipped))
+
     def open_batch_dialog(self, mode="auto"):
         from .batch_progress import BatchDialog
 
@@ -674,6 +966,8 @@ class WorkspaceOperations:
                 or Path(tempfile.gettempdir()) / "YOAKE" / "recovery" / project.identity
             )
             try:
-                project.save(directory / "project.yoake.json")
+                from ..annotation.layout import PROJECT_FILE
+
+                project.save(directory / PROJECT_FILE)
             except OSError as exc:
                 print(f"Could not save workspace on exit: {exc}")

@@ -71,6 +71,7 @@ try:  # GUI 補助モジュール (相対 import で失敗したら絶対 import
     from .annotation import propagation as propagation_mod
     from .annotation import quality as quality_mod
     from .annotation import review_queue as review_queue_mod
+    from .annotation import sampling as sampling_mod
     from .annotation import tracklet as tracklet_mod
 except ImportError:  # スクリプト直接実行時のフォールバック
     from htrtdetr.gui import auto_label, click_segment
@@ -97,6 +98,7 @@ except ImportError:  # スクリプト直接実行時のフォールバック
     from htrtdetr.annotation import propagation as propagation_mod
     from htrtdetr.annotation import quality as quality_mod
     from htrtdetr.annotation import review_queue as review_queue_mod
+    from htrtdetr.annotation import sampling as sampling_mod
     from htrtdetr.annotation import tracklet as tracklet_mod
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -414,6 +416,11 @@ class AnnotationApp(WorkspaceMixin):
         self._sam_pump_armed: bool = False
         self._sam_embed_due: Optional[float] = None
         self._sam_waiting: bool = False
+        # 起動は非同期。押した操作は「用意ができたら」ここに積んで replay する。
+        self._sam_starting: bool = False
+        self._sam_on_ready: List[Callable[[bool], None]] = []
+        # _stop_sam が飛んだ後に古い起動が着地して勝手にヘルパーを据えるのを防ぐ。
+        self._sam_start_token: int = 0
         # concept モードの候補 (auto_label.ReviewSession)。accepted になるまで
         # self.annotations には入らない = ディスクに届かない (GUI_DESIGN P1)。
         self._review = None
@@ -481,6 +488,7 @@ class AnnotationApp(WorkspaceMixin):
         self._sel_tracklet = None  # the tracklet in the inspector
         self._sel_interval = None
         self._sel_issue = None
+        self._sel_clip = None  # the sampled clip in the inspector
         self._analysis_thread = None
         self._analysis_stop = False
         self._propagate_thread = None
@@ -495,6 +503,7 @@ class AnnotationApp(WorkspaceMixin):
             "timeline",
             on_seek=lambda f: self.goto_frame(f, light=True),
             on_issue=self._on_timeline_marker,
+            on_clip=self._on_timeline_clip,
         )
         self.inbox = review_mod.ReviewInbox(
             on_select=self.jump_to_issue,
@@ -573,7 +582,12 @@ class AnnotationApp(WorkspaceMixin):
                 dpg.add_spacer(height=8)
 
                 dpg.add_text("Project name")
-                dpg.add_input_text(tag="setup_proj_name", default_value="my_project", width=-1)
+                dpg.add_input_text(
+                    tag="setup_proj_name",
+                    default_value="my_project",
+                    width=-1,
+                    callback=self._on_setup_name_changed,
+                )
                 dpg.add_spacer(height=8)
 
                 dpg.add_text("Class labels (comma-separated, for example: fly,worm)")
@@ -610,10 +624,35 @@ class AnnotationApp(WorkspaceMixin):
                 )
                 dpg.add_spacer(height=8)
 
-                dpg.add_text("Project folder (optional - Save writes annotations.json here)")
+                # ── where the project lives ───────────────────────────
+                # A folder, not a file. Everything the study produces -
+                # annotations, training data, analysis output, caches - is
+                # written inside it, and every path it records is relative to
+                # it, so the folder can be moved, copied or handed over whole.
+                dpg.add_text("Project folder (created if it does not exist)")
                 with dpg.group(horizontal=True):
-                    dpg.add_input_text(tag="setup_proj_dir", default_value="", width=-90)
+                    dpg.add_input_text(
+                        tag="setup_proj_dir",
+                        default_value=str(self._setup_default_dir()),
+                        width=-90,
+                        callback=self._on_setup_dir_edited,
+                    )
                     dpg.add_button(label="Browse", width=80, callback=self._on_setup_pick_proj_dir)
+                dpg.add_text("", tag="setup_dir_preview", color=theme.TEXT_DIM, wrap=w - 60)
+                dpg.add_checkbox(
+                    label="Copy the videos into the project folder",
+                    tag="setup_copy_media",
+                    default_value=False,
+                )
+                dpg.add_text(
+                    "On: the folder is self-contained and can be moved to another "
+                    "machine on its own. Off: videos stay where they are and the "
+                    "project remembers both their relative and absolute location, "
+                    "so moving the folder alone still works.",
+                    color=theme.TEXT_DIM,
+                    wrap=w - 60,
+                )
+                dpg.add_text("", tag="setup_error", color=theme.DANGER, wrap=w - 60)
                 dpg.add_spacer(height=12)
                 dpg.add_separator()
                 dpg.add_spacer(height=8)
@@ -647,14 +686,89 @@ class AnnotationApp(WorkspaceMixin):
                 width=-1,
                 height=28,
             )
+        self._setup_dir_edited = False
+        self._setup_dir_parent = None
+        self._refresh_setup_dir_preview()
         widgets.place_dialog("setup_win", w, h)
 
+    # ── the project folder, on the first screen anyone sees ──────────────
+    def _setup_default_dir(self, name: str = "") -> Path:
+        """Somewhere sensible by default, so a study is never left homeless.
+
+        The folder used to be optional, and a project without one autosaved
+        into a temporary recovery directory - which is exactly how annotations,
+        runs and analysis output end up in three unrelated places.
+        """
+        from .annotation.layout import project_folder_name
+
+        parent = getattr(self, "_setup_dir_parent", None) or Path.home() / "YOAKE"
+        raw = name or (
+            dpg.get_value("setup_proj_name") if dpg.does_item_exist("setup_proj_name") else ""
+        )
+        return Path(parent) / project_folder_name(raw or "my_project")
+
+    def _on_setup_dir_edited(self, *_args) -> None:
+        self._setup_dir_edited = True
+        self._refresh_setup_dir_preview()
+
+    def _on_setup_name_changed(self, *_args) -> None:
+        if not getattr(self, "_setup_dir_edited", False) and dpg.does_item_exist("setup_proj_dir"):
+            dpg.set_value("setup_proj_dir", str(self._setup_default_dir()))
+        self._refresh_setup_dir_preview()
+
+    def _refresh_setup_dir_preview(self) -> None:
+        if not dpg.does_item_exist("setup_dir_preview"):
+            return
+        from .annotation.layout import FOLDERS, is_project_root
+
+        raw = dpg.get_value("setup_proj_dir").strip()
+        if not raw:
+            dpg.set_value(
+                "setup_dir_preview",
+                "No folder: the project autosaves to a temporary recovery folder "
+                "until you use Save As.",
+            )
+            return
+        folders = ", ".join(f"{name}/" for _a, name, _d in FOLDERS)
+        existing = "Opens the project already in this folder. " if is_project_root(raw) else ""
+        dpg.set_value("setup_dir_preview", f"{existing}Creates {folders} and annotations.json here.")
+
     def _on_setup_pick_proj_dir(self) -> None:
-        p = _tk_ask_dir(title="Select Project Directory")
-        if p is not None and dpg.does_item_exist("setup_proj_dir"):
+        p = _tk_ask_dir(title="Select a folder to create the project in")
+        if p is None or not dpg.does_item_exist("setup_proj_dir"):
+            return
+        # A folder that already holds a project is the one the user means;
+        # anything else is the parent the new project folder goes into.
+        from .annotation.layout import is_project_root
+
+        if is_project_root(p):
+            self._setup_dir_edited = True
             dpg.set_value("setup_proj_dir", str(p))
+        else:
+            self._setup_dir_parent = Path(p)
+            self._setup_dir_edited = False
+            dpg.set_value("setup_proj_dir", str(self._setup_default_dir()))
+        self._refresh_setup_dir_preview()
 
     def _on_new_project_confirmed(self) -> None:
+        from .annotation.layout import PROJECT_FILE, is_project_root
+
+        raw_dir = dpg.get_value("setup_proj_dir").strip()
+        # Creating a project on top of another one would overwrite a study with
+        # an empty one. Offer to open it instead, on the screen they are on.
+        if raw_dir and is_project_root(raw_dir):
+            if dpg.does_item_exist("setup_error"):
+                dpg.set_value(
+                    "setup_error",
+                    f"{raw_dir} already holds a project. Opening it instead of "
+                    "creating an empty one.",
+                )
+            dpg.delete_item("setup_win")
+            widgets.forget_dialog("setup_win")
+            self._build_main_window()
+            self.open_project(Path(raw_dir) / PROJECT_FILE)
+            return
+
         self._preserve_project_to_recovery()
         from .annotation.project import ProjectSession
         from .annotation.session import VideoSession
@@ -673,14 +787,16 @@ class AnnotationApp(WorkspaceMixin):
             self.class_names = ["fly"]
         if not self.action_names:
             self.action_names = list(_DEFAULT_ACTIONS)
-        raw_dir = dpg.get_value("setup_proj_dir").strip()
-        self.project_dir = Path(raw_dir) if raw_dir else None
+        self.project_dir = Path(raw_dir).expanduser() if raw_dir else None
         self.project.settings["end_of_video"] = (
             "next_unfinished"
             if dpg.get_value("setup_end") == "Open next unfinished video"
             else "stay"
         )
         self.project.settings["use_track_ids"] = bool(dpg.get_value("setup_use_tracks"))
+        copy_media = dpg.does_item_exist("setup_copy_media") and bool(
+            dpg.get_value("setup_copy_media")
+        )
         dpg.delete_item("setup_win")
         widgets.forget_dialog("setup_win")
         self._build_main_window()
@@ -690,7 +806,10 @@ class AnnotationApp(WorkspaceMixin):
         self._add_videos(getattr(self, "_setup_videos", []))
         self._setup_videos = []
         if self.project_dir is not None:
-            self.project.save(self.project_dir / "project.yoake.json")
+            self.project.save(self.project_dir / PROJECT_FILE)
+            self._status(f"Project folder created: {self.project_dir}")
+            if copy_media:
+                self.collect_videos()
         self._refresh_workspace()
         if not self.project.settings.get("onboarding_done"):
             self.show_onboarding()
@@ -793,6 +912,9 @@ class AnnotationApp(WorkspaceMixin):
                 dpg.add_menu_item(
                     label="Set Project Folder...", callback=self._set_project_dir_dialog
                 )
+                dpg.add_menu_item(
+                    label="Open Project Folder", callback=self._open_project_folder
+                )
                 dpg.add_menu_item(label="Save  Ctrl+S", callback=self.save_annotation)
                 dpg.add_menu_item(label="Save As...", callback=self._save_as_dialog)
                 dpg.add_menu_item(
@@ -811,6 +933,9 @@ class AnnotationApp(WorkspaceMixin):
 
             with dpg.menu(label="Project"):
                 dpg.add_menu_item(label="Project Videos...", callback=self.show_video_browser)
+                dpg.add_menu_item(
+                    label="Copy Videos into Project Folder", callback=self.collect_videos
+                )
                 dpg.add_menu_item(
                     label="Auto Annotate Project...",
                     callback=lambda: self.open_batch_dialog("auto"),
@@ -845,6 +970,18 @@ class AnnotationApp(WorkspaceMixin):
                 dpg.add_menu_item(label="Project Review Inbox", callback=self.show_project_review)
                 dpg.add_menu_item(label="Review Inbox", callback=self.toggle_inbox)
                 dpg.add_menu_item(label="Review issues one by one", callback=self.open_review_mode)
+                dpg.add_separator()
+                # Clip propagation sits under Review, beside Smart Annotate,
+                # because a clip is what Smart Annotate proposed and the boxes
+                # it produces go straight into the Review Inbox.
+                dpg.add_menu_item(
+                    label="Follow animals across this clip",
+                    callback=self.propagate_clip_here,
+                )
+                dpg.add_menu_item(
+                    label="Follow animals across every sampled clip",
+                    callback=self.propagate_sampled_clips,
+                )
                 dpg.add_separator()
                 dpg.add_menu_item(label="Re-check everything", callback=self.rebuild_copilot)
                 dpg.add_menu_item(
@@ -2595,6 +2732,7 @@ class AnnotationApp(WorkspaceMixin):
         # A box selection supersedes whatever the Inspector was showing: the
         # user just pointed at something, and that is the context now.
         self._sel_tracklet = self._sel_interval = self._sel_issue = None
+        self._sel_clip = None
         self._selected = obj
         self._refresh_sidebar()
         self._render_canvas()
@@ -2811,8 +2949,11 @@ class AnnotationApp(WorkspaceMixin):
         """
         if name not in ("auto", *click_segment.BACKENDS):
             name = "local"
-        if name == "sam" and not self._start_sam():
-            name = "local"
+        if name == "sam" and not self._sam_ready():
+            # The start is asynchronous now, so whether it worked is not known
+            # here. Selecting the backend optimistically keeps the window
+            # responsive; the fallback to Local happens when the answer comes.
+            self._start_sam(on_done=self._sam_backend_started)
         if name == "model" and not self._predictions:
             self._status(
                 "No model predictions are loaded. Use File > Load Predictions "
@@ -2827,27 +2968,64 @@ class AnnotationApp(WorkspaceMixin):
             f"Click animal now uses {click_segment.BACKEND_LABELS.get(name, 'Automatic (best available)')}."
         )
 
-    def _start_sam(self) -> bool:
+    def _sam_backend_started(self, ok: bool) -> None:
+        """Keep the promise that choosing SAM is never a dead end.
+
+        ``local`` needs nothing installed, so a helper that could not start
+        drops the selection back to it rather than leaving Click animal
+        pointing at a backend that is not there.
+        """
+        if not ok and self._click_backend == "sam":
+            self.set_click_backend("local")
+
+    def _start_sam(self, on_done: Optional[Callable[[bool], None]] = None) -> bool:
         """SAM ヘルパーを遅延起動する。使うと言われて初めて探索します。
 
         probe も起動も**この瞬間まで一切走りません**。torch のあるインタプリタを
         探すだけで数秒かかることがあり、SAM を使わない人にその代金を払わせる
         理由がないからです。
+
+        探索と起動は**ワーカースレッドで**走ります。両方が UI スレッドに乗って
+        いた頃、``_status`` に書いた進捗は 1 文字も画面に出ませんでした。
+        dearpygui はこのコールバックが返るまでフレームを描き直さないので、
+        最後に描かれた "Looking for a Python with PyTorch..." のまま窓が固まり、
+        Windows が「応答なし」を出します。実測でも探索 1.2 秒 + 起動 2.7 秒、
+        コールドな初回は子プロセスの ``import torch`` だけで数十秒かかります。
+
+        戻り値は**いま使えるか**であって、起動が成功するかではありません。
+        まだなら ``on_done(ok)`` が UI スレッドで後から呼ばれるので、押された
+        操作はそこでやり直します — 二度押しを覚えてもらう代わりに。
         """
         if self._sam_ready():
+            if on_done is not None:
+                on_done(True)
             return True
-        if self._sam_cap is None:
-            self._status("Looking for a Python with PyTorch...")
+        if on_done is not None:
+            self._sam_on_ready.append(on_done)
+        if self._sam_starting:
+            return False
+        self._sam_starting = True
+        self._sam_start_token += 1
+        token = self._sam_start_token
+        self._status("Looking for a Python with PyTorch...")
+        threading.Thread(
+            target=self._sam_start_worker, args=(token,), daemon=True
+        ).start()
+        return False
+
+    def _sam_start_worker(self, token: int) -> None:
+        """Probe and launch, off the UI thread. Touches no dearpygui item."""
+        cap = self._sam_cap
+        if cap is None:
             try:
-                self._sam_cap = sidecar_mod.probe_interpreters()
+                cap = sidecar_mod.probe_interpreters()
             except Exception as exc:  # noqa: BLE001
-                self._sam_cap = sidecar_mod.SidecarCapability(
+                cap = sidecar_mod.SidecarCapability(
                     usable=False, reason=f"Could not probe for PyTorch: {exc}"
                 )
-        cap = self._sam_cap
         if not cap.usable:
-            self._status(cap.reason.splitlines()[0])
-            return False
+            self._post(lambda: self._finish_sam_start(token, cap, None, ""))
+            return
         spec = sidecar_mod.SidecarSpec(
             python=cap.interpreter.python,
             repo_root=str(_repo_root()),
@@ -2855,21 +3033,68 @@ class AnnotationApp(WorkspaceMixin):
             # The helper picks the device, because only the helper has torch.
             device="auto",
         )
-        self._status(f"Starting the segmentation helper ({spec.backend})...")
+        self._post(
+            lambda: self._status(f"Starting the segmentation helper ({spec.backend})...")
+        )
+        client: Any = None
+        error = ""
         try:
-            self._sam_client = sidecar_mod.SidecarClient(spec, on_log=self._sam_log)
-            self._sam_client.start(timeout=60.0)
+            client = sidecar_mod.SidecarClient(spec, on_log=self._sam_log)
+            client.start(timeout=60.0)
         except Exception as exc:  # noqa: BLE001
+            client, error = None, f"The segmentation helper did not start: {exc}"
+        self._post(lambda: self._finish_sam_start(token, cap, client, error))
+
+    def _finish_sam_start(self, token: int, cap, client, error: str) -> None:
+        """Install the helper on the UI thread, then replay what was waiting."""
+        self._sam_cap = cap
+        if token != self._sam_start_token:
+            # _stop_sam ran while this start was in flight. The user's last
+            # word wins, and a helper nobody asked for any more is a stray
+            # process holding the GPU.
+            if client is not None:
+                try:
+                    client.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        self._sam_starting = False
+        waiting, self._sam_on_ready = self._sam_on_ready, []
+        if client is None:
             self._sam_client = None
-            self._status(f"The segmentation helper did not start: {exc}")
-            return False
-        self._arm_sam_pump()
-        if self._current_bgr is not None:
-            self._sam_embed_due = time.monotonic()
-        return True
+            reason = error or cap.reason
+            self._status(
+                (reason.splitlines() or ["The segmentation helper did not start."])[0]
+            )
+        else:
+            self._sam_client = client
+            self._arm_sam_pump()
+            if self._current_bgr is not None:
+                self._sam_embed_due = time.monotonic()
+            hello = getattr(client, "hello", None) or {}
+            backend = str(hello.get("backend") or "")
+            device = str(hello.get("device") or "")
+            detail = ", ".join(part for part in (backend, device) if part)
+            self._status(
+                f"Segmentation helper ready ({detail})."
+                if detail
+                else "Segmentation helper ready."
+            )
+        ok = client is not None
+        for callback in waiting:
+            try:
+                callback(ok)
+            except Exception as exc:  # noqa: BLE001
+                self._status(f"Could not resume after starting: {type(exc).__name__}: {exc}")
 
     def _stop_sam(self) -> None:
         client, self._sam_client = self._sam_client, None
+        # Invalidate any start still in flight: without this a helper the user
+        # has just turned off installs itself seconds later, and the operation
+        # waiting on it runs after they said no.
+        self._sam_start_token += 1
+        self._sam_starting = False
+        self._sam_on_ready = []
         self._sam_jobs.clear()
         self._sam_waiting = False
         self._sam_embed_due = None
@@ -3052,8 +3277,19 @@ class AnnotationApp(WorkspaceMixin):
         """テキストでこのフレームの個体をまとめて検出させる (SAM3 系のみ)。"""
         text = (text or "").strip() or (self.class_names[0] if self.class_names else "animal")
         if not self._sam_ready():
-            self._status("Find all needs the SAM helper. Choose it under 'Fit with:' first.")
-            return False
+            # Pressing this IS asking to use the helper — the same reading
+            # Continue and clip propagation have always taken. It used to send
+            # the user to an unrelated Click to Box setting instead, and said
+            # so in one line at the bottom of the window, so the button looked
+            # dead. The resolved text is captured, so the replay searches for
+            # what was typed rather than for the default.
+            self._start_sam(on_done=lambda ok: self.find_all_in_frame(text) if ok else None)
+            if not self._sam_ready():
+                self._status(
+                    f"Starting the segmentation helper. The search for "
+                    f"'{text}' will run as soon as it answers."
+                )
+                return False
         client = self._sam_client
         if "concept" not in client.capabilities:
             self._status(
@@ -3792,13 +4028,47 @@ class AnnotationApp(WorkspaceMixin):
             self._write_annotation(path)
 
     def _set_project_dir_dialog(self) -> None:
-        """メニューからプロジェクト保存ディレクトリを変更する。"""
-        p = _tk_ask_dir(title="Select Project Directory")
+        """メニューからプロジェクトフォルダを設定/移動する。
+
+        設定した時点でフォルダ構造 (datasets/ runs/ analysis/ ...) を作り、
+        マニフェストを書き出す。「後で保存すれば作られる」では、その間に走った
+        学習や解析の出力が別の場所に残ってしまうため。
+        """
+        p = _tk_ask_dir(title="Select the project folder")
         if p is None:
             return
-        self.project_dir = p
+        from .annotation.layout import PROJECT_FILE
+
+        self.project_dir = Path(p)
+        self._sync_project()
+        try:
+            self.project.save(self.project_dir / PROJECT_FILE)
+        except OSError as exc:
+            self._status(f"Could not create the project folder: {exc}")
+            return
+        self.annotation_path = self.project_dir / "annotations.json"
         self._refresh_project_dir_display()
+        self._refresh_workspace()
         self._status(f"Project folder set to {p}")
+
+    def _open_project_folder(self) -> None:
+        """Show the project folder in the system file browser."""
+        if self.project_dir is None:
+            self._status("No project folder yet. Use File > Set Project Folder.")
+            return
+        import os
+        import subprocess
+        import sys
+
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(self.project_dir))  # noqa: S606 - a folder the user owns
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(self.project_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(self.project_dir)])
+        except OSError as exc:
+            self._status(f"Could not open {self.project_dir}: {exc}")
 
     def _refresh_project_dir_display(self) -> None:
         if dpg.does_item_exist("project_dir_text"):
@@ -3811,7 +4081,19 @@ class AnnotationApp(WorkspaceMixin):
         self._save_workspace(Path(path))
 
     def _save_and_export_dialog(self) -> None:
-        out = self.project_dir or _tk_ask_dir(title="Select Output Directory")
+        """Export frames + annotations as a dataset, inside the project by default.
+
+        ``datasets/frames`` rather than the project root: exported frames are
+        training input, they can be regenerated, and there can be several of
+        them. Mixing them into the root is how a project folder stops being
+        readable after the third export.
+        """
+        from .annotation.layout import ProjectLayout
+
+        out = ProjectLayout(self.project_dir).frames if self.project_dir else None
+        if out is None:
+            picked = _tk_ask_dir(title="Select Output Directory")
+            out = Path(picked) if picked is not None else None
         if out is not None:
             self.export_project(Path(out))
 
@@ -4048,7 +4330,18 @@ class AnnotationApp(WorkspaceMixin):
         elif not cap.package:
             predict_reason = cap.package_reason
         elif not self._ensure_project().settings.get("weights"):
-            predict_reason = "Choose a checkpoint in Project > Auto Annotate Project first."
+            # Not a deficiency: this option is the accelerator that arrives
+            # *after* a model exists, and labelling does not wait for it. The
+            # wording says so, and names what proposes boxes in the meantime,
+            # so an empty checkbox does not read as a blocked workflow.
+            predict_reason = (
+                "Detector pre-labelling needs a trained checkpoint, which step 2 "
+                "produces once the labels are done - so this option turns on "
+                "later, and nothing here waits for it.\n"
+                "Choose one in Project > Auto Annotate Project when you have it.\n"
+                "Until then the boxes come from the segmentation helper: press C "
+                "to click an animal, or select a box and press Continue."
+            )
         self.smart_dialog.set_capability(
             gpu_reason=(
                 ""
@@ -4360,6 +4653,7 @@ class AnnotationApp(WorkspaceMixin):
         self._sel_issue = item
         self._sel_tracklet = None
         self._sel_interval = None
+        self._sel_clip = None
         self._queue.select(item)
         self.goto_frame(item.middle())
         # Select the box the item is about, when it names exactly one track, so
@@ -4836,10 +5130,17 @@ class AnnotationApp(WorkspaceMixin):
 
         # Pressing this IS asking to use the helper, so start it here rather
         # than sending the user to Settings to turn on an unrelated setting.
-        # _start_sam is lazy and idempotent, and reports its own failure; the
-        # capability check below then turns that into the sentence to show.
+        # _start_sam is lazy and idempotent. It is also asynchronous, so the
+        # press is remembered and replayed when the helper answers — a second
+        # press would otherwise be a rule to learn from nowhere.
         if not self._sam_ready():
-            self._start_sam()
+            self._start_sam(on_done=lambda ok: self.propagate_selection() if ok else None)
+            if not self._sam_ready():
+                self._status(
+                    "Starting the segmentation helper. The propagation will "
+                    "begin as soon as it answers."
+                )
+                return
 
         capability = self.video_capability()
         if not capability.available:
@@ -5090,6 +5391,9 @@ class AnnotationApp(WorkspaceMixin):
             "accept_similar": self.accept_similar,
             "reject_tracklet": self.reject_tracklet,
             "goto_tracklet": self.goto_tracklet,
+            "clip_follow": self._insp_follow_clip,
+            "clip_goto_seed": self._insp_goto_clip_seed,
+            "clip_goto_start": self._insp_goto_clip_start,
             "confirm_interval": self._insp_confirm_interval,
             "relabel_interval": self._insp_relabel_interval,
             "interval_start_here": lambda: self._insp_move_interval("start"),
@@ -5153,6 +5457,29 @@ class AnnotationApp(WorkspaceMixin):
             )
             return
 
+        if self._sel_clip is not None:
+            try:
+                from .gui import video_segment as vs
+            except ImportError:  # pragma: no cover
+                from htrtdetr.gui import video_segment as vs
+
+            clip = self._sel_clip
+            seed = vs.clip_seed_frame(
+                clip.start, clip.end, self.annotations,
+                num_frames=self.num_frames,
+            )
+            self.inspector.show(
+                inspector_mod.InspectorContext(
+                    kind=inspector_mod.CLIP,
+                    clip=clip,
+                    clip_seed=seed,
+                    clip_animals=len(self.annotations.get(seed, [])) if seed is not None else 0,
+                    clip_blocked=self.clip_propagation_blocked(),
+                    **common,
+                )
+            )
+            return
+
         here = len(self.annotations.get(self.current_frame_idx, []))
         obj = self._selected
         if obj is None:
@@ -5180,6 +5507,77 @@ class AnnotationApp(WorkspaceMixin):
         )
 
     # -- inspector actions -------------------------------------------
+    def _on_timeline_clip(self, payload) -> None:
+        """A click on a clip in the samples lane: ``(start, end)``.
+
+        Selecting, not running. A propagation is a job of minutes that a click
+        cannot take back, so the click puts the clip in the Inspector and the
+        Inspector offers the button - the same shape as clicking a box, which
+        selects it rather than editing it.
+        """
+        start, end = (int(v) for v in payload)
+        clip = None
+        for candidate in getattr(self._selection, "clips", ()) or ():
+            if int(candidate.start) == start and int(candidate.end) == end:
+                clip = candidate
+                break
+        if clip is None:
+            # The timeline only draws clips it was given, so this means the
+            # model and the selection have drifted; fall back to a plain span
+            # rather than dropping the click.
+            clip = sampling_mod.Clip(start=start, end=end)
+        self._sel_clip = clip
+        self._sel_tracklet = self._sel_interval = self._sel_issue = None
+        self._selected = None
+        self._refresh_sidebar()
+        self._render_canvas()
+
+    def clip_propagation_blocked(self) -> str:
+        """Why a clip propagation could not run, or ``""``.
+
+        Only reasons that pressing the button cannot resolve. The segmentation
+        helper is deliberately **not** one of them: ``propagate_clip`` starts it
+        on press, so reporting "no helper is running" here would lock a control
+        over a condition that pressing it fixes. That is the same reasoning
+        that keeps Continue permanently unlocked.
+        """
+        if not self.use_track_ids:
+            return (
+                "Following a clip needs track IDs, which this project has "
+                "turned off. Turn them on in Project > Tracking."
+            )
+        if self.cap is None:
+            return "Open a video first."
+        return ""
+
+    def _insp_follow_clip(self) -> None:
+        clip = self._sel_clip
+        if clip is None:
+            return
+        self.propagate_clip(clip.start, clip.end)
+
+    def _insp_goto_clip_seed(self) -> None:
+        clip = self._sel_clip
+        if clip is None:
+            return
+        try:
+            from .gui import video_segment as vs
+        except ImportError:  # pragma: no cover
+            from htrtdetr.gui import video_segment as vs
+
+        seed = vs.clip_seed_frame(
+            clip.start, clip.end, self.annotations, num_frames=self.num_frames
+        )
+        if seed is None:
+            self._status("This clip has no annotated frame to go to yet.")
+            return
+        self.goto_frame(int(seed))
+
+    def _insp_goto_clip_start(self) -> None:
+        clip = self._sel_clip
+        if clip is not None:
+            self.goto_frame(int(clip.start))
+
     def _insp_set_class(self, name: str) -> None:
         if name not in self.class_names:
             return
@@ -5480,7 +5878,11 @@ def main(argv=None) -> None:
 
     parser = argparse.ArgumentParser(prog="annotate", description="YOAKE GUI Annotation Tool")
     parser.add_argument("video", nargs="?", help="Video file to open")
-    parser.add_argument("--project", metavar="JSON", help="Open a project.yoake.json workspace")
+    parser.add_argument(
+        "--project",
+        metavar="PATH",
+        help="Open a project folder, or the project.yoake.json inside it",
+    )
     parser.add_argument("--folder", metavar="PATH", help="Add all videos from a folder")
     parser.add_argument("--recursive", action="store_true", help="Include subfolders with --folder")
     parser.add_argument("--load", metavar="JSON", help="Load existing annotation JSON")

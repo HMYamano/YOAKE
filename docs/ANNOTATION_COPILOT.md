@@ -215,7 +215,7 @@ analysis script keeps working and no second file exists to desynchronise.
 │           Undo Redo Save  Panels  Settings   tool sentence    │
 ├──────┬────────────────────────────────────┬──────────────────┤
 │ Tool │                                    │ Inspector        │
-│ Rail │             CANVAS                 │  one of six      │
+│ Rail │             CANVAS                 │  one of seven    │
 │      │                                    │  contexts        │
 │ 6 ›› │   zoom / pan / crosshair /         │   — or —         │
 │ tools│   tool border + caption            │ Review Inbox     │
@@ -250,12 +250,37 @@ rotation, occlusion, the one-press behavior buttons, provenance, delete. A
 candidate shows confidence, why it is queued, and the six accept scopes. A
 tracklet shows range, **minimum before mean** confidence, issues, and
 `Accept all N`. An interval shows label, timecode and edge edits. A review item
-shows the reason, what to check, and the one-click answers.
+shows the reason, what to check, and the one-click answers. A **sampled clip**
+shows its range, why it was sampled, how many animals would be followed and
+from which frame, and the button that starts the propagation.
+
+A clip is deliberately not the interval context. An interval is a span a human
+has already answered and its actions edit edges; a clip is a span nobody has
+labelled and its one action is *start*. Sharing a context would have put edge
+edits on something with no label to edit.
+
+Adding the seventh context is also what turned the three dispatch tables in
+`show()` into `_TITLES`, `_SUBTITLES` and `_FILLERS` at module level. They are
+edited together whenever a context is added and nothing but a reader was
+checking that they agreed - and the failure is quiet, because a context with a
+title and no filler renders an empty pane under a correct heading, which reads
+as *there is nothing here* rather than as a bug. One test now asserts all three
+cover `CONTEXTS`.
 
 **Timeline lanes.** Shape carries meaning, not only colour: an ID-switch risk is
 a cross, a missing or merged animal is a triangle, everything else is a diamond;
 a sample is a hollow circle and a keyframe is a filled square. Cost is
 O(width), not O(frames).
+
+**Clicking a clip** in the samples lane selects it rather than running
+anything: a propagation is minutes of work that a click cannot take back, so
+the click fills the Inspector and the Inspector offers the button - the same
+shape as clicking a box, which selects it rather than editing it. Unlike a
+marker hit the press also seeks, because a clip is a span and the frame aimed
+at is information the propagation reads. There is no pixel tolerance on a clip,
+unlike the 6-pixel one on a marker: a clip is drawn as wide as its own frames,
+so a tolerance would select the clip next door. The narrowest clip wins when
+two overlap, being both the harder to hit and the more specific answer.
 
 **Layout is derived, not guessed.** `_bottom_height()` is
 `Timeline.height + _UNDER_TIMELINE_H`, so adding a lane reflows the canvas
@@ -294,6 +319,45 @@ Heavy models stay out of this process entirely, through `gui/sidecar.py`, which 
 exists and already runs a helper under a *different interpreter* — the only design that
 works when the GUI's Python cannot have torch.
 
+### Starting the helper is on a worker too (2026-09-18)
+
+`_start_sam` used to run the interpreter probe **and** `SidecarClient.start(timeout=60)`
+inline in the button callback. dearpygui draws no frame until a callback returns, so
+every `_status` line written during it was invisible: the window kept showing
+*"Looking for a Python with PyTorch..."* — the last thing drawn before the block — and
+Windows greyed it out. Measured here: 1.2 s to probe, 2.7 s to start warm, and a cold
+`import torch` in the child costs tens of seconds on top. It looked exactly like a
+hang, and the natural response is to kill the window.
+
+Both halves now run in `_sam_start_worker`, which touches no dearpygui item and posts
+its result through the same `_post` queue as every other worker. `_sam_client` is still
+assigned only on the UI thread, in `_finish_sam_start`.
+
+That makes the start asynchronous, so `_start_sam` cannot answer *did it work* — it
+answers **is it usable now**, and takes `on_done(ok)` for the rest. Every caller that
+presses a button to use the helper passes its own press as that callback and returns:
+
+| Caller | What is replayed |
+|---|---|
+| `find_all_in_frame` | the search, with the word that was typed |
+| `propagate_selection` | the propagation |
+| `_clip_propagation_ready` | whatever the gate's caller passed as `retry` |
+| `set_click_backend("sam")` | nothing — a failure falls back to `local` instead |
+
+A second press while a start is in flight joins the queue rather than starting a second
+helper, and `_stop_sam` bumps a token so a start that lands *after* the user turned it
+off stops the helper it built and drops the work that was waiting on it — otherwise a
+helper appears seconds after the no, holding the GPU, and runs the operation anyway.
+
+**`find_all_in_frame` now starts the helper itself**, which is what `Continue` and clip
+propagation always did. It used to refuse with *"Find all needs the SAM helper. Choose
+it under 'Fit with:' first"* — one line at the bottom of the window, pointing at an
+unrelated Click to Box setting — so the button read as dead. Pressing a control **is**
+asking to use what it needs.
+
+Verified end to end against the real helper: one press with nothing running returns in
+15 ms, and 10.3 s later the candidates are on screen, with `annotations` still empty.
+
 ---
 
 ## 8. Compatibility
@@ -326,10 +390,11 @@ Stated so an omission is not mistaken for an oversight.
 | Not built | Why, and what exists instead |
 |---|---|
 | A measured `WorkloadModel` | Its four constants are guesses and the UI labels them *estimated*. Replace them from an instrumented session and the feature gets better with no code change. |
-| In-process inference | The annotator's Python has no torch. Pre-labelling goes through `predictions.json`, which is how the suite already moves model output. |
+| ~~In-process inference~~ | **Available since 2026-09-18** when the annotator is launched from the `yoake` conda env, which has dearpygui, OpenCV and torch 2.10+cu128 together. Launched from pythoncore-3.14 there is still no torch and pre-labelling goes through `predictions.json`, as before. |
 | `class_id` on a box | `to_dict` hardcodes `0` and `tests/test_labeling_ops.py` asserts it. The Inspector says so rather than appearing to work. |
 | Timeline drag-editing of behavior intervals | Edges move from the Inspector against the current frame. Dragging on the lane is the next increment. |
 | Per-sample reason shown *on the timeline* | Reasons are in the Smart Annotate summary and in `Selection.reasons`. The timeline draws samples as one marker kind. |
+| A detector trained *from inside* the annotator | Deliberate, not missing. Step 1 is the loop and closes without a model; step 2 turns a finished label set into one. See §12. |
 
 ---
 
@@ -478,3 +543,99 @@ takes `embeddings=` and falls through per frame, so a 384-d DINOv2 vector and a
 caller**. A batch that errors or times out gives up on the helper and returns
 what it has; the run continues on the descriptor rather than being lost.
 
+---
+
+## 12. The loop closes without a model (2026-09-18)
+
+The thesis in §2 had one hole: every arrow marked *AI proposes* ran through a
+trained YOAKE checkpoint, and there is no checkpoint until someone has already
+labelled a few hundred frames by hand. The loop could not start itself.
+
+It can now, and nothing in it trains anything.
+
+```
+  Smart Annotate                       picks the frames
+      | diversity over appearance, seeded with what you already labelled
+      v
+  Follow animals across this clip      proposes the boxes
+      | every animal on one frame of the clip, over one export
+      | or: Find all in frame - OWLv2 finds them from a word,
+      |     SAM 2 orients each one
+      | or: Continue - one human prompt per animal, +/-100 frames
+      v
+  Review Inbox                         you accept or reject
+      v
+  Smart Annotate again                 picks what is unlike round 1
+```
+
+### The two things that were unwired
+
+**`SamplingContext.known` had no caller.** Novelty is "distance to the nearest
+already-annotated frame", and with `known` empty it takes a constant branch that
+rank-normalises to nothing. `ScoreWeights.novelty` was `0.6` against a column of
+zeros. `batch.known_vectors` now builds it from `VideoResult.annotated`, which
+`_video` carries over from `VideoInput.annotations` - a field the GUI had been
+deep-copying into place all along.
+
+Annotated frames are not scanned frames: features come every `stride` frames, so
+frame 17 has no vector when the stride is 15. Each annotated frame snaps to the
+nearest scanned one. That is the right resolution rather than a rounding error,
+because the sampler can only ever *select* a scanned frame, so "already covered"
+has to be said in the units the selection is made in.
+
+**`diversity` never consulted `known` at all**, and `diversity` is the
+cold-start strategy - the one that runs when no model exists, which is exactly
+when the loop has to iterate on its own. Novelty only ever reached
+`combined()`, which `diversity` does not call. `farthest_point_order` now takes
+`seeds=`: with seeds the traversal has no arbitrary start, and the first pick is
+whatever lies furthest from everything already labelled. Both documented
+properties survive, because seeding only rewrites the initial nearest-distance
+array. `tests/test_active_learning_loop.py` pins the end-to-end consequence: two
+passes over one video share no frames.
+
+### Why an open-vocabulary detector, and not SAM
+
+`concept` had a UI, a protocol op, a capability guard and a review flow, and
+only `StubAdapter` behind it. That was not neglect - it is a real gap in what
+SAM is. SAM and SAM 2 are *promptable*: they answer "what is at this point" and
+cannot answer "where are the flies".
+
+So the detector is added beside the image adapter rather than instead of it, and
+`Session.ground` composes them: OWLv2 decides *where*, SAM 2 decides *which
+pixels*, and `mask_to_obb` decides *which way round* - the last of which OWLv2
+has no concept of, and which for an elongated animal is most of the label.
+Measurements and the recall caveat are in `docs/CLICK_SEGMENT.md`.
+
+### A clip is the unit worth propagating
+
+`Continue` follows one animal. A clip is the span Smart Annotate proposed and a
+human already agreed to look at, and it usually holds every animal at once - so
+following them one at a time re-exported and re-encoded the same frames per
+animal, and `init_state` is the whole cost of a propagation.
+
+Measured on 40 frames with two animals: **5.98 s for the first, 3.09 s for the
+second** over the same export, both covered 40/40. The helper caches its
+inference state per `frames_dir` and `reset_state` keeps the per-frame
+features, so the encode is paid once and each extra animal costs only its two
+propagation passes.
+
+That measurement is what decided the shape. One worker owns a whole clip and
+every `PropagationRequest` it builds reports the *same* window - the saving is
+entirely in exporting once and evaporates if the caller exports per animal. It
+is also why there is no multi-object protocol op: it would save one pass per
+animal against a cost that is already amortised, for a protocol change.
+
+The seed frame is the **fullest** frame in the clip, not its middle. Seeding
+from a frame where one of two flies is drawn leaves the other unproposed for
+the whole clip and nothing in the result says why. Ties go to the middle,
+because SAM 2 propagates one way from the prompt and the middle makes the
+longer of the two runs as short as it can be. The frame the human is looking at
+wins only when it is not beaten on count.
+
+### Where training sits
+
+Step 2 is not part of this loop and step 1 never waits for it. A checkpoint
+makes step 1 *faster* - Auto Annotate pre-labels whole videos, and uncertainty
+joins the sampling signals - so the Smart Annotate option that needs one is
+locked with a reason that says it turns on later, rather than one that reads
+like a blocked workflow.

@@ -197,11 +197,13 @@ class Timeline:
         *,
         on_seek: Optional[Callable[[int], None]] = None,
         on_issue: Optional[Callable[[Any], None]] = None,
+        on_clip: Optional[Callable[[Tuple[int, int]], None]] = None,
         lanes: Sequence[Lane] = LANES,
     ) -> None:
         self.tag = tag
         self.on_seek = on_seek
         self.on_issue = on_issue
+        self.on_clip = on_clip
         self.lanes = tuple(lanes)
         self.model = TimelineModel()
         self._width = 800
@@ -479,6 +481,32 @@ class Timeline:
                 best, best_dx = payload, dx
         return best
 
+    def clip_at(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        """The sampled clip under ``(x, y)``, or ``None``.
+
+        No pixel tolerance, unlike :meth:`marker_at`: a clip is drawn as a
+        rectangle spanning its own frames, so it is already as wide as it is
+        and a tolerance would let a click next to a clip select it. The band in
+        y is generous for the same reason the marker one is - the lane is 10
+        pixels tall.
+
+        The narrowest clip wins when two overlap. A short clip inside a long
+        one is the harder of the two to hit, and it is also the more specific
+        answer to "which clip did you mean".
+        """
+        lane_top = self._lane_top("samples")
+        lane = self._lane_of("samples")
+        if not (lane_top - 3 <= y <= lane_top + lane.height + 3):
+            return None
+        best = None
+        for start, end in self.model.clips:
+            left = self.frame_to_x(start)
+            right = max(self.frame_to_x(end), left + 2)
+            if left - 1 <= x <= right + 1:
+                if best is None or (end - start) < (best[1] - best[0]):
+                    best = (int(start), int(end))
+        return best
+
     def on_press(self) -> bool:
         """Handle a left press. ``True`` when the timeline consumed it.
 
@@ -495,6 +523,15 @@ class Timeline:
         marker = self.marker_at(x, y)
         if marker is not None and self.on_issue is not None:
             self.on_issue(marker)
+            return True
+        clip = self.clip_at(x, y)
+        if clip is not None and self.on_clip is not None:
+            # Seek as well, unlike a marker hit. A clip is a span rather than a
+            # point, so the frame the user aimed at is information - and the
+            # propagation the clip pane offers reads the playhead to decide
+            # which frame the human was looking at.
+            self._seek_to(x)
+            self.on_clip(clip)
             return True
         self._scrubbing = True
         self._seek_to(x)

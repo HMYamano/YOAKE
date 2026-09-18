@@ -292,10 +292,13 @@ class TrainingPanel:
     thread; when it is never called an internal clock thread does the same job.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, project: Optional[Path] = None) -> None:
         self.root = Path(root)
         self.tools = self.root / "tools"
-        self.runs = self.root / "runs"
+        #: The project folder this page writes into. ``None`` falls back to the
+        #: source checkout, which is where runs used to land unconditionally -
+        #: next to the code rather than next to the study they belong to.
+        self.project = Path(project) if project else None
         # status_tag is deliberately empty: this panel owns "train_status" so a
         # user-requested stop is reported as a stop, never as "Error (code=1)".
         self.runner = _PanelRunner("train_log", "", cwd=self.root)
@@ -324,6 +327,83 @@ class TrainingPanel:
         except OSError:
             pass
         self._cap = auto_label.probe(self.root)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # where this page writes
+    # ─────────────────────────────────────────────────────────────────────
+    @property
+    def layout(self):
+        """The active project's folder shape, or ``None`` without a project."""
+        from ..annotation.layout import ProjectLayout
+
+        return ProjectLayout(self.project) if self.project is not None else None
+
+    @property
+    def runs(self) -> Path:
+        layout = self.layout
+        return layout.runs if layout is not None else self.root / "runs"
+
+    def _defaults(self) -> Dict[str, str]:
+        """Every path this page suggests, in one table.
+
+        One table rather than a default per widget, because switching projects
+        has to know exactly which values it may replace: a field still holding
+        a suggestion follows the project, a field the user typed into does not.
+        """
+        layout = self.layout
+        stage = self.current_stage
+        runs = self.runs
+        if layout is None:
+            return {
+                "tr_out": str(runs / "train" / f"stage{stage}"),
+                "tr_eval_out": str(runs / "val" / f"stage{stage}"),
+                "an_out": str(runs / "analyze"),
+                "mon_dir": str(runs / "train" / f"stage{stage}"),
+                "ds_stat_out": str(self.root / "outputs" / "dataset_summary"),
+                "ds_split_out": "",
+                "ds_split_anno": "",
+                "ds_stat_anno": "",
+                "tr_train": "",
+                "tr_val": "",
+                "tr_eval_val": "",
+                "tr_ckpt": "",
+                "an_pred": "",
+                "an_anno": "",
+            }
+        splits = layout.splits
+        return {
+            "tr_out": str(layout.train_run(stage)),
+            "tr_eval_out": str(layout.eval_run(stage)),
+            "an_out": str(layout.reports),
+            "mon_dir": str(layout.train_run(stage)),
+            "ds_stat_out": str(layout.summary),
+            "ds_split_out": str(splits),
+            "ds_split_anno": str(layout.annotations),
+            "ds_stat_anno": str(layout.annotations),
+            "tr_train": str(splits / "annotations_train.json"),
+            "tr_val": str(splits / "annotations_val.json"),
+            "tr_eval_val": str(splits / "annotations_val.json"),
+            "tr_ckpt": str(layout.train_run(stage) / "weights" / "best.pth"),
+            "an_pred": str(layout.predictions / "predictions.json"),
+            "an_anno": str(layout.annotations),
+        }
+
+    def _default_for(self, tag: str) -> str:
+        return self._defaults().get(tag, "")
+
+    def set_project(self, path: Optional[Path]) -> None:
+        """Point the page at another project, without discarding typed paths."""
+        previous = self._defaults()
+        self.project = Path(path) if path else None
+        current = self._defaults()
+        for tag, value in current.items():
+            if not dpg.does_item_exist(tag):
+                continue
+            existing = dpg.get_value(tag) or ""
+            if existing and existing != previous.get(tag, ""):
+                continue  # typed by the user: a project switch must not erase it
+            dpg.set_value(tag, value)
+        widgets.refresh_all_indicators(list(current))
 
     # ─────────────────────────────────────────────────────────────────────
     # build
@@ -565,6 +645,7 @@ class TrainingPanel:
                     "Annotation JSON", "ds_split_anno",
                     field_key="annotation_json",
                     required=True,
+                    default=self._default_for("ds_split_anno"),
                     browse=self._pick_json("ds_split_anno"),
                     tooltip_text="The converted annotation JSON to split.",
                 )
@@ -572,6 +653,7 @@ class TrainingPanel:
                     "Output folder", "ds_split_out",
                     field_key="split_dir",
                     required=True,
+                    default=self._default_for("ds_split_out"),
                     browse=self._pick_dir("ds_split_out"),
                     tooltip_text=(
                         "Receives annotations_train.json, annotations_val.json, "
@@ -633,6 +715,7 @@ class TrainingPanel:
                     "Annotation JSON", "ds_stat_anno",
                     field_key="annotation_json",
                     required=True,
+                    default=self._default_for("ds_stat_anno"),
                     browse=self._pick_json("ds_stat_anno"),
                     tooltip_text="Any annotation JSON, split or not.",
                 )
@@ -642,7 +725,7 @@ class TrainingPanel:
                     self._field(
                         "Figure folder", "ds_stat_out",
                         field_key="dataset_summary_dir",
-                        default=str(self.root / "outputs" / "dataset_summary"),
+                        default=self._default_for("ds_stat_out"),
                         browse=self._pick_dir("ds_stat_out"),
                         tooltip_text=("Receives the summary JSON and the plots. "
                                       "It is created if it does not exist yet."),
@@ -745,6 +828,7 @@ class TrainingPanel:
                 "Training data", "tr_train",
                 field_key="train_data",
                 required=True,
+                default=self._default_for("tr_train"),
                 browse=self._pick_json("tr_train"),
                 tooltip_text=(
                     "annotations_train.json from 'Create splits', or a YOLO "
@@ -754,6 +838,7 @@ class TrainingPanel:
             self._field(
                 "Validation data", "tr_val",
                 field_key="val_data",
+                default=self._default_for("tr_val"),
                 browse=self._pick_json("tr_val"),
                 tooltip_text=(
                     "Optional but strongly recommended: without it there is no "
@@ -764,7 +849,7 @@ class TrainingPanel:
                 "Run output folder", "tr_out",
                 field_key="train_output_dir",
                 required=True,
-                default=str(self.runs / "train" / "stage1"),
+                default=self._default_for("tr_out"),
                 browse=self._pick_dir("tr_out"),
                 tooltip_text=(
                     "Receives checkpoints, results.csv and metrics_latest.json. "
@@ -968,15 +1053,18 @@ class TrainingPanel:
             ):
                 if dpg.does_item_exist(tag):
                     dpg.set_value(tag, value)
-            if dpg.does_item_exist("tr_out"):
-                dpg.set_value("tr_out", str(self.runs / "train" / f"stage{stage}"))
-            if dpg.does_item_exist("tr_eval_out"):
-                dpg.set_value("tr_eval_out", str(self.runs / "val" / f"stage{stage}"))
+            # The checkpoint follows the stage only when a project says where
+            # its runs are; without one there is nothing better to offer than
+            # whatever the user already typed.
+            for tag in ("tr_out", "tr_eval_out", "tr_ckpt"):
+                value = self._default_for(tag)
+                if value and dpg.does_item_exist(tag):
+                    dpg.set_value(tag, value)
         if dpg.does_item_exist("tr_window"):
             dpg.configure_item("tr_window", enabled=meta["needs_window"])
         if dpg.does_item_exist("tr_imb"):
             dpg.configure_item("tr_imb", enabled=meta["needs_imbalance"])
-        widgets.refresh_all_indicators(["tr_out", "tr_eval_out"])
+        widgets.refresh_all_indicators(["tr_out", "tr_eval_out", "tr_ckpt"])
         self._refresh_stage_table()
         self._refresh_hp_summary()
         self._report_train_validation(quiet=True)
@@ -1014,6 +1102,7 @@ class TrainingPanel:
                 "Checkpoint", "tr_ckpt",
                 field_key="checkpoint",
                 required=True,
+                default=self._default_for("tr_ckpt"),
                 browse=self._pick_ckpt("tr_ckpt"),
                 tooltip_text=(
                     "The .pth or .pt file a training run wrote, usually "
@@ -1024,6 +1113,7 @@ class TrainingPanel:
                 "Validation data", "tr_eval_val",
                 field_key="val_data",
                 required=True,
+                default=self._default_for("tr_eval_val"),
                 browse=self._pick_json("tr_eval_val"),
                 tooltip_text=(
                     "annotations_val.json or annotations_test.json from "
@@ -1033,7 +1123,7 @@ class TrainingPanel:
             self._field(
                 "Evaluation output folder", "tr_eval_out",
                 field_key="eval_output_dir",
-                default=str(self.runs / "val" / "stage1"),
+                default=self._default_for("tr_eval_out"),
                 browse=self._pick_dir("tr_eval_out"),
                 tooltip_text=(
                     "Receives the metrics JSON and the plots. The source run "
@@ -1086,6 +1176,7 @@ class TrainingPanel:
             widgets.gap(1)
             self._field(
                 "Predictions JSON", "an_pred",
+                default=self._default_for("an_pred"),
                 field_key="predictions_json",
                 browse=self._pick_json("an_pred"),
                 tooltip_text=(
@@ -1096,13 +1187,14 @@ class TrainingPanel:
             self._field(
                 "Annotation JSON", "an_anno",
                 field_key="annotation_json",
+                default=self._default_for("an_anno"),
                 browse=self._pick_json("an_anno"),
                 tooltip_text="Labelled data. Required by the distribution mode.",
             )
             self._field(
                 "Output folder", "an_out",
                 field_key="analyze_output_dir",
-                default=str(self.runs / "analyze"),
+                default=self._default_for("an_out"),
                 browse=self._pick_dir("an_out"),
                 tooltip_text=("Receives the figures and the analysis JSON. "
                               "It is created if it does not exist yet."),
@@ -1149,7 +1241,7 @@ class TrainingPanel:
         with dpg.group(horizontal=True):
             dpg.add_input_text(
                 tag="mon_dir", width=-190,
-                default_value=str(self.runs / "train" / "stage1"),
+                default_value=self._default_for("mon_dir"),
                 hint="Run folder, for example runs/train/stage1",
             )
             dpg.add_button(label="Browse", width=70, height=24,
@@ -1943,8 +2035,7 @@ class TrainingPanel:
                             "Ready to summarize.", quiet=False):
             return
 
-        out = _text("ds_stat_out",
-                    str(self.root / "outputs" / "dataset_summary"))
+        out = _text("ds_stat_out", self._default_for("ds_stat_out"))
         plots = "1" if bool(_value("ds_stat_plots", True)) else "0"
         cmd: List = [
             self.tools / "summarize_dataset.py",

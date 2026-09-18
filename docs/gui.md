@@ -26,6 +26,30 @@ yoake gui                    # または:  python -m htrtdetr.gui  /  gui
 > DearPyGui は 1 プロセス 1 コンテキストのため、アノテータはハブから別プロセスで
 > 起動します（YORU の `app.py` が各モジュールを起動するのと同じ設計）。
 
+## プロジェクトフォルダ
+
+**1 研究 = 1 フォルダ。** アノテーション・学習データ・解析結果はすべてその中に
+書き出され、記録されるパスはすべてフォルダ基準の相対パスです。フォルダごと移動・
+コピー・他人への受け渡しをしても、そのまま開けます。
+
+```
+<project>/  project.yoake.json  annotations.json
+            videos/  datasets/  runs/  analysis/
+```
+
+Label ページ上部の **Project folder** が「いまどの研究にいるか」で、Train / Analyze
+ページの出力先（`runs/train/stage{N}`、`analysis/predict` …）はこれに追従します。
+以前は出力先がソースツリーの `runs/` 固定だったため、研究のデータとコードが
+混ざっていました。ユーザが自分で打ち込んだパスは、プロジェクトを切り替えても
+上書きされません。
+
+フォルダ外の動画は相対パスと絶対パスの両方で記録され、
+「プロジェクトだけ動かした」「一式まとめて動かした」のどちらでも解決できます。
+両方が別々に動いた場合は **Project Videos ▸ Locate file**（または
+`yoake project relink path=... from=<folder>`）で 1 回答えれば、そのフォルダは
+記憶され以後は自動で解決されます。詳細は
+[PROJECT_FOLDER.md](PROJECT_FOLDER.md)。
+
 ## Labeling — 動画アノテータ
 
 フレーム毎の bbox 描画・track ID・行動(action)付与に加え、前フレームからの
@@ -47,7 +71,7 @@ box 伝播（Space）と OpenCV 自動追跡が使えます。
 
 ## Training — ライブ学習モニタ
 
-Stage 1–4 の学習フォームから `yoake train` を起動し、`runs/train/stage{N}/results.csv`
+Stage 1–4 の学習フォームから `yoake train` を起動し、`<project>/runs/train/stage{N}/results.csv`
 と `metrics_latest.json` を定期的に読み取って、損失曲線・主要指標
 （Stage1: AP50 / Stage2: macro F1 / Stage3: IDF1 / Stage4: composite）をライブ描画します。
 「監視」ボタンで既存の学習出力ディレクトリを後から接続することもできます。

@@ -16,6 +16,40 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+
+class _SafeStreamHandler(logging.StreamHandler):
+    """A console handler the console's codepage cannot kill.
+
+    The Japanese Windows console is cp932, which has no U+2014 EM DASH - it maps
+    U+2015 HORIZONTAL BAR to 0x815C instead. One em dash in a log message was
+    enough for ``StreamHandler.emit`` to raise ``UnicodeEncodeError``, and
+    because ``emit`` hands that to ``handleError`` rather than propagating it,
+    the result was a traceback on stderr and a *silently dropped log line* -
+    while the utf-8 file handler recorded the same line correctly, so the loss
+    was visible only on screen.
+
+    Re-encoding through the stream's own codec with ``errors="replace"`` keeps
+    the line, marks the character it could not draw, and changes nothing about
+    the file log. The fast path is untouched: the round trip only runs on the
+    write that actually failed.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            try:
+                self.stream.write(msg + self.terminator)
+            except UnicodeEncodeError:
+                encoding = getattr(self.stream, "encoding", None) or "utf-8"
+                safe = msg.encode(encoding, errors="replace").decode(encoding, errors="replace")
+                self.stream.write(safe + self.terminator)
+            self.flush()
+        except RecursionError:  # pragma: no cover - logging's own contract
+            raise
+        except Exception:  # pragma: no cover - matches StreamHandler.emit
+            self.handleError(record)
+
+
 def get_logger(
     name: str = "htrtdetr",
     level: int = logging.INFO,
@@ -36,7 +70,7 @@ def get_logger(
         for h in logger.handlers
     )
     if not has_stdout:
-        sh = logging.StreamHandler(sys.stdout)
+        sh = _SafeStreamHandler(sys.stdout)
         sh.setFormatter(fmt)
         logger.addHandler(sh)
 

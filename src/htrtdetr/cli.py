@@ -686,6 +686,7 @@ Commands:
   predict  source=<video/dir> weights=<path.pth> [key=value ...]
   analyze  mode=<timeline|distribution|id_switches|confidence> [key=value ...]
   pipeline config=<pipeline.yaml> source=<video/dir> [output_dir=path] [max_frames=N]
+  project  <new|info|collect|relink> [key=value ...]   プロジェクトフォルダ操作
   gui      統一 GUI (Labeling / Training / Video Analysis) を起動する
 
 Examples:
@@ -695,6 +696,8 @@ Examples:
   yoake predict source=data/videos/video.mp4 weights=runs/train/stage4/weights/best.pth
   yoake analyze mode=timeline predictions=runs/predict/predictions.json
   yoake pipeline config=configs/pipeline/full_offline.yaml source=data/videos/video.mp4
+  yoake project new dir="D:/studies" name="courtship 2026" videos=D:/captures
+  yoake project info path="D:/studies/courtship 2026"
 
 Layered pipeline (configs/pipeline/*.yaml):
   detect_only | temporal_detect | detect_track | full_offline | yolo_bytetrack
@@ -751,6 +754,12 @@ def main() -> None:
 
     if command == "pipeline":
         run_pipeline(rest)
+        return
+
+    if command == "project":
+        from .project_cli import run_project
+
+        run_project(rest)
         return
 
     if command == "gui":

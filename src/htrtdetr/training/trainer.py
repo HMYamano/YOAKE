@@ -299,7 +299,7 @@ class Trainer:
             if self.use_dummy:
                 self.logger.warning(
                     f"[Epoch {epoch}/{self.cfg.max_epochs}] "
-                    "DUMMY MODE — メトリクスは無意味です (smoke-test only)"
+                    "DUMMY MODE - メトリクスは無意味です (smoke-test only)"
                 )
 
             # --- Train epoch ---
@@ -796,7 +796,7 @@ class Trainer:
             self.criterion.cfg.imbalance_strategy = "class_weight"
 
         if strategy != "class_weight":
-            self.logger.info(f"imbalance_strategy={strategy!r} — class weight 計算をスキップ")
+            self.logger.info(f"imbalance_strategy={strategy!r} - class weight 計算をスキップ")
             return
 
         action_loss_mod = getattr(self.criterion, "action_loss", None)

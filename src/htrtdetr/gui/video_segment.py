@@ -42,7 +42,8 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, List, Mapping, Optional,
+                    Sequence, Tuple)
 
 __all__ = [
     "MAX_WINDOW",
@@ -200,6 +201,241 @@ class PropagationResult:
             f"{self.count:,} boxes proposed across {span}{who}. "
             f"They are candidates until you accept them.{tail}"
         )
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Clips: one export, every animal in it
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Smart Annotate proposes *clips* for behavior, and a clip is the natural unit
+# to follow animals across: it is already the span a human agreed to look at.
+# Propagating one animal at a time re-exported and re-encoded the same frames
+# for each of them, which is the whole cost of a propagation.
+#
+# Measured here (RTX 5070 Ti, sam2-hiera-tiny, 40 frames, two animals):
+#
+#   animal 1   forward 4.40 s + backward 1.58 s = 5.98 s   <- pays init_state
+#   animal 2   forward 1.50 s + backward 1.58 s = 3.09 s   <- 52% of the first
+#
+# The helper caches the inference state per ``frames_dir`` and ``reset_state``
+# keeps the per-frame features, so the encode is paid once and every extra
+# animal costs only its two propagation passes. That is why these functions
+# hand back requests that all share one window: the saving is entirely in
+# exporting and encoding once, and it evaporates if the caller exports per
+# animal. It is also why there is no multi-object protocol op - it would save
+# one pass per animal against a cost that is already amortised.
+
+
+@dataclass(frozen=True)
+class ClipPrompt:
+    """One animal to follow through a clip, and the identity its boxes claim.
+
+    Both a ``box`` and a centre ``point`` are worth sending: SAM 2 takes them
+    together and the pair is a stronger prompt than either alone.
+    """
+
+    track_id: int
+    points: Tuple[Tuple[float, float, int], ...] = ()
+    box: Optional[Tuple[float, float, float, float]] = None
+    class_id: int = 0
+    action_id: int = -1
+
+
+def clip_window(start: int, end: int, num_frames: int = 0) -> Tuple[int, int]:
+    """``(first, last)`` inclusive for a clip, clamped to the video and MAX_WINDOW.
+
+    Order-tolerant: a clip handed over backwards is read as the span it covers
+    rather than rejected, because the caller is often a drag.
+    """
+    first = max(0, min(int(start), int(end)))
+    last = max(int(start), int(end))
+    if num_frames > 0:
+        last = min(last, num_frames - 1)
+    last = min(last, first + MAX_WINDOW - 1)
+    return first, max(first, last)
+
+
+def clip_prompt_frame(start: int, end: int, preferred: Optional[int] = None,
+                      num_frames: int = 0) -> int:
+    """Which frame the prompts are read from. The middle, unless asked.
+
+    The middle is not arbitrary. SAM 2 propagates one way from the prompt, so a
+    clip is covered by a forward pass and a backward one; prompting at the
+    middle makes the longer of those two runs as short as it can be, and drift
+    accumulates along a run. Prompting at an end doubles the worst-case run for
+    no gain.
+
+    A ``preferred`` frame - the one the human is looking at - is honoured but
+    clamped into the window, because a prompt outside it has nothing to read.
+    """
+    first, last = clip_window(start, end, num_frames)
+    if preferred is None:
+        return (first + last) // 2
+    return max(first, min(int(preferred), last))
+
+
+def clip_requests(
+    start: int,
+    end: int,
+    prompts: Sequence[ClipPrompt],
+    *,
+    preferred_frame: Optional[int] = None,
+    num_frames: int = 0,
+) -> Tuple[PropagationRequest, ...]:
+    """One :class:`PropagationRequest` per animal, all over the same window.
+
+    Every request carries the same ``frame``, ``before`` and ``after``, so
+    :meth:`PropagationRequest.window` gives all of them the identical span and
+    one export serves the lot. Empty prompts are dropped rather than sent: a
+    request with neither a point nor a box cannot prompt anything, and the
+    helper would answer with an empty result that reads like a lost animal.
+    """
+    first, last = clip_window(start, end, num_frames)
+    frame = clip_prompt_frame(start, end, preferred_frame, num_frames)
+    out = []
+    for prompt in prompts:
+        request = PropagationRequest(
+            frame=frame,
+            points=tuple(tuple(p) for p in prompt.points),
+            box=tuple(prompt.box) if prompt.box else None,
+            track_id=int(prompt.track_id),
+            before=frame - first,
+            after=last - frame,
+            class_id=int(prompt.class_id),
+            action_id=int(prompt.action_id),
+        )
+        if not request.is_empty():
+            out.append(request)
+    return tuple(out)
+
+
+
+def clip_seed_frame(
+    start: int,
+    end: int,
+    annotated: Mapping[int, Sequence[Any]],
+    *,
+    preferred: Optional[int] = None,
+    num_frames: int = 0,
+) -> Optional[int]:
+    """Which frame inside the clip should seed the propagation.
+
+    A propagation can only follow animals it was prompted with, so the frame
+    that matters is the one carrying the **most** of them - seeding from a
+    frame where one of two flies is drawn leaves the other one unproposed for
+    the entire clip, and nothing in the result says why.
+
+    Ties go to whichever candidate frame is nearest the middle, for the same
+    reason :func:`clip_prompt_frame` defaults there: the clip is covered by a
+    forward pass and a backward one, and the middle makes the longer of the two
+    as short as possible.
+
+    ``preferred`` - the frame the human is looking at - wins **only** when it
+    is not beaten on count. Honouring it unconditionally would quietly drop
+    animals; ignoring it would move the prompt away from the frame they just
+    checked for no reason.
+
+    Returns ``None`` when no frame in the clip has a box, which is a different
+    answer from "frame 0" and the caller has to say something different about
+    it.
+    """
+    first, last = clip_window(start, end, num_frames)
+    middle = (first + last) // 2
+    populated = [
+        (f, len(annotated.get(f) or ()))
+        for f in range(first, last + 1)
+        if annotated.get(f)
+    ]
+    if not populated:
+        return None
+    best_count = max(count for _f, count in populated)
+    if preferred is not None:
+        want = max(first, min(int(preferred), last))
+        if len(annotated.get(want) or ()) >= best_count:
+            return want
+    # -count first so the fullest frame wins, then distance to the middle.
+    return min(populated, key=lambda item: (-item[1], abs(item[0] - middle), item[0]))[0]
+
+
+def prompts_from_objects(objects: Sequence[Any], *, fallback_track: int = 1
+                         ) -> Tuple[ClipPrompt, ...]:
+    """Turn the boxes on one frame into one prompt per animal.
+
+    Sends the box **and** its centre as a point, because SAM 2 takes both and
+    the pair is a stronger prompt than either alone.
+
+    An object with no track id of its own gets a synthetic one counting up from
+    ``fallback_track``: the propagation's result is a tracklet, and a tracklet
+    with no identity cannot be accepted as one animal. Ids already present are
+    never renumbered.
+    """
+    out = []
+    spare = int(fallback_track)
+    used = {int(o.track_id) for o in objects if int(getattr(o, "track_id", -1)) >= 0}
+    for obj in objects:
+        bbox = [float(v) for v in tuple(obj.bbox)[:4]]
+        if len(bbox) < 4:
+            continue
+        x0, y0, x1, y1 = bbox
+        track = int(getattr(obj, "track_id", -1))
+        if track < 0:
+            while spare in used:
+                spare += 1
+            track = spare
+            used.add(track)
+        out.append(
+            ClipPrompt(
+                track_id=track,
+                points=(((x0 + x1) / 2.0, (y0 + y1) / 2.0, 1),),
+                box=(x0, y0, x1, y1),
+                class_id=int(getattr(obj, "class_id", 0) or 0),
+                action_id=int(getattr(obj, "action_id", -1)),
+            )
+        )
+    return tuple(out)
+
+
+def describe_clip_run(pairs: Sequence[Tuple[Any, Optional[PropagationResult]]],
+                      *, clips: int = 1, skipped: int = 0) -> str:
+    """The one sentence a finished clip run leaves in the status line.
+
+    Counts animals, not boxes, first: *3 animals followed across 48 frames* is
+    what the human asked for, and a bare box total hides an animal that was
+    lost immediately. An animal the model never found is named separately for
+    the same reason - it is the outcome worth acting on.
+
+    ``skipped`` belongs here rather than in a status line at the start of the
+    run: a clip with no box in it is skipped before any work happens, so the
+    only message announcing it would be overwritten by the first progress
+    update seconds later. The count has to survive to the end or it is not
+    really reported.
+    """
+    followed = [(r, res) for r, res in pairs if res is not None and res.count]
+    lost = [r for r, res in pairs if res is None or not res.count]
+    missing = (
+        f" {skipped} clip(s) had no box to follow and were skipped." if skipped else ""
+    )
+    if not pairs:
+        return "Nothing to follow in this clip." + missing
+    if not followed:
+        return (
+            f"The model found none of the {len(pairs)} animals in this clip. "
+            "Try prompting on a frame where they are clearly separated." + missing
+        )
+    boxes = sum(res.count for _r, res in followed)
+    frames = sorted({f for _r, res in followed for f in res.frames})
+    where = f"frames {frames[0]:,}-{frames[-1]:,}" if frames else "no frames"
+    scope = "" if clips <= 1 else f" over {clips} clips"
+    tail = ""
+    if lost:
+        ids = ", ".join(str(r.track_id) for r in lost)
+        tail = f" Track {ids} was not found and nothing was proposed for it."
+    return (
+        f"{len(followed)} animal(s) followed across {where}{scope}: "
+        f"{boxes:,} candidate boxes. They are candidates until you accept "
+        f"them.{tail}{missing}"
+    )
 
 
 def export_window(

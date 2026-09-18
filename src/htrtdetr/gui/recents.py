@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from threading import Lock
-from typing import List
+from typing import List, Optional
 
 MAX_ITEMS = 10
 _STORE = Path.home() / ".yoake" / "gui_recents.json"
@@ -51,6 +51,35 @@ def add(field: str, path: str) -> None:
             _save(data)
         except OSError:
             pass
+
+
+#: The field that names the project folder every page works inside. It is a
+#: recents list like any other, so "switch back to last month's study" is the
+#: same gesture as any other recent path - but the newest entry has a second
+#: job: it is what the Train and Analyze pages write their output into.
+PROJECT_FIELD = "project_dir"
+
+
+def active_project() -> Optional[Path]:
+    """The project folder the GUI is currently working in, if it still exists.
+
+    Returns ``None`` rather than a stale path: a project folder that has been
+    moved or deleted must not silently become the destination of a training
+    run. The user re-opens it, and the pages follow.
+    """
+    for candidate in get(PROJECT_FIELD):
+        folder = Path(candidate)
+        if (folder / "project.yoake.json").is_file():
+            return folder
+    return None
+
+
+def set_active_project(path) -> None:
+    """Record ``path`` (a project folder, or any file inside it) as active."""
+    folder = Path(path)
+    if folder.is_file():
+        folder = folder.parent
+    add(PROJECT_FIELD, str(folder))
 
 
 def clear(field: str) -> None:

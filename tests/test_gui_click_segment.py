@@ -15,8 +15,10 @@ import importlib.util
 import json
 import math
 import sys
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -847,9 +849,148 @@ def test_a_stale_concept_reply_is_discarded(app_with_helper):
     assert app.status_messages[-1] == "Frame changed; the search was discarded."
 
 
-def test_find_all_without_a_helper_says_where_to_turn_it_on(app):
+def test_find_all_without_a_helper_starts_it_instead_of_refusing(app):
+    """It used to point at an unrelated Click to Box setting, in one line at
+    the bottom of the window, which made the button look dead. Continue and
+    clip propagation have always started the helper themselves."""
+    asked = []
+    app._start_sam = lambda **kwargs: (asked.append(kwargs.get("on_done")), False)[1]
+
     assert not app.find_all_in_frame("fly")
-    assert "Fit with:" in app.status_messages[-1]
+
+    assert asked, "the press must start the helper"
+    assert "Fit with:" not in app.status_messages[-1]
+    assert "fly" in app.status_messages[-1]
+
+
+def test_find_all_replays_the_typed_word_when_the_helper_comes_up(app):
+    """The replay must search for what was typed, not for the default class:
+    the word is resolved before the gate and captured by the callback."""
+    captured = []
+    app._start_sam = lambda **kwargs: (captured.append(kwargs["on_done"]), False)[1]
+    app.find_all_in_frame("wasp")
+
+    searched = []
+    app.find_all_in_frame = lambda text="": searched.append(text)
+    captured[0](True)
+    assert searched == ["wasp"]
+
+    searched.clear()
+    captured[0](False)
+    assert searched == [], "a failed start must not run a search"
+
+
+# --------------------------------------------------------------------------- #
+# Starting the helper — off the UI thread, so the window keeps drawing
+# --------------------------------------------------------------------------- #
+
+def _cap(usable=True, reason=""):
+    from htrtdetr.gui import sidecar as sc
+
+    interpreter = sc.InterpreterInfo(
+        python=sys.executable, ok=True, torch=True,
+        modules=("torch", "sam2", "huggingface_hub"),
+    )
+    return sc.SidecarCapability(
+        usable=usable, interpreter=interpreter if usable else None, reason=reason
+    )
+
+
+def _fake_helper(**hello):
+    payload = {"backend": "sam2", "device": "cuda", "capabilities": ["point"]}
+    payload.update(hello)
+    return SimpleNamespace(hello=payload, is_running=lambda: True, stop=lambda: None)
+
+
+def test_start_does_not_block_the_ui_thread(app, monkeypatch):
+    """The whole point of the change.
+
+    The probe and the helper's start used to run inline in the button
+    callback, and dearpygui draws no frame until a callback returns — so the
+    status line said "Looking for a Python with PyTorch..." and stayed there,
+    with the window greyed out, for as long as both took. Measured on this
+    machine: 1.2 s to probe, 2.7 s to start, and a cold ``import torch`` in the
+    child costs tens of seconds on top.
+    """
+    from htrtdetr.annotator import sidecar_mod
+
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_probe(*_args, **_kwargs):
+        entered.set()
+        release.wait(10.0)
+        return _cap(usable=False, reason="probe finished")
+
+    monkeypatch.setattr(sidecar_mod, "probe_interpreters", slow_probe)
+    began = time.monotonic()
+    try:
+        assert app._start_sam() is False, "not ready yet is the honest answer"
+        elapsed = time.monotonic() - began
+        assert entered.wait(10.0), "the probe never ran"
+        assert elapsed < 1.0, f"_start_sam held the UI thread for {elapsed:.1f}s"
+    finally:
+        release.set()
+
+
+def test_one_start_however_many_times_the_button_is_pressed(app, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(app, "_sam_start_worker", spawned.append)
+    first, second = [], []
+
+    assert app._start_sam(on_done=first.append) is False
+    assert app._start_sam(on_done=second.append) is False
+    assert len(spawned) == 1, "a second press must not start a second helper"
+
+    app._finish_sam_start(spawned[0], _cap(), _fake_helper(), "")
+    assert first == [True] and second == [True], "every press waiting must be answered"
+    assert app._sam_starting is False
+    assert "ready" in app.status_messages[-1]
+
+
+def test_a_live_helper_answers_the_caller_without_starting_anything(app, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(app, "_sam_start_worker", spawned.append)
+    app._sam_client = _fake_helper()
+    answered = []
+
+    assert app._start_sam(on_done=answered.append) is True
+    assert spawned == [] and answered == [True]
+
+
+def test_a_failed_start_reports_one_line_and_releases_the_waiting_press(app, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(app, "_sam_start_worker", spawned.append)
+    answered = []
+    app._start_sam(on_done=answered.append)
+
+    app._finish_sam_start(
+        spawned[0], _cap(usable=False, reason="No Python has PyTorch.\npip install ..."), None, ""
+    )
+
+    assert answered == [False], "the press must be told, not left hanging"
+    assert app._sam_client is None
+    assert app._sam_starting is False
+    assert app.status_messages[-1] == "No Python has PyTorch."
+
+
+def test_stopping_while_starting_discards_the_helper_that_lands_later(app, monkeypatch):
+    """Otherwise the user turns it off and a helper appears seconds later,
+    holding the GPU, and the operation that was waiting runs after the no."""
+    spawned = []
+    monkeypatch.setattr(app, "_sam_start_worker", spawned.append)
+    waiting = []
+    app._start_sam(on_done=waiting.append)
+
+    app._stop_sam()
+
+    stopped = []
+    late = _fake_helper()
+    late.stop = lambda: stopped.append(True)
+    app._finish_sam_start(spawned[0], _cap(), late, "")
+
+    assert app._sam_client is None
+    assert stopped == [True], "a helper nobody asked for any more must be stopped"
+    assert waiting == [], "the operation waiting on it must not run after a stop"
 
 
 @needs_cv2

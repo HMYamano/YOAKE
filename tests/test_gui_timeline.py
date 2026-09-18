@@ -237,3 +237,181 @@ def test_every_inspector_context_has_a_title():
     from htrtdetr.gui import inspector as INS
     for kind in INS.CONTEXTS:
         assert INS._TITLES.get(kind), f"{kind} has no title"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Clicking a clip in the samples lane
+# ══════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def sampled(strip):
+    strip.set_model(TL.TimelineModel(num_frames=2000, current=0,
+                                     clips=[(100, 300), (900, 1000)]))
+    return strip
+
+
+def samples_y(line):
+    return line._lane_top("samples") + 2
+
+
+def test_a_click_inside_a_clip_finds_it(sampled):
+    x = sampled.frame_to_x(200)
+    assert sampled.clip_at(x, samples_y(sampled)) == (100, 300)
+
+
+def test_a_click_beside_a_clip_finds_nothing(sampled):
+    """No pixel tolerance here, unlike a marker: a clip is already as wide as
+    its own frames, so a tolerance would select the clip next door."""
+    x = sampled.frame_to_x(600)
+    assert sampled.clip_at(x, samples_y(sampled)) is None
+
+
+def test_both_ends_of_a_clip_are_clickable(sampled):
+    y = samples_y(sampled)
+    assert sampled.clip_at(sampled.frame_to_x(100), y) == (100, 300)
+    assert sampled.clip_at(sampled.frame_to_x(300), y) == (100, 300)
+
+
+def test_a_click_in_another_lane_is_not_a_clip_hit(sampled):
+    """Otherwise scrubbing over the status lane selects clips."""
+    x = sampled.frame_to_x(200)
+    assert sampled.clip_at(x, sampled._lane_top("issues") + 2) is None
+    assert sampled.clip_at(x, 2.0) is None
+
+
+def test_the_narrowest_clip_wins_when_two_overlap(strip):
+    """A short clip inside a long one is the harder of the two to hit, and the
+    more specific answer to which clip was meant."""
+    strip.set_model(TL.TimelineModel(num_frames=2000, current=0,
+                                     clips=[(100, 900), (400, 500)]))
+    y = samples_y(strip)
+    assert strip.clip_at(strip.frame_to_x(450), y) == (400, 500)
+    assert strip.clip_at(strip.frame_to_x(200), y) == (100, 900)
+
+
+def test_no_clips_means_no_clip_hit(strip):
+    assert strip.clip_at(strip.frame_to_x(200), samples_y(strip)) is None
+
+
+# -- press order ----------------------------------------------------------
+
+def press_at(line, x, y, monkeypatch):
+    monkeypatch.setattr(line, "hovered", lambda: True)
+    monkeypatch.setattr(line, "mouse_pos", lambda: (x, y))
+    return line.on_press()
+
+
+def test_a_marker_beats_a_clip(sampled, monkeypatch):
+    """The issues lane is above the samples lane, so this is about precedence
+    in code rather than in pixels - but marker_at is checked first and a
+    reordering would silently swallow review clicks."""
+    seen = []
+    sampled.on_issue = lambda payload: seen.append(("issue", payload))
+    sampled.on_clip = lambda clip: seen.append(("clip", clip))
+    x = sampled.frame_to_x(200)
+    sampled._markers = [(x, 30.0, "item")]
+    assert press_at(sampled, x, sampled._lane_top("issues") + 2, monkeypatch)
+    assert seen == [("issue", "item")]
+
+
+def test_a_clip_click_selects_and_also_seeks(sampled, monkeypatch):
+    """A clip is a span, so the frame aimed at is information: the clip pane's
+    propagation reads the playhead to decide which frame the human was on."""
+    seen = []
+    sampled.on_clip = lambda clip: seen.append(clip)
+    sampled.on_seek = lambda frame: seen.append(("seek", frame))
+    x = sampled.frame_to_x(200)
+    assert press_at(sampled, x, samples_y(sampled), monkeypatch)
+    assert ("seek", 200) in seen or any(
+        isinstance(s, tuple) and s[0] == "seek" and abs(s[1] - 200) <= 2 for s in seen
+    ), f"the click should have seeked as well: {seen}"
+    assert (100, 300) in seen
+
+
+def test_an_empty_part_of_the_lane_falls_through_to_a_seek(sampled, monkeypatch):
+    seen = []
+    sampled.on_clip = lambda clip: seen.append(("clip", clip))
+    sampled.on_seek = lambda frame: seen.append(("seek", frame))
+    assert press_at(sampled, sampled.frame_to_x(600), samples_y(sampled), monkeypatch)
+    assert not any(s[0] == "clip" for s in seen)
+    assert any(s[0] == "seek" for s in seen)
+    assert sampled._scrubbing, "an empty click must start a scrub"
+
+
+def test_a_clip_click_without_a_handler_still_seeks(sampled, monkeypatch):
+    """on_clip is optional; the timeline must not swallow the press."""
+    seen = []
+    sampled.on_clip = None
+    sampled.on_seek = lambda frame: seen.append(frame)
+    assert press_at(sampled, sampled.frame_to_x(200), samples_y(sampled), monkeypatch)
+    assert seen, "the press was consumed and nothing happened"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The inspector's three dispatch tables must agree
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_every_context_has_a_subtitle_entry_and_a_filler():
+    """The bug this guards: these three tables are edited together when a
+    context is added, and missing one shows an empty pane under a correct
+    heading - which reads as "there is nothing here" rather than as a bug."""
+    from htrtdetr.gui import inspector as INS
+    assert set(INS._TITLES) == set(INS.CONTEXTS)
+    assert set(INS._SUBTITLES) == set(INS.CONTEXTS)
+    assert set(INS._FILLERS) == set(INS.CONTEXTS)
+    for kind, name in INS._FILLERS.items():
+        assert hasattr(INS.Inspector, name), f"{kind} points at a missing {name}"
+
+
+def test_the_clip_context_exists_and_is_not_the_interval_one():
+    """A clip is a question and an interval is an answer; sharing a context
+    would put edge edits on something with no label to edit."""
+    from htrtdetr.gui import inspector as INS
+    assert INS.CLIP in INS.CONTEXTS
+    assert INS.CLIP != INS.INTERVAL
+    assert INS._TITLES[INS.CLIP] == "Sampled clip"
+
+
+def test_no_two_inspector_sections_share_a_tag():
+    """The bug this guards, which cost a crash to find.
+
+    Every section's widgets are created at build time, so two sections using
+    the same tag is not a subtle conflict - dearpygui refuses the second one
+    with ``Alias already exists`` and the whole window fails to build. Adding
+    the clip section with a ``c_`` prefix collided with the *candidate*
+    section's ``c_reason``, and nothing caught it until a test that opens a
+    viewport tried to build the pane.
+
+    A static check is worth having because the tests that build a window are
+    the slowest ones in the suite and the last to run.
+    """
+    import re
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "htrtdetr" / "gui" / "inspector.py"
+    ).read_text(encoding="utf-8")
+
+    # Every method boundary, so a builder's span ends at the next method and
+    # not at the next builder - otherwise the last builder swallows the
+    # fillers, which legitimately name every section's tags.
+    methods = list(re.finditer(r"\n    def (\w+)\(", source))
+    assert methods, "no methods found - has the file been restructured?"
+    spans = [
+        (m.group(1), m.end(), methods[i + 1].start() if i + 1 < len(methods) else len(source))
+        for i, m in enumerate(methods)
+    ]
+    builders = [s for s in spans if s[0].startswith("_build_")]
+    assert builders, "no _build_* methods found - has the file been restructured?"
+
+    owners: dict[str, str] = {}
+    clashes = []
+    for name, start, end in builders:
+        for tag in set(re.findall(r'_t\("([a-z_0-9]+)"\)', source[start:end])):
+            previous = owners.get(tag)
+            if previous is not None and previous != name:
+                clashes.append(f"{tag}: {previous} and {name}")
+            owners[tag] = name
+
+    assert not clashes, "inspector tags used by two sections: " + "; ".join(clashes)

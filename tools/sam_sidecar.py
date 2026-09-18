@@ -652,6 +652,134 @@ def _window_paths(frames_dir: str) -> List[str]:
     return [str(p) for p in sorted(folder.glob("*.jpg"))]
 
 
+
+def grounding_ready() -> bool:
+    """Whether an open-vocabulary detector could be loaded, without loading one.
+
+    ``transformers`` alone is enough - OWLv2's weights come from the Hub through
+    ``from_pretrained``, and ``transformers`` depends on ``huggingface_hub``
+    itself, so there is no half-installed trap here of the kind ``sam2`` has.
+    """
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None
+               for m in ("torch", "transformers"))
+
+
+class OwlGroundingAdapter:
+    """Text in, axis-aligned boxes out: the one thing SAM cannot do.
+
+    SAM and SAM 2 are *promptable* - they answer "what is at this point" and
+    cannot answer "where are the flies". That gap is why ``concept`` existed as
+    a protocol op with only ``StubAdapter`` behind it, and why *Find all in
+    frame* always reported that the backend could not find animals from a
+    description. An open-vocabulary detector fills exactly that gap and nothing
+    else, so it is a second small model beside the image adapter rather than a
+    replacement for it (``Session.ground`` composes the two).
+
+    OWLv2 first, OWL-ViT second: same interface, and OWLv2 is the stronger of
+    the two at the same size. Both are ~150 MB from the Hub on first use.
+    """
+
+    name = "owl"
+    capabilities = ("concept",)
+
+    #: Tried in order. Both speak the same processor/model API.
+    MODELS = (
+        ("Owlv2Processor", "Owlv2ForObjectDetection", "google/owlv2-base-patch16-ensemble"),
+        ("OwlViTProcessor", "OwlViTForObjectDetection", "google/owlvit-base-patch32"),
+    )
+
+    def __init__(self, model: str = "", device: str = "cpu") -> None:
+        self.model = model
+        self.device = device or "cpu"
+        self._model = None
+        self._processor = None
+        self._loaded_name = ""
+        self._image = None
+
+    def available(self) -> bool:
+        return grounding_ready()
+
+    def _load(self):
+        if self._model is not None:
+            return self._model
+        import transformers
+        last = None
+        for processor_name, model_name, default in self.MODELS:
+            name = self.model or default
+            try:
+                processor_cls = getattr(transformers, processor_name)
+                model_cls = getattr(transformers, model_name)
+                self._processor = processor_cls.from_pretrained(name)
+                self._model = model_cls.from_pretrained(name).to(self.device).eval()
+                self._loaded_name = name
+                return self._model
+            except Exception as exc:                 # noqa: BLE001
+                last = exc
+                # An explicit --concept-model names one architecture; do not
+                # silently load a different one under the user's name.
+                if self.model:
+                    break
+        raise RuntimeError(f"No open-vocabulary detector could be loaded: {last}")
+
+    def set_image(self, frame_bgr) -> None:
+        self._image = frame_bgr[:, :, ::-1].copy()
+
+    #: OWLv2's scores are not probabilities and run low - a confident animal
+    #: often sits near 0.2 - so the default keeps recall and lets the human
+    #: reject, which is the cheap direction. Overridable per request.
+    DEFAULT_THRESHOLD = 0.05
+
+    def detect(self, text: str, limit: int, threshold: float = DEFAULT_THRESHOLD):
+        """``[(xyxy, score)]`` for one description, best first.
+
+        Commas separate alternatives, so ``"fly, wing"`` is two queries in one
+        pass rather than two passes - the image encoder is the expensive half
+        and it runs once either way.
+        """
+        import numpy as np
+        import torch
+
+        if self._image is None:
+            return []
+        queries = [q.strip() for q in str(text).split(",") if q.strip()]
+        if not queries:
+            return []
+
+        model = self._load()
+        height, width = self._image.shape[0], self._image.shape[1]
+        inputs = self._processor(text=[queries], images=self._image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        # OWLv2 pads the short side to a square before encoding, and the
+        # post-processor returns boxes in whatever target size it is given. The
+        # padding is added at the right and bottom, so the square's coordinate
+        # system agrees with the original image over the image's own area -
+        # passing the square and clipping is correct, while passing (h, w)
+        # would stretch every box along the padded axis.
+        side = max(int(height), int(width))
+        results = self._processor.post_process_grounded_object_detection(
+            outputs=outputs, threshold=float(threshold), target_sizes=[(side, side)]
+        )[0]
+
+        boxes = np.asarray(results["boxes"].detach().cpu(), dtype=float).reshape(-1, 4)
+        scores = np.asarray(results["scores"].detach().cpu(), dtype=float).reshape(-1)
+        order = np.argsort(-scores)
+        out = []
+        for i in order[: max(0, int(limit))]:
+            x0, y0, x1, y1 = boxes[i]
+            x0 = max(0.0, min(float(x0), width - 1.0))
+            x1 = max(0.0, min(float(x1), width - 1.0))
+            y0 = max(0.0, min(float(y0), height - 1.0))
+            y1 = max(0.0, min(float(y1), height - 1.0))
+            if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+                continue
+            out.append(((x0, y0, x1, y1), float(scores[i])))
+        return out
+
+
 class Session:
     """One helper's state: the adapters, and which frame it currently holds.
 
@@ -671,6 +799,11 @@ class Session:
         self.device = device
         self._video = None
         self._embed = None
+        self._ground = None
+        self._last_array = None
+        #: Set from ``--concept-model``; kept apart from ``self.model`` because
+        #: that one names a SAM checkpoint and the two are different families.
+        self.concept_model = ""
 
     def video(self):
         """The SAM 2 video predictor, or ``None`` when sam2 is not installed."""
@@ -690,6 +823,60 @@ class Session:
             self._embed = candidate
         return self._embed
 
+    def grounder(self):
+        """The open-vocabulary detector, or ``None`` when transformers is absent."""
+        if self._ground is None:
+            candidate = OwlGroundingAdapter(self.concept_model, self.device)
+            if not candidate.available():
+                return None
+            self._ground = candidate
+        return self._ground
+
+    def ground(self, text: str, limit: int,
+               threshold: float = OwlGroundingAdapter.DEFAULT_THRESHOLD):
+        """Text -> oriented boxes, by composing the two models.
+
+        The detector finds *where* the animals are and returns axis-aligned
+        boxes; the image adapter is then prompted with each box to get a mask,
+        which the caller reduces through the same ``mask_to_obb`` every other
+        path uses. Neither model can do this alone, and the split is not
+        incidental: SAM 2 cannot find anything unprompted, and OWLv2 has no
+        notion of orientation - which for an elongated animal is most of the
+        label.
+
+        The prompt is the box *and* its centre point, because a box-only prompt
+        is not well formed for every adapter here while box-plus-point is.
+
+        When the image adapter cannot segment - the stub, or a mask that comes
+        back empty - the axis-aligned box is returned as a zero-rotation OBB.
+        The feature then degrades to "a box in roughly the right place", which
+        a human can rotate, rather than to nothing.
+        """
+        grounder = self.grounder()
+        if grounder is None:
+            return []
+        if self.frame is not None and self._last_array is not None:
+            grounder.set_image(self._last_array)
+        found = grounder.detect(text, limit, threshold)
+        out = []
+        for (x0, y0, x1, y1), score in found:
+            centre = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+            mask = None
+            if "box" in getattr(self.adapter, "capabilities", ()):
+                try:
+                    mask, _ = self.adapter.point(
+                        [(centre[0], centre[1], 1)], (x0, y0, x1, y1)
+                    )
+                except Exception:                    # noqa: BLE001
+                    mask = None
+            if mask is None:
+                width = x1 - x0
+                height = y1 - y0
+                out.append((("obb", (centre[0], centre[1], width, height, 0.0)), score))
+            else:
+                out.append((mask, score))
+        return out
+
     def extra_capabilities(self) -> List[str]:
         """What this helper can do beyond its image adapter.
 
@@ -702,6 +889,8 @@ class Session:
             out.append("video")
         if DinoEmbeddingAdapter(self.model, self.device).available():
             out.append("embedding")
+        if OwlGroundingAdapter(self.concept_model, self.device).available():
+            out.append("concept")
         return out
 
     def load(self, frame_index: int, path: str) -> None:
@@ -713,6 +902,9 @@ class Session:
         self.adapter.set_image(array)
         self.frame = frame_index
         self.shape = (int(array.shape[0]), int(array.shape[1]))
+        # Held so a second model can be shown the same frame without the GUI
+        # writing it twice. One frame, not a cache: the next load replaces it.
+        self._last_array = array
 
     def to_obb(self, mask_or_obb, at: Optional[Tuple[float, float]]):
         """Reduce whatever the adapter returned to one OBB.
@@ -777,11 +969,39 @@ def handle(req: Dict[str, Any], session: Session, args) -> Optional[Dict[str, An
                 "score": None if score is None else round(float(score), 4)}
 
     if op == "concept":
-        if "concept" not in session.adapter.capabilities:
+        text = str(req.get("text", ""))
+        limit = int(req.get("max", 32))
+        if "concept" in session.adapter.capabilities:
+            found = session.adapter.concept(text, limit)
+        elif session.grounder() is not None:
+            # The image adapter cannot find animals from a description - no SAM
+            # can - so the open-vocabulary detector does the finding and the
+            # image adapter is prompted with what it found.
+            #
+            # The frame load is the same one the "point" branch does, and it
+            # belongs here rather than at the top of the op: the capability
+            # answer has to come first, or a helper with no detector installed
+            # reports "that frame has not been sent" and never mentions the one
+            # thing that would fix it. Only this branch reads pixels out of
+            # ``session``; an adapter that implements ``concept`` itself keeps
+            # whatever contract it had.
+            if frame is not None and session.frame != int(frame):
+                path = req.get("path")
+                if not path:
+                    return {"id": req_id, "ok": False, "frame": frame, "error": "no_frame",
+                            "detail": "That frame has not been sent to the helper yet."}
+                session.load(int(frame), str(path))
+            found = session.ground(
+                text, limit, float(req.get("threshold", OwlGroundingAdapter.DEFAULT_THRESHOLD))
+            )
+        else:
             return {"id": req_id, "ok": False, "frame": frame, "error": "unsupported",
                     "detail": (f"The {session.adapter.name} backend cannot find animals "
-                               f"from a description.")}
-        found = session.adapter.concept(str(req.get("text", "")), int(req.get("max", 32)))
+                               "from a description, and no open-vocabulary detector is "
+                               "installed in this helper's Python.\n"
+                               "Install one with:  pip install transformers\n"
+                               "Until then, click an animal (C) or select a box and press "
+                               "Continue - both work without it.")}
         height, width = session.shape if session.shape != (0, 0) else (None, None)
         items = []
         for mask, score in found:
@@ -977,6 +1197,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--checkpoint", default="", help="weights file, if the backend needs one")
     parser.add_argument("--device", default="auto",
                         help="cpu / cuda / mps, or auto to pick the best present")
+    parser.add_argument("--concept-model", default="",
+                        help="open-vocabulary detector for 'find all in frame' "
+                             "(default: google/owlv2-base-patch16-ensemble)")
     parser.add_argument("--selftest", action="store_true",
                         help="run the protocol against the stub and exit")
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -993,7 +1216,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:                          # noqa: BLE001
         _warn(f"could not build the {args.backend} backend: {exc}")
         return 2
-    return serve(Session(adapter, model=args.model, device=args.device), args)
+    session = Session(adapter, model=args.model, device=args.device)
+    session.concept_model = getattr(args, "concept_model", "") or ""
+    return serve(session, args)
 
 
 if __name__ == "__main__":

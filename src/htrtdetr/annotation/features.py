@@ -367,6 +367,7 @@ def farthest_point_order(
     k: int,
     *,
     first: int = 0,
+    seeds: Sequence[Sequence[float]] = (),
 ) -> List[int]:
     """Greedy k-centre: pick ``k`` indices that are as spread out as possible.
 
@@ -384,16 +385,30 @@ def farthest_point_order(
     array — 2,000 frames and 200 picks is 400,000 cosine distances over
     256 dimensions, about 1.5 s here. Comfortably a worker-thread job, far too
     slow for the render loop.
+
+    ``seeds`` are points that count as already picked without being candidates:
+    the vectors of frames a human has already annotated. With seeds the
+    traversal has no arbitrary start — the first pick is whatever lies furthest
+    from everything already labelled, which is the entire point — so ``first``
+    is ignored and the run stays deterministic without it. This is what makes a
+    second pass over the same video continue the first instead of re-rolling it;
+    both properties above survive, because seeding only changes the initial
+    ``nearest`` array and not the loop.
     """
     n = len(vectors)
     if n == 0 or k <= 0:
         return []
     k = min(int(k), n)
-    start = max(0, min(int(first), n - 1))
 
-    picked = [start]
-    nearest = [distance(vectors[i], vectors[start]) for i in range(n)]
-    nearest[start] = -1.0
+    usable_seeds = [s for s in seeds if s]
+    if usable_seeds:
+        picked: List[int] = []
+        nearest = [min(distance(v, s) for s in usable_seeds) for v in vectors]
+    else:
+        start = max(0, min(int(first), n - 1))
+        picked = [start]
+        nearest = [distance(vectors[i], vectors[start]) for i in range(n)]
+        nearest[start] = -1.0
 
     while len(picked) < k:
         best, best_d = -1, -1.0

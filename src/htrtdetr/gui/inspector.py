@@ -18,6 +18,7 @@ A candidate            Accept / Reject / Edit, confidence, why it is queued
 A tracklet             Range, confidence summary, issues, Accept tracklet
 A behavior interval    Label, start, end, confidence, confirm and adjust
 A review item          The reason, what to check, and the one-click answers
+A sampled clip         Range, why it was sampled, and Follow animals across it
 =====================  ==================================================
 
 Built once, shown by section
@@ -53,6 +54,7 @@ __all__ = [
     "TRACKLET",
     "INTERVAL",
     "ISSUE",
+    "CLIP",
     "CONTEXTS",
     "InspectorContext",
     "Inspector",
@@ -64,8 +66,12 @@ CANDIDATE = "candidate"
 TRACKLET = "tracklet"
 INTERVAL = "interval"
 ISSUE = "issue"
+#: A span Smart Annotate proposed and nobody has labelled yet. Distinct from
+#: INTERVAL, which is a span a human has already answered: a clip is a
+#: question, an interval is an answer, and the actions on them share nothing.
+CLIP = "clip"
 
-CONTEXTS: Tuple[str, ...] = (NOTHING, BOX, CANDIDATE, TRACKLET, INTERVAL, ISSUE)
+CONTEXTS: Tuple[str, ...] = (NOTHING, BOX, CANDIDATE, TRACKLET, INTERVAL, ISSUE, CLIP)
 
 _TITLES: Dict[str, str] = {
     NOTHING: "Frame",
@@ -74,6 +80,36 @@ _TITLES: Dict[str, str] = {
     TRACKLET: "Tracklet",
     INTERVAL: "Behavior",
     ISSUE: "Review item",
+    CLIP: "Sampled clip",
+}
+
+
+#: The one-line explanation under each title. Empty where the section speaks
+#: for itself.
+_SUBTITLES: Dict[str, str] = {
+    NOTHING: "Nothing is selected.",
+    BOX: "",
+    CANDIDATE: "Not saved until you accept it.",
+    TRACKLET: "One decision covers every frame below.",
+    INTERVAL: "Edit the edges, not every frame.",
+    ISSUE: "",
+    CLIP: "Proposed for annotation. Nothing in it is labelled yet.",
+}
+
+#: Which filler runs for each context. Module level, and by name rather than by
+#: bound method, so a test can assert that every context in :data:`CONTEXTS`
+#: has a title, a subtitle and a filler. Adding a seventh context showed why
+#: that matters: these three tables are edited together and nothing but a
+#: reader was checking that they agreed, so missing one would have shown an
+#: empty pane with the right heading.
+_FILLERS: Dict[str, str] = {
+    NOTHING: "_fill_nothing",
+    BOX: "_fill_box",
+    CANDIDATE: "_fill_candidate",
+    TRACKLET: "_fill_tracklet",
+    INTERVAL: "_fill_interval",
+    ISSUE: "_fill_issue",
+    CLIP: "_fill_clip",
 }
 
 
@@ -124,6 +160,18 @@ class InspectorContext:
     item: Any = None
     issue_progress: str = ""
 
+    # -- sampled clip --
+    clip: Any = None
+    #: The frame inside the clip whose boxes would seed a propagation, and how
+    #: many there are. Both come from the annotator rather than being worked
+    #: out here: the rule for choosing the frame is the propagation's, and two
+    #: implementations of it would drift.
+    clip_seed: Optional[int] = None
+    clip_animals: int = 0
+    #: Empty when a clip propagation could run right now; otherwise the one
+    #: sentence saying what would stop it.
+    clip_blocked: str = ""
+
     # -- vocabulary --
     class_names: Sequence[str] = ()
     action_names: Sequence[str] = ()
@@ -148,7 +196,7 @@ class InspectorContext:
 
 
 class Inspector:
-    """The right pane. One child window, six sections, one visible at a time."""
+    """The right pane. One child window, seven sections, one visible at a time."""
 
     WIDTH = 288
 
@@ -241,6 +289,7 @@ class Inspector:
             self._build_tracklet()
             self._build_interval()
             self._build_issue()
+            self._build_clip()
 
         self._built = True
         self.show(InspectorContext())
@@ -682,6 +731,59 @@ class Inspector:
             widgets.gap(1)
             dpg.add_text("", tag=self._t("r_progress"), color=theme.TEXT_DIM)
 
+    # -- a sampled clip ---------------------------------------------------
+    def _build_clip(self) -> None:
+        """A clip is a question, so the pane's job is to let one answer start.
+
+        The animal count is the number that decides the outcome, not a detail:
+        a propagation can only follow animals it was prompted with, so a clip
+        seeded from a frame holding one of two flies leaves the other one
+        unproposed for its whole length. Showing the count and the frame it
+        came from is what makes that visible *before* the run rather than
+        afterwards.
+        """
+        with dpg.group(tag=self._t("sec_clip"), show=False):
+            dpg.add_text("", tag=self._t("cl_range"), color=theme.TEXT)
+            dpg.add_text("", tag=self._t("cl_time"), color=theme.TEXT_DIM)
+            widgets.gap(1)
+            dpg.add_text("Sampled because", color=theme.TEXT_DIM)
+            dpg.add_text("", tag=self._t("cl_reason"), color=theme.TEXT,
+                         wrap=self.WIDTH - 20)
+            widgets.gap(1)
+            dpg.add_text("Would follow", color=theme.TEXT_DIM)
+            dpg.add_text("", tag=self._t("cl_seed"), color=theme.TEXT,
+                         wrap=self.WIDTH - 20)
+            widgets.gap(2)
+            widgets.primary_button(
+                "Follow animals across this clip",
+                self._cb("clip_follow"),
+                height=34,
+                tag=self._t("cl_follow"),
+            )
+            widgets.attach_tooltip(
+                self._t("cl_follow"),
+                "Follows every animal on the seed frame across the whole clip, "
+                "in one pass over its frames. The boxes arrive as candidates "
+                "in the Review Inbox; nothing is saved until you accept them.",
+            )
+            dpg.add_text("", tag=self._t("cl_blocked"), color=theme.PENDING,
+                         wrap=self.WIDTH - 20)
+            with dpg.group(horizontal=True):
+                widgets.secondary_button(
+                    "Go to seed frame",
+                    self._cb("clip_goto_seed"),
+                    width=(self.WIDTH - 30) // 2,
+                    height=28,
+                    tag=self._t("cl_goto_seed"),
+                )
+                widgets.secondary_button(
+                    "Go to start",
+                    self._cb("clip_goto_start"),
+                    width=(self.WIDTH - 30) // 2,
+                    height=28,
+                    tag=self._t("cl_goto"),
+                )
+
     # ── display ──────────────────────────────────────────────────────────
     def show(self, context: InspectorContext) -> None:
         """Switch to a context and fill it in. The only public update path."""
@@ -699,24 +801,8 @@ class Inspector:
         self._show(self._t("b_track"), context.use_track_ids)
 
         self._set(self._t("title"), _TITLES.get(kind, "Inspector"))
-        filler = {
-            NOTHING: "Nothing is selected.",
-            BOX: "",
-            CANDIDATE: "Not saved until you accept it.",
-            TRACKLET: "One decision covers every frame below.",
-            INTERVAL: "Edit the edges, not every frame.",
-            ISSUE: "",
-        }
-        self._set(self._t("subtitle"), filler.get(kind, ""))
-
-        {
-            NOTHING: self._fill_nothing,
-            BOX: self._fill_box,
-            CANDIDATE: self._fill_candidate,
-            TRACKLET: self._fill_tracklet,
-            INTERVAL: self._fill_interval,
-            ISSUE: self._fill_issue,
-        }[kind](context)
+        self._set(self._t("subtitle"), _SUBTITLES.get(kind, ""))
+        getattr(self, _FILLERS[kind])(context)
 
     # -- fillers ----------------------------------------------------------
     def _fill_nothing(self, ctx: InspectorContext) -> None:
@@ -785,7 +871,8 @@ class Inspector:
             widgets.locked(
                 "find_all_btn",
                 reason
-                or "No segmentation helper is running. Start one from " "Settings > Assistance.",
+                or "No segmentation helper can run on this machine. Install "
+                "one with:  pip install sam2 huggingface_hub",
             )
 
     def _next_action_hint(self, ctx: InspectorContext) -> str:
@@ -951,6 +1038,53 @@ class Inspector:
         self._label(self._t("r_accept"), f"Accept  ({self._key('review.accept_all')})")
         self._label(self._t("r_reject"), f"Reject  ({self._key('review.discard_all')})")
         self._set(self._t("r_progress"), ctx.issue_progress)
+
+    def _fill_clip(self, ctx: InspectorContext) -> None:
+        clip = ctx.clip
+        if clip is None:
+            return
+        start, end = int(clip.start), int(clip.end)
+        length = end - start + 1
+        self._set(self._t("cl_range"), f"Frames {start:,}-{end:,}   ({length:,} frames)")
+        seconds = length / ctx.fps if ctx.fps > 0 else 0.0
+        span = f"{_timecode(start, ctx.fps)} - {_timecode(end, ctx.fps)}"
+        self._set(
+            self._t("cl_time"), span + (f"   {seconds:.1f} s" if seconds else "")
+        )
+
+        reason = str(getattr(clip, "reason", "") or "").replace("_", " ") or "sampling"
+        score = getattr(clip, "score", 0.0) or 0.0
+        self._set(
+            self._t("cl_reason"),
+            reason + (f"   (score {float(score):.2f})" if score else ""),
+        )
+
+        if ctx.clip_seed is None or ctx.clip_animals <= 0:
+            # Not a warning about the tool: a propagation follows what it was
+            # prompted with, so with nothing drawn there is nothing to follow.
+            self._set(
+                self._t("cl_seed"),
+                "Nothing yet. A propagation can only follow animals it was "
+                "prompted with, so draw a box (W), click an animal (C), or use "
+                "Find all in frame on one frame of this clip first.",
+            )
+        else:
+            count = int(ctx.clip_animals)
+            self._set(
+                self._t("cl_seed"),
+                f"{count} animal{'s' if count != 1 else ''} from frame "
+                f"{int(ctx.clip_seed):,}, the fullest frame in this clip.",
+            )
+
+        blocked = ctx.clip_blocked
+        if not blocked and (ctx.clip_seed is None or ctx.clip_animals <= 0):
+            blocked = "There is no box inside this clip to follow."
+        if blocked:
+            widgets.locked(self._t("cl_follow"), blocked)
+        else:
+            widgets.unlock(self._t("cl_follow"))
+        self._set(self._t("cl_blocked"), blocked)
+        self._show(self._t("cl_goto_seed"), ctx.clip_seed is not None)
 
 
 def _timecode(frame: int, fps: float) -> str:

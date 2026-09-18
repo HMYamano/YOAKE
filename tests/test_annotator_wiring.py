@@ -365,15 +365,46 @@ def test_pressing_propagate_starts_the_helper_itself(tmp_path):
     started = []
     app._sam_client = None
     app._sam_ready = lambda: False
-    app._start_sam = lambda: (started.append(True), False)[1]
+    app._start_sam = lambda **kwargs: (started.append(kwargs.get("on_done")), False)[1]
     app._propagate_thread = None
+    app.statuses = []
+    app._status = app.statuses.append
     shown = []
     app._show_unavailable = lambda feature, reason: shown.append((feature, reason))
 
     A.AnnotationApp.propagate_selection(app)
 
     assert started, "the button must start the helper, not send the user away"
-    assert shown and shown[0][0] == "Video propagation"
+    assert not shown, "a helper that is still starting is not an unavailable one"
+    assert app.statuses and "as soon as it answers" in app.statuses[-1]
+
+
+def test_the_press_is_replayed_once_the_helper_answers(tmp_path):
+    """The start is asynchronous, so the first press cannot do the work. It
+    must come back by itself rather than teaching the user to press twice."""
+    app = A.AnnotationApp.__new__(A.AnnotationApp)
+    app._sam_client = None
+    app._sam_ready = lambda: False
+    app._propagate_thread = None
+    app.statuses = []
+    app._status = app.statuses.append
+    app._show_unavailable = lambda feature, reason: None
+    captured = []
+    app._start_sam = lambda **kwargs: (captured.append(kwargs["on_done"]), False)[1]
+
+    A.AnnotationApp.propagate_selection(app)
+    assert captured, "nothing was registered to run when the helper comes up"
+
+    # The helper is now up, and the callback the press left behind runs.
+    calls = []
+    app.propagate_selection = lambda: calls.append(True)
+    captured[0](True)
+    assert calls == [True]
+
+    # A helper that failed must not replay anything: the status already said so.
+    calls.clear()
+    captured[0](False)
+    assert calls == []
 
 
 def test_propagate_does_not_restart_a_running_helper(tmp_path):
@@ -384,7 +415,7 @@ def test_propagate_does_not_restart_a_running_helper(tmp_path):
         hello={"backend": "sam2", "capabilities": ["point", "video"],
                "device": "cuda"})
     app._sam_ready = lambda: True
-    app._start_sam = lambda: started.append(True)
+    app._start_sam = lambda **_kwargs: started.append(True)
     app._propagate_thread = None
     app.cap = None
     app.statuses = []

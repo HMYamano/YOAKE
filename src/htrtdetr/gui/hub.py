@@ -78,15 +78,17 @@ _PAGES: Tuple[Dict[str, str], ...] = (
         "short": "Label",
         "subtitle": "Draw boxes, label actions",
         "action": "page.label",
-        "summary": "Open the annotator, reopen a recent project, or auto-annotate.",
+        "summary": "The whole labelling loop lives here: it picks the frames, "
+                   "proposes the boxes, and you review them. No model needed.",
     },
     {
         "key": "training",
         "label": "2. Train",
         "short": "Train",
-        "subtitle": "Prepare data and train",
+        "subtitle": "Build a model from finished labels",
         "action": "page.train",
-        "summary": "Convert annotations, create splits, train each stage, watch the metrics.",
+        "summary": "Once the labels are done: create splits, train, watch the "
+                   "metrics. Nothing in step 1 waits on this.",
     },
     {
         "key": "analysis",
@@ -382,8 +384,14 @@ class Hub:
         self.cap = auto_label.probe(self.root)
         self.current = "workflow"
 
-        self.training = TrainingPanel(self.root)
-        self.analysis = AnalysisPanel(self.root)
+        #: The project folder all three working pages operate inside. It is
+        #: remembered across sessions, because "which study am I in" is not a
+        #: question a user should answer again on every launch - and because
+        #: it decides where training and analysis write their output.
+        self.project: Optional[Path] = recents.active_project()
+
+        self.training = TrainingPanel(self.root, self.project)
+        self.analysis = AnalysisPanel(self.root, self.project)
         # 追加のみ: パネル側は好きなときに ``self.hub.status(...)`` を呼べる。
         # コンストラクタ署名は変えていないので、使わないパネルにも無害。
         self.training.hub = self       # type: ignore[attr-defined]
@@ -416,15 +424,17 @@ class Hub:
         except Exception:  # noqa: BLE001
             vw = WINDOW_W
         chars = max(16, int((vw - 24) * 0.38 / 7.6))
-        runs = self.root / "runs"
+        home = self.project if self.project is not None else self.root
+        runs = self.training.runs
+        label = "Project" if self.project is not None else "Source"
         if chars >= 60:
             half = max(14, (chars - 24) // 2)
-            text = (f"Project: {_ellipsize(str(self.root), half)}   |   "
+            text = (f"{label}: {_ellipsize(str(home), half)}   |   "
                     f"Output: {_ellipsize(str(runs), half)}")
         elif chars >= 34:
-            text = f"Project: {self.root.name}   |   Output: {runs.name}/"
+            text = f"{label}: {home.name}   |   Output: {runs.name}/"
         else:
-            text = f"Project: {self.root.name}"
+            text = f"{label}: {home.name}"
         self.context(text)
 
     # ─── responsive text ─────────────────────────────────────────────
@@ -662,22 +672,29 @@ class Hub:
                      "annotations.json you saved earlier.",
             "does": "Draw a box around each subject, give it a track ID, and "
                     "label what it is doing. Range labeling applies one action "
-                    "across a span of frames instead of one frame at a time.",
-            "makes": "annotations.json in the project folder.",
-            "tip": "Candidates produced by Auto-Annotate or Track forward are "
-                   "never written to disk until you accept them, so re-running "
-                   "the detector is always safe.",
+                    "across a span of frames instead of one frame at a time. "
+                    "Then repeat: Smart Annotate picks the next frames, Find "
+                    "all in frame and Continue propose the boxes, and the "
+                    "Review Inbox is where you accept or reject them.",
+            "makes": "annotations.json in the project folder, beside "
+                     "project.yoake.json.",
+            "tip": "This step needs no trained model. The proposals come from "
+                   "the segmentation helper, and each pass avoids the frames "
+                   "the last one had you annotate. Candidates are never "
+                   "written to disk until you accept them, so re-running "
+                   "anything here is always safe.",
         },
         {
             "key": "training",
-            "needs": "annotations.json, converted to the dataset layout and "
-                     "split into train / val / test.",
+            "needs": "A label set you consider finished: annotations.json, "
+                     "converted to the dataset layout and split into "
+                     "train / val / test.",
             "does": "Convert the annotations, create the splits, then train the "
                     "stages in order. The monitor plots loss and metrics while "
                     "the run is going.",
-            "makes": "runs/train/stage{N}/weights/best.pth, plus results.csv "
-                     "for the plots.",
-            "tip": "Each run writes to runs/train/stage{N}/ and is never "
+            "makes": "<project>/runs/train/stage{N}/weights/best.pth, plus "
+                     "results.csv for the plots.",
+            "tip": "Each run writes to <project>/runs/train/stage{N}/ and is never "
                    "overwritten. Picking \"detection\" as the model mode forces "
                    "stage 1 regardless of the stage you chose - the log says so "
                    "when it happens.",
@@ -688,7 +705,8 @@ class Hub:
             "does": "Run inference, then step through the frames, click a box "
                     "to inspect its track, action and confidence, and read the "
                     "timeline for the whole video.",
-            "makes": "predictions.json and output.mp4 in the output folder.",
+            "makes": "predictions.json and output.mp4 in "
+                     "<project>/analysis/predict/.",
             "tip": "The detector's confidence is not a calibrated probability. "
                    "Use the timeline to find the moments the model got wrong, "
                    "then fix those frames in step 1.",
@@ -696,14 +714,22 @@ class Hub:
     )
 
     _RECOMMENDED_LOOP: Tuple[str, ...] = (
-        "1. Label 200-400 frames by hand, spread across the whole video rather "
-        "than one continuous block.",
-        "2. Train stage 1 first, then the later stages in order. Watch the "
-        "validation curve rather than the training curve.",
-        "3. Run step 3 on a video the model has not seen and step through the "
+        "Step 1 is the loop, and it closes without a model. Run Smart Annotate "
+        "to pick the frames, let Find all in frame or Continue propose the "
+        "boxes, review them, and run Smart Annotate again - the next pass "
+        "scores frames by how unlike your existing labels they are, so it "
+        "carries on from where you stopped instead of re-rolling.",
+        "Label in rounds of 20-50 frames rather than one long sitting. The "
+        "point of the loop is that what you label changes what you are asked "
+        "to label next, and that only happens between rounds.",
+        "Steps 2 and 3 start when you decide the labels are good enough. Train "
+        "stage 1 first; \"detection\" as the model mode forces it whatever the "
+        "stage buttons say. Watch the validation curve, not the training one.",
+        "Analyze on a video the model has not seen, and step through the "
         "timeline instead of trusting the summary numbers.",
-        "4. Bring the frames it got wrong back into step 1 and correct them. "
-        "One round of human review beats more threshold tuning.",
+        "A trained checkpoint then makes step 1 faster - Auto Annotate "
+        "pre-labels whole videos and uncertainty joins the sampling - but it "
+        "was never required to get here.",
     )
 
     def _build_workflow(self, parent: str) -> None:
@@ -711,7 +737,8 @@ class Hub:
                               height=-1, border=False, show=True):
             widgets.page_title(
                 "0. Workflow",
-                "Label a video, train a model, then review what it predicted. "
+                "Step 1 is a loop you repeat until the labels are good enough. "
+                "Steps 2 and 3 turn those labels into a model and check it. "
                 "Each step produces the file the next step needs.")
 
             self._build_capability_block()
@@ -719,7 +746,7 @@ class Hub:
             self._section(
                 "The three steps",
                 "Every card names what it needs before you start, what you do, "
-                "and the file it leaves behind.")
+                "and the file it leaves behind. Only step 1 repeats.")
             widgets.gap(1)
             for card in self._STEP_CARDS:
                 self._build_step_card(card)
@@ -857,12 +884,109 @@ class Hub:
             with dpg.group(horizontal=True):
                 with dpg.child_window(width=-SIDE_COL_W, height=-1,
                                       border=False, tag="labeling_main"):
+                    self._build_project_bar()
                     self._build_label_launcher()
                     self._build_label_recents()
                     self._build_label_autolabel()
                 with dpg.child_window(width=-1, height=-1, border=True,
                                       tag="labeling_side"):
                     self._build_label_side()
+
+    # ══════════════════════════════════════════════════════════════════
+    # the project folder
+    # ══════════════════════════════════════════════════════════════════
+    def _build_project_bar(self) -> None:
+        self._section(
+            "Project folder",
+            "One folder per study. Annotations, the training data built from "
+            "them, every run and every analysis result are written inside it, "
+            "and every path it stores is relative - so the folder can be "
+            "moved, copied or handed to someone else and still work.",
+            margin=CARD_PAD + SIDE_COL_W)
+        with dpg.group(horizontal=True):
+            dpg.add_text("●", tag="hub_project_dot", color=theme.TEXT_FAINT)
+            dpg.add_text("", tag="hub_project_path", color=theme.TEXT)
+        self._track_wrap("hub_project_path", 44, fixed=560)
+        with dpg.group(horizontal=True):
+            widgets.secondary_button("Open project folder...",
+                                     self._pick_project_folder,
+                                     height=30, width=210, tag="hub_project_open")
+            widgets.attach_tooltip(
+                "hub_project_open",
+                "Pick a folder that contains project.yoake.json. Steps 2 and 3 "
+                "immediately point at the data and the output folders inside "
+                "it.", wrap=340)
+            dpg.add_spacer(width=theme.SP_S)
+            dpg.add_button(label="Show in file browser", height=30, width=190,
+                           tag="hub_project_reveal", callback=self._reveal_project)
+            theme.bind(dpg.last_item(), theme.ghost_theme())
+        widgets.gap(2)
+        self._refresh_project_bar()
+
+    def _refresh_project_bar(self) -> None:
+        if not dpg.does_item_exist("hub_project_path"):
+            return
+        if self.project is None:
+            dpg.set_value(
+                "hub_project_path",
+                "No project yet. 'Start a new labeling session' creates one, "
+                "or open an existing project folder.")
+            dpg.configure_item("hub_project_dot", color=theme.TEXT_FAINT)
+        else:
+            dpg.set_value("hub_project_path", str(self.project))
+            dpg.configure_item("hub_project_dot", color=theme.status_dot("ok"))
+        self._refresh_context()
+
+    def use_project(self, path, *, quiet: bool = False) -> None:
+        """Adopt ``path`` as the active project, and tell every page about it.
+
+        Called from the folder picker and from opening a recent project: the
+        two ways in must not be able to disagree, because a Train page still
+        pointing at the previous study would write a run into it.
+        """
+        from ..annotation.layout import find_project
+
+        manifest = find_project(path) if path else None
+        if manifest is None:
+            # Opening a loose annotation JSON is legitimate; it simply does not
+            # name a project, and the pages keep the one they had.
+            if not quiet:
+                self.status(f"No project.yoake.json in {path}.", "error")
+            return
+        self.project = manifest.parent
+        recents.set_active_project(self.project)
+        self.training.set_project(self.project)
+        self.analysis.set_project(self.project)
+        self._refresh_project_bar()
+        self._rebuild_recent_projects()
+        self.status(f"Project: {self.project}", "ok")
+
+    def _pick_project_folder(self) -> None:
+        try:
+            path = dialogs.pick_dir("Select a project folder")
+        except Exception as exc:  # noqa: BLE001
+            self.status(f"Could not open the folder picker: {exc}", "error")
+            return
+        if not path:
+            return
+        self.use_project(path)
+        if self.project is not None:
+            self._launch_annotator(["--project", str(self.project)],
+                                   label=self.project.name)
+
+    def _reveal_project(self) -> None:
+        if self.project is None:
+            self.status("No project folder yet.", "error")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(self.project))  # noqa: S606 - the user's own folder
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(self.project)])
+            else:
+                subprocess.Popen(["xdg-open", str(self.project)])
+        except OSError as exc:
+            self.status(f"Could not open {self.project}: {exc}", "error")
 
     def _build_label_launcher(self) -> None:
         self._section(
@@ -959,6 +1083,7 @@ class Hub:
                 "error")
             return
         if kind == "project":
+            self.use_project(Path(path), quiet=True)
             self._launch_annotator(["--load", path], label=Path(path).name)
         else:
             self._launch_annotator([path], label=Path(path).name)
@@ -1211,6 +1336,7 @@ class Hub:
         if not path:
             return
         recents.add("annotation_json", path)
+        self.use_project(Path(path).parent, quiet=True)
         self._rebuild_recent_projects()
         self._launch_annotator(["--load", path], label=Path(path).name)
 

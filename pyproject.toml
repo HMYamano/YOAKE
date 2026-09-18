@@ -46,10 +46,24 @@ gui = ["opencv-python>=4.8.0", "dearpygui>=1.11.0"]
 # build_sam._hf_download. `pip install sam2` alone installs a package that
 # raises ModuleNotFoundError on every load.
 sam2 = ["sam2>=1.1.0", "huggingface_hub>=0.23.0"]
+# "Find all in frame" in the annotator: type what the animal is and get a box
+# per animal, with no trained model and no per-animal clicking. Install into the
+# same Python as sam2 above.
+#
+# This is the one thing SAM cannot do. SAM and SAM 2 are promptable - they
+# answer "what is at this point" - so on their own they can refine a box but
+# never find one. An open-vocabulary detector (OWLv2, via transformers) does the
+# finding, and the SAM adapter beside it turns each box into the oriented box
+# YOAKE stores. Without this the op is reported as unavailable and clicking or
+# Continue still work.
+#
+# No huggingface_hub entry: transformers depends on it already, so there is no
+# half-installed trap here of the kind sam2 has.
+concept = ["transformers>=4.40.0"]
 vis = ["matplotlib>=3.7.0", "opencv-python>=4.8.0"]
 dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "black", "isort", "mypy"]
 wandb = ["wandb>=0.16.0"]
-all = ["matplotlib>=3.7.0", "opencv-python>=4.8.0", "wandb>=0.16.0"]
+all = ["matplotlib>=3.7.0", "opencv-python>=4.8.0", "wandb>=0.16.0", "transformers>=4.40.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
