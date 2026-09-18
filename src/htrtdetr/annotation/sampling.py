@@ -46,10 +46,9 @@ Purity: no dearpygui, no torch, no cv2, no numpy.
 
 from __future__ import annotations
 
-import math
 import random
-from dataclasses import dataclass, field, replace
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
+from dataclasses import dataclass, field
+from typing import (Any, Callable, Dict, List, Mapping, Optional,
                     Sequence, Tuple)
 
 from .features import FrameFeature, distance, farthest_point_order
@@ -365,7 +364,9 @@ class Selection:
         if not lines:
             return "Nothing selected"
         if self.estimated_seconds > 0:
-            model = workload or WorkloadModel()
+            # ``workload`` は API 互換のために受け取るだけ。所要時間は
+            # SamplingRequest.workload.estimate_seconds() で既に
+            # estimated_seconds に畳み込まれている (二重に見積もらない)。
             minutes = self.estimated_seconds / 60.0
             estimate = ("under 2 minutes" if self.estimated_seconds < 90
                         else f"~{int(round(minutes))} minutes" if minutes < 60

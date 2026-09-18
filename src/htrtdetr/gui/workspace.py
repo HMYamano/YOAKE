@@ -351,7 +351,7 @@ class WorkspaceMixin(WorkspaceOperations):
         self._add_videos([Path(f) for f in files])
 
     def add_video_folder(self, recursive=False):
-        from ..annotator import _tk_ask_dir
+        from .file_dialogs import ask_dir as _tk_ask_dir
 
         folder = _tk_ask_dir("Add a folder of videos")
         if folder is not None:
@@ -413,7 +413,7 @@ class WorkspaceMixin(WorkspaceOperations):
         self._collect_thread.start()
 
     def locate_video(self, video_id):
-        from ..annotator import _tk_open_file
+        from .file_dialogs import open_file as _tk_open_file
 
         path = _tk_open_file("Locate video", [("Videos", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v")])
         if path is not None:

@@ -27,12 +27,9 @@ import math
 import queue
 import shutil
 import threading
-import time
-import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
     import dearpygui.dearpygui as dpg
@@ -48,7 +45,14 @@ import numpy as np
 
 try:  # GUI 補助モジュール (相対 import で失敗したら絶対 import)
     from .gui import auto_label, click_segment
-    from .gui import sidecar as sidecar_mod
+    from .gui import sidecar as sidecar_mod  # noqa: F401  (re-export: サイドカーの起動は gui.sam_session に移したが、テストと外部コードが htrtdetr.annotator.sidecar_mod をmonkeypatch する)
+    from .gui import canvas_view, file_dialogs, history as history_mod, sam_session
+    from .gui.review_mode import ReviewModeMixin
+    from .gui import video_controller
+    from .gui.video_controller import VideoControllerMixin
+    from .gui.canvas_view import CanvasViewMixin
+    from .gui.history import EditHistoryMixin
+    from .gui.sam_session import SamSessionMixin
     from .gui.auto_label import TRACKER_LABELS, make_tracker
 
     if dpg is not None:
@@ -75,7 +79,14 @@ try:  # GUI 補助モジュール (相対 import で失敗したら絶対 import
     from .annotation import tracklet as tracklet_mod
 except ImportError:  # スクリプト直接実行時のフォールバック
     from htrtdetr.gui import auto_label, click_segment
-    from htrtdetr.gui import sidecar as sidecar_mod
+    from htrtdetr.gui import sidecar as sidecar_mod  # noqa: F401  (re-export: サイドカーの起動は gui.sam_session に移したが、テストと外部コードが htrtdetr.annotator.sidecar_mod をmonkeypatch する)
+    from htrtdetr.gui import canvas_view, file_dialogs, history as history_mod, sam_session
+    from htrtdetr.gui.review_mode import ReviewModeMixin
+    from htrtdetr.gui import video_controller
+    from htrtdetr.gui.video_controller import VideoControllerMixin
+    from htrtdetr.gui.canvas_view import CanvasViewMixin
+    from htrtdetr.gui.history import EditHistoryMixin
+    from htrtdetr.gui.sam_session import SamSessionMixin
     from htrtdetr.gui.auto_label import TRACKER_LABELS, make_tracker
 
     if dpg is not None:
@@ -130,9 +141,9 @@ _TRACK_PALETTE = [
 ]
 
 _MIN_BOX_PX = 5
-#: フレーム移動から投機 encode を投げるまでの猶予 (秒)。シークバーを
-#: ドラッグしている間ずっと投げ続けないための遅延 (docs/CLICK_SEGMENT.md §6.4)。
-_SAM_EMBED_DELAY = 0.2
+#: 投機 encode の遅延。値は ``gui.sam_session`` に移したが、この名前で
+#: import していたコードのために別名を残す。
+_SAM_EMBED_DELAY = sam_session.SAM_EMBED_DELAY
 
 #: Click to Box のバックエンド選択に出すツールチップ。
 #: P17 (取り返しのつかない待ちは事前に値段を言う) に従い、SAM の初回コストを
@@ -165,7 +176,8 @@ _DRAG_EDIT_MODES = ("move", "resize", "rotate")
 
 _HANDLE_R = 7  # resize-handle radius in canvas pixels
 _ROT_HANDLE_OFFSET = 26  # rotation handle distance from the box edge (canvas px)
-_FRAME_TEX = "yoake_frame_tex"
+#: フレームテクスチャのタグ。値は ``gui.video_controller`` に移した。
+_FRAME_TEX = video_controller.FRAME_TEX
 _SIDEBAR_W = 280
 _TIMELINE_H = 26  # シークバー (drawlist) の高さ
 _TIMELINE_PAD = 10  # シークバー左右の余白 (px)
@@ -204,24 +216,24 @@ _TOP_H = 114
 #: reflows the canvas instead of pushing the controls off screen.
 _UNDER_TIMELINE_H = 76
 
-#: How far ahead :meth:`AnnotationApp._read_frame_bgr` will ``grab()`` rather
-#: than seek. Half a second at 25 fps: far enough to cover a held Right arrow
-#: and the small hops the review queue makes, short enough that a real jump
-#: still takes the seek.
-_SEQ_SKIP_MAX = 12
+#: 逐次デコードで grab に切り替える上限。値は ``gui.video_controller``
+#: に移した (実際に使うのはそちら)。
+_SEQ_SKIP_MAX = video_controller.SEQ_SKIP_MAX
 
-#: Undo depth, per frame (docs/GUI_DESIGN.md §0.3.5).
-_UNDO_DEPTH = 50
+#: Undo depth, per frame. Lives beside the code that applies it
+#: (``gui.history``); this name is kept for backward compatibility.
+_UNDO_DEPTH = history_mod.UNDO_DEPTH
 
-#: Seconds of quiet before an autosave fires. Long enough that dragging a box
-#: across thirty frames writes once rather than thirty times, short enough that
-#: a crash costs a few seconds of work (§38).
-_AUTOSAVE_DEBOUNCE = 4.0
+#: Autosave debounce. The value now lives beside the code that applies it
+#: (``gui.history``); this name is kept for anything that imported it from
+#: ``htrtdetr.annotator``.
+_AUTOSAVE_DEBOUNCE = history_mod.AUTOSAVE_DEBOUNCE
 
-#: Zoom clamp, multiplied onto the fit scale.
-_ZOOM_MIN, _ZOOM_MAX = 0.2, 20.0
-#: Minimum image that must stay on screen when panning, in canvas px.
-_PAN_KEEP = 64
+#: Zoom / pan limits. The values now live beside the code that applies them
+#: (``gui.canvas_view``); these names are kept so anything that imported them
+#: from ``htrtdetr.annotator`` keeps working.
+_ZOOM_MIN, _ZOOM_MAX = canvas_view.ZOOM_MIN, canvas_view.ZOOM_MAX
+_PAN_KEEP = canvas_view.PAN_KEEP
 
 #: The six tools, in rail order: ``(tool, full name, rail word, action)``.
 #:
@@ -255,33 +267,19 @@ _TOOL_CHIP: Dict[str, str] = {
 _KEY_CTRL = getattr(dpg, "mvKey_ModCtrl", getattr(dpg, "mvKey_Control", 17))
 
 
-def _corners_of(obj) -> List[Tuple[float, float]]:
-    """Four corners of anything with ``obb`` or ``bbox``.
-
-    ``AnnObject`` has ``corners()``; ``auto_label.Candidate`` does not, and the
-    review canvas draws both. One helper rather than two draw paths, so a box
-    and the candidate that replaced it cannot be drawn differently.
-    """
-    obb = getattr(obj, "obb", None)
-    if obb is not None:
-        cx, cy, w, h, theta = (float(v) for v in obb[:5])
-        hw, hh = w / 2.0, h / 2.0
-        cos_t, sin_t = math.cos(theta), math.sin(theta)
-        return [
-            (cx + lx * cos_t - ly * sin_t, cy + lx * sin_t + ly * cos_t)
-            for lx, ly in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))
-        ]
-    x1, y1, x2, y2 = (float(v) for v in getattr(obj, "bbox", (0, 0, 0, 0))[:4])
-    return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+#: 4 隅の算出は幾何なので ``gui.canvas_view`` に置いた。レビュー画面と
+#: 通常キャンバスの両方が使うため、描画経路ごとに書き分けない。
+_corners_of = canvas_view.corners_of
 
 
 def _repo_root() -> Path:
     """リポジトリのルート。子プロセスの cwd と PYTHONPATH の基準になる。
 
-    ``src/htrtdetr/annotator.py`` から 2 つ上。インストール済みでも
-    src-layout のチェックアウトでも同じ答えになる。
+    実装は ``gui.sam_session.repo_root`` に一本化してある (サイドカーの起動が
+    この値を最も必要とするため)。2 か所で別々に数え直すと、片方だけ階層が
+    ずれても気付けない。
     """
-    return Path(__file__).resolve().parent.parent.parent
+    return sam_session.repo_root()
 
 
 # ─── OpenCV tracker backend ───────────────────────────────────────────────────
@@ -305,41 +303,27 @@ def _track_color(track_id: int, alpha: int = 255) -> Tuple[int, int, int, int]:
 # ─── tkinter file-dialog helpers ─────────────────────────────────────────────
 
 
+# ダイアログ本体は ``gui.file_dialogs`` へ移した (gui 側のモジュールが
+# ``from ..annotator import _tk_open_file`` と逆向きに import していたため)。
+# 旧名は外部コードのために残すが、**呼び出し時に解決する薄いラッパ**にする。
+#
+# ``_tk_open_file = file_dialogs.open_file`` と束縛してしまうと、
+# ``file_dialogs.open_file`` を差し替えてもこちらは元の関数を指したままになる。
+# OS の modal ダイアログはテストを無言でハングさせるので、差し替え口は
+# ``gui.file_dialogs`` の 1 か所に揃えておく (tests/conftest.py の安全網もそこを見る)。
+
 def _tk_open_file(title: str, filetypes: list) -> Optional[Path]:
-    """Show a native OS open-file dialog (tkinter). Returns Path or None."""
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    path = filedialog.askopenfilename(title=title, filetypes=filetypes)
-    root.destroy()
-    return Path(path) if path else None
+    return file_dialogs.open_file(title, filetypes)
 
 
 def _tk_save_file(
     title: str, filetypes: list, initial_file: str = "annotations.json"
 ) -> Optional[Path]:
-    """Show a native OS save-file dialog (tkinter). Returns Path or None."""
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    path = filedialog.asksaveasfilename(
-        title=title,
-        filetypes=filetypes,
-        initialfile=initial_file,
-        defaultextension=".json",
-    )
-    root.destroy()
-    return Path(path) if path else None
+    return file_dialogs.save_file(title, filetypes, initial_file)
 
 
 def _tk_ask_dir(title: str) -> Optional[Path]:
-    """Show a native OS directory picker (tkinter). Returns Path or None."""
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    path = filedialog.askdirectory(title=title)
-    root.destroy()
-    return Path(path) if path else None
+    return file_dialogs.ask_dir(title)
 
 
 # ─── Data Model ───────────────────────────────────────────────────────────────
@@ -351,7 +335,14 @@ from htrtdetr.gui.workspace import WorkspaceMixin
 
 
 @video_scoped
-class AnnotationApp(WorkspaceMixin):
+class AnnotationApp(
+    CanvasViewMixin,
+    EditHistoryMixin,
+    ReviewModeMixin,
+    SamSessionMixin,
+    VideoControllerMixin,
+    WorkspaceMixin,
+):
 
     def __init__(self) -> None:
         if dpg is None or cv2 is None:
@@ -1629,175 +1620,6 @@ class AnnotationApp(WorkspaceMixin):
     # Canvas Rendering
     # ═══════════════════════════════════════════════════════════════════
 
-    def _canvas_origin(self) -> Tuple[float, float]:
-        """
-        描画キャンバス (drawlist) 左上の viewport 座標。
-
-        dearpygui 2.x の child_window は item state に ``rect_min`` を持たない
-        (``get_item_rect_min`` が KeyError を投げる)。drawlist は持っているので
-        そちらを基準にする。ここを取り違えるとクリック座標がキャンバス原点
-        (= メニューバー高さ + 余白) の分だけずれる。
-        """
-        for tag in ("canvas", "canvas_win"):
-            if not dpg.does_item_exist(tag):
-                continue
-            try:
-                ox, oy = dpg.get_item_rect_min(tag)
-                return float(ox), float(oy)
-            except (KeyError, SystemError, TypeError):
-                continue
-        return 0.0, 0.0
-
-    def _get_canvas_mouse(self) -> Tuple[float, float]:
-        """Mouse position in canvas-local pixel coords."""
-        mx, my = dpg.get_mouse_pos(local=False)
-        ox, oy = self._canvas_origin()
-        return float(mx - ox), float(my - oy)
-
-    def _recompute_scale(self) -> None:
-        cw, ch = self._canvas_w, self._canvas_h
-        for tag in ("canvas", "canvas_win"):
-            if not dpg.does_item_exist(tag):
-                continue
-            try:
-                cw, ch = dpg.get_item_rect_size(tag)
-                break
-            except (KeyError, SystemError, TypeError):
-                continue
-        self._canvas_w = int(cw) if cw > 1 else self._canvas_w
-        self._canvas_h = int(ch) if ch > 1 else self._canvas_h
-        if self.frame_w > 0 and self.frame_h > 0:
-            # _scale composes the fit scale with the user's zoom, and _offset
-            # composes the centering with the user's pan. Because _i2c / _c2i
-            # are the only way anything converts coordinates, every hit test,
-            # every handle and every draw call is correct under zoom without a
-            # single further edit (docs/GUI_DESIGN.md §0.3.5).
-            self._fit_scale = min(self._canvas_w / self.frame_w, self._canvas_h / self.frame_h)
-            self._scale = self._fit_scale * self._zoom
-            self._offset_x = (self._canvas_w - self.frame_w * self._scale) / 2 + self._pan_x
-            self._offset_y = (self._canvas_h - self.frame_h * self._scale) / 2 + self._pan_y
-
-    # ─── Zoom and pan ────────────────────────────────────────────────
-
-    def _clamp_pan(self) -> None:
-        """Keep at least ``_PAN_KEEP`` px of image on screen.
-
-        Without this the image can be panned entirely out of the canvas and the
-        only way back is to reopen the video.
-        """
-        if self.frame_w <= 0 or self.frame_h <= 0:
-            return
-        width = self.frame_w * self._scale
-        height = self.frame_h * self._scale
-        base_x = (self._canvas_w - width) / 2
-        base_y = (self._canvas_h - height) / 2
-        self._pan_x = max(
-            min(self._pan_x, self._canvas_w - _PAN_KEEP - base_x), _PAN_KEEP - width - base_x
-        )
-        self._pan_x = max(-self._canvas_w + _PAN_KEEP, min(self._canvas_w - _PAN_KEEP, self._pan_x))
-        self._pan_y = max(
-            min(self._pan_y, self._canvas_h - _PAN_KEEP - base_y), _PAN_KEEP - height - base_y
-        )
-
-    def fit_view(self) -> None:
-        """Reset zoom and pan. The escape hatch from any lost view."""
-        self._zoom = 1.0
-        self._pan_x = self._pan_y = 0.0
-        self._recompute_scale()
-        self._refresh_zoom_label()
-        self._render_canvas()
-
-    def zoom_by(self, factor: float, anchor: Optional[Tuple[float, float]] = None) -> None:
-        """Multiply the zoom, keeping ``anchor`` (canvas px) over the same pixel.
-
-        Anchoring is what makes wheel zoom usable: without it, zooming in on a
-        fly in the corner walks it off the screen and the user has to pan back
-        after every step.
-        """
-        if self.cap is None:
-            return
-        if anchor is None:
-            anchor = (self._canvas_w / 2.0, self._canvas_h / 2.0)
-        before = self._c2i(*anchor)
-        self._zoom = max(_ZOOM_MIN, min(_ZOOM_MAX, self._zoom * float(factor)))
-        self._recompute_scale()
-        after = self._i2c(*before)
-        self._pan_x += anchor[0] - after[0]
-        self._pan_y += anchor[1] - after[1]
-        self._clamp_pan()
-        self._recompute_scale()
-        self._refresh_zoom_label()
-        self._render_canvas()
-
-    def _drag_pan(self, cx: float, cy: float) -> None:
-        """Move the view by the distance dragged since the press.
-
-        From the *press* origin rather than frame to frame: accumulating deltas
-        drifts away from the cursor over a long drag, and the image ends up not
-        under the hand that is moving it.
-        """
-        if self._pan_origin is None:
-            return
-        ox, oy, start_x, start_y = self._pan_origin
-        self._pan_x = start_x + (cx - ox)
-        self._pan_y = start_y + (cy - oy)
-        self._clamp_pan()
-        self._recompute_scale()
-        self._render_canvas()
-
-    def _on_middle_press(self, sender=None, app_data=None) -> None:
-        if not self._is_over_canvas() or self.cap is None:
-            return
-        cx, cy = self._get_canvas_mouse()
-        self._middle_pan = (cx, cy, self._pan_x, self._pan_y)
-
-    def _on_middle_drag(self, sender=None, app_data=None) -> None:
-        if self._middle_pan is None or not self._is_over_canvas():
-            return
-        saved, self._pan_origin = self._pan_origin, self._middle_pan
-        try:
-            self._drag_pan(*self._get_canvas_mouse())
-        finally:
-            self._pan_origin = saved
-
-    def _on_middle_release(self, sender=None, app_data=None) -> None:
-        self._middle_pan = None
-
-    def _refresh_zoom_label(self) -> None:
-        if dpg.does_item_exist("rail_zoom"):
-            dpg.set_value("rail_zoom", f"{self._zoom * 100:.0f}%")
-
-    def _on_mouse_wheel(self, _sender=None, app_data=0) -> None:
-        if not self._is_over_canvas() or self.cap is None:
-            return
-        self.zoom_by(1.25 if float(app_data) > 0 else 0.8, anchor=self._get_canvas_mouse())
-
-    def _on_mouse_move(self, _sender=None, _app_data=None) -> None:
-        """Track the cursor for the crosshair the drawing tools show.
-
-        Only the tools that need it pay: in Select the branch returns before
-        touching anything, so the common case costs one comparison per move
-        event rather than a re-render.
-        """
-        if self._tool not in ("draw", "obb", "delete", "click"):
-            if self._cursor_canvas is not None:
-                self._cursor_canvas = None
-                self._render_canvas()
-            return
-        if not self._is_over_canvas():
-            self._cursor_canvas = None
-            return
-        self._cursor_canvas = self._get_canvas_mouse()
-        if self._mode == "idle":
-            self._render_canvas()
-
-    def _i2c(self, x: float, y: float) -> Tuple[float, float]:
-        return x * self._scale + self._offset_x, y * self._scale + self._offset_y
-
-    def _c2i(self, cx: float, cy: float) -> Tuple[float, float]:
-        s = max(self._scale, 1e-9)
-        return (cx - self._offset_x) / s, (cy - self._offset_y) / s
-
     def _render_canvas(self) -> None:
         if not dpg.does_item_exist("canvas"):
             return
@@ -2546,188 +2368,6 @@ class AnnotationApp(WorkspaceMixin):
     # Video Loading
     # ═══════════════════════════════════════════════════════════════════
 
-    def _open_video_dialog(self) -> None:
-        path = _tk_open_file(
-            title="Open Video",
-            filetypes=[
-                ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"),
-                ("All files", "*.*"),
-            ],
-        )
-        if path is not None:
-            self._load_video(path)
-
-    def _install_video_capture(self, cap) -> None:
-        self.cap = cap
-        self._decoded_idx = None
-        path = self.video_path
-        self.fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        self.frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        # Create frame texture.
-        #
-        # The canvases are cleared **first**. A drawlist that still holds a
-        # draw_image of this texture keeps it bound, and deleting a bound
-        # texture raises SystemError out of dearpygui - so opening a second
-        # video used to take the annotator down. Clearing the draw items
-        # releases the reference; the next render puts them back.
-        for canvas in ("canvas", self.review_mode.canvas_tag):
-            if dpg.does_item_exist(canvas):
-                dpg.delete_item(canvas, children_only=True)
-        self._current_bgr = None
-        if dpg.does_item_exist(self._frame_tex):
-            try:
-                dpg.delete_item(self._frame_tex)
-            except SystemError:
-                # Still bound by something we do not own. The comment here used
-                # to promise a fresh tag and the code did nothing, so the old
-                # texture survived at the **old video's** size and the next
-                # set_value pushed a differently-shaped buffer into it. Take
-                # the fresh tag for real; a leaked texture costs memory, a
-                # mismatched one costs the process.
-                pass
-        if dpg.does_item_exist(self._frame_tex):
-            self._frame_tex = f"{_FRAME_TEX}_{self._tex_serial}"
-            self._tex_serial += 1
-        blank = np.zeros(self.frame_w * self.frame_h * 4, dtype=np.float32)
-        if not dpg.does_item_exist("tex_reg"):
-            with dpg.texture_registry(tag="tex_reg", show=False):
-                dpg.add_raw_texture(
-                    self.frame_w,
-                    self.frame_h,
-                    blank,
-                    tag=self._frame_tex,
-                    format=dpg.mvFormat_Float_rgba,
-                )
-        elif not dpg.does_item_exist(self._frame_tex):
-            dpg.push_container_stack("tex_reg")
-            dpg.add_raw_texture(
-                self.frame_w,
-                self.frame_h,
-                blank,
-                tag=self._frame_tex,
-                format=dpg.mvFormat_Float_rgba,
-            )
-            dpg.pop_container_stack()
-
-        if dpg.does_item_exist("frame_input"):
-            dpg.configure_item("frame_input", max_value=self.num_frames - 1)
-        if dpg.does_item_exist("total_frames_text"):
-            dpg.set_value("total_frames_text", f"/ {self.num_frames - 1}")
-
-        dpg.set_viewport_title(f"YOAKE Annotation Tool — {path.name}")
-        self.goto_frame(self.current_frame_idx, light=True)
-        self._status(
-            f"Loaded: {path.name}  ({self.num_frames} frames, "
-            f"{self.fps:.1f} fps, {self.frame_w}×{self.frame_h})"
-        )
-
-    def _read_frame_bgr(self, idx: int) -> Optional[np.ndarray]:
-        """Decode frame ``idx``, sequentially whenever that is possible (P15).
-
-        Stepping one frame forward is the single most-used gesture in the
-        annotator, and it used to cost a ``CAP_PROP_POS_FRAMES`` seek every
-        time. On a long-GOP codec a seek re-decodes from the previous keyframe,
-        so holding Right walked the decoder over the same group of pictures
-        again and again: Next/Prev felt heavy on exactly the videos this tool
-        is for, and the wait grew with the GOP length rather than with the step.
-
-        ``_decoded_idx`` remembers where the capture actually is, so:
-
-        * ``idx == _decoded_idx + 1`` is a bare ``read()`` - no seek at all;
-        * a short forward hop is ``grab()`` over the gap, which decodes nothing
-          it is going to throw away;
-        * anything else - backwards, or a jump - still seeks, because that is
-          genuinely cheaper than grabbing a thousand frames.
-
-        This also removes the off-by-one P15 warns about from the common path:
-        at a non-integer fps ``cap.set`` can land on the neighbouring frame,
-        and sequential decoding cannot.
-        """
-        if self.cap is None:
-            return None
-        here = self._decoded_idx
-        if here is not None and here < idx <= here + _SEQ_SKIP_MAX:
-            for _ in range(idx - here - 1):
-                if not self.cap.grab():
-                    here = None
-                    break
-        else:
-            here = None
-        if here is None:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = self.cap.read()
-        # A failed read leaves the position unknowable, so the next access must
-        # seek rather than trust a stale count.
-        self._decoded_idx = idx if ret else None
-        return frame if ret else None
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Frame Navigation
-    # ═══════════════════════════════════════════════════════════════════
-
-    def goto_frame(self, idx: int, *, light: bool = False) -> None:
-        """フレーム idx へ移動する。
-
-        light=True はシークバーのドラッグ中に使う軽量パス。自動トラッキングと
-        サイドバー更新を省き、フレーム描画とシークバーだけを更新する。
-        """
-        if self.cap is None:
-            return
-        if self._advance_at_end(idx):
-            return
-        idx = max(0, min(idx, self.num_frames - 1))
-
-        # Auto-track: run trackers when advancing one frame. The frame it
-        # decodes is kept rather than decoded a second time below - with
-        # auto-track on, every step used to pay for the same frame twice.
-        frame_bgr = None
-        if self._auto_track and not light and idx == self.current_frame_idx + 1 and self._trackers:
-            frame_bgr = self._read_frame_bgr(idx)
-            if frame_bgr is not None:
-                self._run_trackers_for_frame(idx, frame_bgr)
-
-        self.current_frame_idx = idx
-        self._visit_frame(idx)
-        if frame_bgr is None:
-            frame_bgr = self._read_frame_bgr(idx)
-        self._current_bgr = frame_bgr
-
-        if frame_bgr is not None and dpg.does_item_exist(self._frame_tex):
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            rgba = np.dstack([rgb, np.full(rgb.shape[:2], 255, dtype=np.uint8)])
-            data = (rgba.astype(np.float32) / 255.0).flatten()
-            dpg.set_value(self._frame_tex, data)
-
-        if light:
-            self._selected = None
-        else:
-            self.deselect(render=False)
-        if dpg.does_item_exist("frame_input"):
-            dpg.set_value("frame_input", idx)
-
-        self._render_canvas()
-        if not light:
-            self._refresh_sidebar()
-        self._render_timeline()
-
-        # SAM を使っているなら、この新しいフレームを先に encode させておく。
-        # ユーザが個体を探している間に終わらせるのが狙い。
-        self._on_frame_changed_for_sam()
-
-        annotated = len(self.annotations)
-        pct = annotated / max(self.num_frames, 1)
-        self._status(
-            f"Frame {idx}/{self.num_frames - 1}  |  "
-            f"Annotated: {annotated}/{self.num_frames} ({pct * 100:.0f}%)"
-        )
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Selection
-    # ═══════════════════════════════════════════════════════════════════
-
     def _select(self, obj: AnnObject) -> None:
         # A box selection supersedes whatever the Inspector was showing: the
         # user just pointed at something, and that is the context now.
@@ -2937,282 +2577,6 @@ class AnnotationApp(WorkspaceMixin):
         self._refresh_sidebar()
 
     # ─── Click to Box: backends ──────────────────────────────────────
-
-    def _sam_ready(self) -> bool:
-        return self._sam_client is not None and self._sam_client.is_running()
-
-    def set_click_backend(self, name: str) -> None:
-        """フィットに使うバックエンドを切り替える。
-
-        ``local`` へは常に戻れます。これは UI の約束でもあって、SAM を選んで
-        失敗しても行き止まりにならないことを保証しています。
-        """
-        if name not in ("auto", *click_segment.BACKENDS):
-            name = "local"
-        if name == "sam" and not self._sam_ready():
-            # The start is asynchronous now, so whether it worked is not known
-            # here. Selecting the backend optimistically keeps the window
-            # responsive; the fallback to Local happens when the answer comes.
-            self._start_sam(on_done=self._sam_backend_started)
-        if name == "model" and not self._predictions:
-            self._status(
-                "No model predictions are loaded. Use File > Load Predictions "
-                "for Click to Box... first, or keep the Local (OpenCV) fit."
-            )
-            name = "local"
-        self._click_backend = name
-        if name not in ("sam", "auto"):
-            self._stop_sam()
-        self._refresh_backend_ui()
-        self._status(
-            f"Click animal now uses {click_segment.BACKEND_LABELS.get(name, 'Automatic (best available)')}."
-        )
-
-    def _sam_backend_started(self, ok: bool) -> None:
-        """Keep the promise that choosing SAM is never a dead end.
-
-        ``local`` needs nothing installed, so a helper that could not start
-        drops the selection back to it rather than leaving Click animal
-        pointing at a backend that is not there.
-        """
-        if not ok and self._click_backend == "sam":
-            self.set_click_backend("local")
-
-    def _start_sam(self, on_done: Optional[Callable[[bool], None]] = None) -> bool:
-        """SAM ヘルパーを遅延起動する。使うと言われて初めて探索します。
-
-        probe も起動も**この瞬間まで一切走りません**。torch のあるインタプリタを
-        探すだけで数秒かかることがあり、SAM を使わない人にその代金を払わせる
-        理由がないからです。
-
-        探索と起動は**ワーカースレッドで**走ります。両方が UI スレッドに乗って
-        いた頃、``_status`` に書いた進捗は 1 文字も画面に出ませんでした。
-        dearpygui はこのコールバックが返るまでフレームを描き直さないので、
-        最後に描かれた "Looking for a Python with PyTorch..." のまま窓が固まり、
-        Windows が「応答なし」を出します。実測でも探索 1.2 秒 + 起動 2.7 秒、
-        コールドな初回は子プロセスの ``import torch`` だけで数十秒かかります。
-
-        戻り値は**いま使えるか**であって、起動が成功するかではありません。
-        まだなら ``on_done(ok)`` が UI スレッドで後から呼ばれるので、押された
-        操作はそこでやり直します — 二度押しを覚えてもらう代わりに。
-        """
-        if self._sam_ready():
-            if on_done is not None:
-                on_done(True)
-            return True
-        if on_done is not None:
-            self._sam_on_ready.append(on_done)
-        if self._sam_starting:
-            return False
-        self._sam_starting = True
-        self._sam_start_token += 1
-        token = self._sam_start_token
-        self._status("Looking for a Python with PyTorch...")
-        threading.Thread(
-            target=self._sam_start_worker, args=(token,), daemon=True
-        ).start()
-        return False
-
-    def _sam_start_worker(self, token: int) -> None:
-        """Probe and launch, off the UI thread. Touches no dearpygui item."""
-        cap = self._sam_cap
-        if cap is None:
-            try:
-                cap = sidecar_mod.probe_interpreters()
-            except Exception as exc:  # noqa: BLE001
-                cap = sidecar_mod.SidecarCapability(
-                    usable=False, reason=f"Could not probe for PyTorch: {exc}"
-                )
-        if not cap.usable:
-            self._post(lambda: self._finish_sam_start(token, cap, None, ""))
-            return
-        spec = sidecar_mod.SidecarSpec(
-            python=cap.interpreter.python,
-            repo_root=str(_repo_root()),
-            backend=cap.backends[0],
-            # The helper picks the device, because only the helper has torch.
-            device="auto",
-        )
-        self._post(
-            lambda: self._status(f"Starting the segmentation helper ({spec.backend})...")
-        )
-        client: Any = None
-        error = ""
-        try:
-            client = sidecar_mod.SidecarClient(spec, on_log=self._sam_log)
-            client.start(timeout=60.0)
-        except Exception as exc:  # noqa: BLE001
-            client, error = None, f"The segmentation helper did not start: {exc}"
-        self._post(lambda: self._finish_sam_start(token, cap, client, error))
-
-    def _finish_sam_start(self, token: int, cap, client, error: str) -> None:
-        """Install the helper on the UI thread, then replay what was waiting."""
-        self._sam_cap = cap
-        if token != self._sam_start_token:
-            # _stop_sam ran while this start was in flight. The user's last
-            # word wins, and a helper nobody asked for any more is a stray
-            # process holding the GPU.
-            if client is not None:
-                try:
-                    client.stop()
-                except Exception:  # noqa: BLE001
-                    pass
-            return
-        self._sam_starting = False
-        waiting, self._sam_on_ready = self._sam_on_ready, []
-        if client is None:
-            self._sam_client = None
-            reason = error or cap.reason
-            self._status(
-                (reason.splitlines() or ["The segmentation helper did not start."])[0]
-            )
-        else:
-            self._sam_client = client
-            self._arm_sam_pump()
-            if self._current_bgr is not None:
-                self._sam_embed_due = time.monotonic()
-            hello = getattr(client, "hello", None) or {}
-            backend = str(hello.get("backend") or "")
-            device = str(hello.get("device") or "")
-            detail = ", ".join(part for part in (backend, device) if part)
-            self._status(
-                f"Segmentation helper ready ({detail})."
-                if detail
-                else "Segmentation helper ready."
-            )
-        ok = client is not None
-        for callback in waiting:
-            try:
-                callback(ok)
-            except Exception as exc:  # noqa: BLE001
-                self._status(f"Could not resume after starting: {type(exc).__name__}: {exc}")
-
-    def _stop_sam(self) -> None:
-        client, self._sam_client = self._sam_client, None
-        # Invalidate any start still in flight: without this a helper the user
-        # has just turned off installs itself seconds later, and the operation
-        # waiting on it runs after they said no.
-        self._sam_start_token += 1
-        self._sam_starting = False
-        self._sam_on_ready = []
-        self._sam_jobs.clear()
-        self._sam_waiting = False
-        self._sam_embed_due = None
-        if client is not None:
-            try:
-                client.stop()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _sam_log(self, text: str) -> None:
-        # ヘルパーの stderr。ログ枠がまだ無いので黙って捨てるのではなく、
-        # 最後の 1 行だけ status に出す (無言で壊れているのが最悪なので)。
-        if "Traceback" in text or "Error" in text:
-            self._post(lambda message=text.strip()[:160]: self._status(message))
-
-    def _arm_sam_pump(self) -> None:
-        """毎フレーム 1 回だけ自分を呼び直すコールバックを仕掛ける。
-
-        ワーカースレッドは dpg に触れず queue に積むだけで、取り出しは必ず
-        メインスレッドのここ。GUI_DESIGN P9 が求める形そのものです。
-        """
-        if self._sam_pump_armed:
-            return
-        self._sam_pump_armed = True
-        try:
-            dpg.set_frame_callback(dpg.get_frame_count() + 1, self._pump_sidecar)
-        except Exception:  # noqa: BLE001 — dpg 未起動 (テスト) では何もしない
-            self._sam_pump_armed = False
-
-    def _pump_sidecar(self) -> None:
-        self._sam_pump_armed = False
-        client = self._sam_client
-        if client is None:
-            return
-        try:
-            self._drain_sam(client)
-            self._maybe_embed(client)
-            self._tick_sam_status(client)
-        finally:
-            if self._sam_client is not None:
-                self._arm_sam_pump()
-
-    def _drain_sam(self, client) -> None:
-        for msg in client.poll():
-            job = self._sam_jobs.pop(int(msg.get("id", -1)), None)
-            if job is None or job["kind"] == "embed":
-                continue
-            self._sam_waiting = False
-            if job["kind"] == "concept":
-                if job["frame"] != self.current_frame_idx:
-                    self._status("Frame changed; the search was discarded.")
-                elif not msg.get("ok"):
-                    self._status(str(msg.get("detail") or "The search failed."))
-                else:
-                    self._apply_concept_reply(msg, job)
-                continue
-            # 世代チェック: 依頼したときのフレームから動いていたら捨てる。
-            # 黙って捨てるが、ユーザが待たされていたことは 1 行だけ知らせる。
-            if job["frame"] != self.current_frame_idx:
-                self._status("Frame changed; the segmentation was discarded.")
-                continue
-            self._apply_click_result(
-                sidecar_mod.result_from_reply(msg, f"sam:{client.backend_name}")
-            )
-
-    def _maybe_embed(self, client) -> None:
-        """フレーム移動から少し置いて、投機的に encode を始める。
-
-        CPU では encode が秒オーダーで、click ごとの decode は数十 ms。
-        ユーザが個体を探している 1-3 秒のあいだに終わらせてしまえば、
-        クリックは即答に見えます。シーク中に投げ続けないための遅延です。
-        """
-        if self._sam_embed_due is None or self._current_bgr is None:
-            return
-        if time.monotonic() < self._sam_embed_due:
-            return
-        self._sam_embed_due = None
-        try:
-            req_id = client.embed(self._sam_frame_id(self.current_frame_idx), self._current_bgr)
-        except Exception:  # noqa: BLE001
-            return
-        self._sam_jobs[req_id] = {"kind": "embed", "frame": self.current_frame_idx}
-
-    def _tick_sam_status(self, client) -> None:
-        if not self._sam_waiting:
-            return
-        age = client.oldest_pending_age()
-        if age is not None and age > 0.4:
-            # 進捗は取れないので経過時間だけ出す (GUI_DESIGN P20)。
-            self._status(f"Segmenting... {age:.1f} s")
-
-    def _request_sam_point(self, req) -> None:
-        client = self._sam_client
-        frame_index = self.current_frame_idx
-        try:
-            path = client.frames.put(self._sam_frame_id(frame_index), self._current_bgr)
-            req_id = client.send(
-                "point",
-                frame=self._sam_frame_id(frame_index),
-                path=str(path),
-                points=[[float(req.x), float(req.y), 1 if req.polarity else 0]],
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._status(f"The segmentation helper stopped: {exc}")
-            self._stop_sam()
-            self._click_backend = "local"
-            self._refresh_backend_ui()
-            return
-        self._sam_jobs[req_id] = {"kind": "point", "frame": frame_index}
-        self._sam_waiting = True
-        self._arm_sam_pump()
-
-    def _on_frame_changed_for_sam(self) -> None:
-        """フレームが変わったときに呼ぶ。投機 encode の予約だけ置く。"""
-        if self._click_backend != "sam" or not self._sam_ready():
-            return
-        self._sam_embed_due = time.monotonic() + _SAM_EMBED_DELAY
-        self._arm_sam_pump()
 
     def load_predictions_for_clicks(self, path: Path) -> bool:
         """``predictions.json`` を model バックエンド用に読む。推論はしない。"""
@@ -4163,131 +3527,6 @@ class AnnotationApp(WorkspaceMixin):
     # happened elsewhere takes them there rather than silently changing a frame
     # they cannot see.
 
-    def _snapshot(self, frames: Optional[Iterable[int]] = None) -> Dict[str, Any]:
-        """Deep-copy the named frames (default: the current one) as one entry."""
-        if frames is None:
-            frames = [self.current_frame_idx]
-        return {
-            "video_id": self._video_session.video_id,
-            "frame": self.current_frame_idx,
-            "review": copy.deepcopy(self._review),
-            "intervals": copy.deepcopy(self._intervals),
-            "frames": {int(f): copy.deepcopy(self.annotations.get(int(f), [])) for f in frames},
-        }
-
-    def _push_undo(
-        self, snapshot: Optional[Dict[str, Any]] = None, frames: Optional[Iterable[int]] = None
-    ) -> None:
-        """Record one undoable step.
-
-        Taking a **new** action clears the redo stack: the future the user could
-        have redone is no longer reachable from here, and offering it would
-        replay edits onto a different history.
-        """
-        entry = snapshot if snapshot is not None else self._snapshot(frames)
-        self._undo.append(entry)
-        if len(self._undo) > _UNDO_DEPTH:
-            del self._undo[0]
-        self._redo.clear()
-        self._refresh_history_ui()
-
-    def _apply_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
-        """Restore one entry, returning the entry that undoes *this* restore."""
-        if entry.get("video_id", self._video_session.video_id) != self._video_session.video_id:
-            raise ValueError("Undo entry belongs to another video")
-        inverse = {
-            "video_id": self._video_session.video_id,
-            "frame": self.current_frame_idx,
-            "review": copy.deepcopy(self._review),
-            "intervals": copy.deepcopy(self._intervals),
-            "frames": {
-                int(f): copy.deepcopy(self.annotations.get(int(f), []))
-                for f in entry.get("frames", {})
-            },
-        }
-        if "review" in entry:
-            self._review = copy.deepcopy(entry["review"])
-        if "intervals" in entry:
-            self._intervals = copy.deepcopy(entry["intervals"])
-        for frame, objects in entry.get("frames", {}).items():
-            if objects:
-                self.annotations[int(frame)] = copy.deepcopy(objects)
-            else:
-                self.annotations.pop(int(frame), None)
-        return inverse
-
-    def _after_history_move(self, entry: Dict[str, Any], verb: str, remaining: int) -> None:
-        # The selection is an object identity and the restored list holds
-        # different objects, so keeping it would leave Delete pointed at a box
-        # that is no longer in the frame.
-        self._selected = None
-        target = int(entry.get("frame", self.current_frame_idx))
-        if target != self.current_frame_idx and 0 <= target < max(self.num_frames, 1):
-            self.goto_frame(target)
-        self._mark_dirty()
-        self.rebuild_copilot()
-        self._refresh_sidebar()
-        self._render_canvas()
-        self._refresh_history_ui()
-        touched = len(entry.get("frames", {}))
-        where = f" across {touched} frames" if touched > 1 else ""
-        self._status(f"{verb}{where}. {remaining} step" f"{'s' if remaining != 1 else ''} left.")
-
-    def undo(self) -> None:
-        if not self._undo:
-            self._status("Nothing to undo.")
-            return
-        entry = self._undo.pop()
-        self._redo.append(self._apply_entry(entry))
-        self._after_history_move(entry, "Undone", len(self._undo))
-
-    def redo(self) -> None:
-        if not self._redo:
-            self._status("Nothing to redo.")
-            return
-        entry = self._redo.pop()
-        self._undo.append(self._apply_entry(entry))
-        self._after_history_move(entry, "Redone", len(self._redo))
-
-    def _refresh_history_ui(self) -> None:
-        """Dim Undo and Redo when there is nothing behind them.
-
-        A permanently-enabled Undo that sometimes does nothing teaches the user
-        to distrust it; a dimmed one says so before they press it.
-        """
-        for tag, stack in (("top_undo", self._undo), ("top_redo", self._redo)):
-            if dpg.does_item_exist(tag):
-                dpg.configure_item(tag, enabled=bool(stack))
-
-    # ─── Dirty state and autosave ────────────────────────────────────
-
-    def _mark_dirty(self) -> None:
-        """Something changed. Schedule an autosave and update the chip."""
-        self._video_session.touch()
-        self._dirty = True
-        self._save_due = time.time() + _AUTOSAVE_DEBOUNCE
-        self._refresh_save_chip()
-
-    def _refresh_save_chip(self) -> None:
-        if not dpg.does_item_exist("top_saved"):
-            return
-        if self._dirty:
-            widgets.status_pill("top_saved", "Unsaved", "pending")
-        elif self._last_saved is not None:
-            widgets.status_pill("top_saved", "Saved", "ok")
-        else:
-            widgets.status_pill("top_saved", "No changes", "idle")
-
-    def _tick_autosave(self) -> None:
-        """Write at most once per quiet period (§38).
-
-        Debounced rather than per-edit: dragging a box across thirty frames is
-        thirty mutations and must be one write. Only fires when there is
-        somewhere to write to, because an autosave that opens a file dialog is
-        not an autosave.
-        """
-        self._autosave_workspace()
-
     def _pump_ui(self) -> None:
         """Run whatever the analysis thread queued, on the main thread.
 
@@ -4684,185 +3923,6 @@ class AnnotationApp(WorkspaceMixin):
         self._status(f"Accepted {n} {label} item{'s' if n != 1 else ''}.")
         self.inbox.refresh()
         self._render_timeline()
-
-    def open_review_mode(self) -> None:
-        if not self.review_mode.open(self._queue, fps=self.fps, num_frames=self.num_frames):
-            self._status(f"Nothing left to review. {self._queue.summary()}.")
-            return
-        self._render_review_canvas()
-        self._status("Review mode. Y accepts, N rejects, E edits, Esc leaves.")
-
-    def _on_review_decision(self, item, verdict: str) -> None:
-        self._render_review_canvas()
-        if verdict == "accept":
-            self._accept_item_candidates(item)
-        elif verdict == "reject":
-            self._reject_item_candidates(item)
-        self.inbox.refresh()
-        self._render_timeline()
-        self._mark_dirty()
-
-    def _on_review_edit(self, item) -> None:
-        self.jump_to_issue(item)
-        self._status("Edit this one, then press Review to carry on.")
-
-    def _on_review_swap(self, item, swapped: bool) -> None:
-        if swapped and len(item.track_ids) == 2:
-            a, b = item.track_ids
-            n = self.swap_tracks(a, b, from_frame=item.end)
-            self._status(
-                f"Swapped tracks {a} and {b} from frame {item.end} "
-                f"({n} boxes). Ctrl+Z takes it back."
-            )
-        else:
-            self._status("Left the identities as they were.")
-        self.inbox.refresh()
-        self._render_timeline()
-        self._mark_dirty()
-
-    def _on_review_exit(self) -> None:
-        self._refresh_sidebar()
-        self._refresh_inspector()
-        self._render_canvas()
-        self._render_timeline()
-
-    def swap_tracks(self, a: int, b: int, *, from_frame: int) -> int:
-        """Exchange two track ids from ``from_frame`` onward (§15).
-
-        One undo step for the whole sweep, because it is one decision: a user
-        who swaps and regrets it must not have to press Ctrl+Z three hundred
-        times.
-        """
-        # Snapshot every frame the sweep will touch, *before* touching any of
-        # them, so one Ctrl+Z takes back the whole swap rather than the one
-        # frame the user happens to be on.
-        touched = [
-            frame
-            for frame, objects in self.annotations.items()
-            if frame >= from_frame and any(o.track_id in (a, b) for o in objects)
-        ]
-        if not touched:
-            return 0
-        snapshot = self._snapshot(touched)
-
-        changed = 0
-        for frame in touched:
-            for obj in self.annotations.get(frame, []):
-                if obj.track_id in (a, b):
-                    obj.track_id = b if obj.track_id == a else a
-                    changed += 1
-        if changed:
-            self._push_undo(snapshot)
-            self._mark_dirty()
-            self._refresh_sidebar()
-            self._render_canvas()
-        return changed
-
-    # ─── Review Mode playback ────────────────────────────────────────
-
-    def _tick_review(self) -> None:
-        """Advance the review loop. Called once per rendered frame.
-
-        Seeks rather than caching the loop's frames: a 50-frame loop costs one
-        ``VideoCapture`` seek plus a decode per tick, which is single-digit
-        milliseconds here, while caching would hold 150 MB for a 1024x1024
-        video and still have to be invalidated on every item.
-        """
-        if not self.review_mode.active or self.cap is None:
-            return
-        if not self.review_mode.due(time.time(), self.fps):
-            return
-        nxt = self.review_mode.advance_loop(self.current_frame_idx)
-        if nxt != self.current_frame_idx:
-            self.goto_frame(nxt, light=True)
-        self._render_review_canvas()
-
-    def _render_review_canvas(self) -> None:
-        """Paint the current frame and its boxes into Review Mode's drawlist.
-
-        Review Mode owns the layout and the decision; the annotator owns the
-        pixels, because the texture, the scale and the box-drawing rules all
-        already live here and a second copy would drift from the canvas the
-        user corrects things on.
-        """
-        tag = self.review_mode.canvas_tag
-        if not dpg.does_item_exist(tag) or self._current_bgr is None:
-            return
-        dpg.delete_item(tag, children_only=True)
-
-        try:
-            width, height = dpg.get_item_rect_size(tag)
-        except (KeyError, SystemError, TypeError):
-            width, height = 900, 460
-        width = max(int(width), 200)
-        height = max(int(height), 160)
-
-        if self.frame_w <= 0 or self.frame_h <= 0:
-            return
-        scale = min(width / self.frame_w, height / self.frame_h)
-        off_x = (width - self.frame_w * scale) / 2
-        off_y = (height - self.frame_h * scale) / 2
-
-        if dpg.does_item_exist(self._frame_tex):
-            dpg.draw_image(
-                self._frame_tex,
-                pmin=(off_x, off_y),
-                pmax=(off_x + self.frame_w * scale, off_y + self.frame_h * scale),
-                parent=tag,
-            )
-
-        item = self.review_mode.item
-        focus = set(getattr(item, "track_ids", ()) or ())
-
-        def to_canvas(x: float, y: float) -> Tuple[float, float]:
-            return x * scale + off_x, y * scale + off_y
-
-        def draw(box_source, dashed: bool) -> None:
-            for obj in box_source:
-                track_id = int(getattr(obj, "track_id", -1))
-                # The tracks the item is about are drawn at full strength;
-                # everything else is dimmed, so the eye goes to the question
-                # rather than to whichever box happens to be brightest.
-                dim = bool(focus) and track_id not in focus
-                colour = theme.rgba(theme.track_color(track_id)[:3], 70 if dim else 255)
-                corners = obj.corners() if hasattr(obj, "corners") else _corners_of(obj)
-                points = [to_canvas(px, py) for px, py in corners]
-                dpg.draw_polygon(points, color=colour, thickness=1.0 if dim else 2.0, parent=tag)
-                if not dim and track_id >= 0:
-                    dpg.draw_text(
-                        (points[0][0], points[0][1] - 16),
-                        f"ID{track_id}",
-                        color=colour,
-                        size=15,
-                        parent=tag,
-                    )
-
-        draw(self.annotations.get(self.current_frame_idx, []), dashed=False)
-        draw([cand for _index, cand in self.candidates_here()], dashed=True)
-
-        # The playhead against the loop, drawn as a bar rather than a number:
-        # during a loop the useful information is "where in the loop am I",
-        # and a frame index does not answer that at a glance.
-        lo, hi = self.review_mode.loop
-        if hi > lo:
-            fraction = (self.current_frame_idx - lo) / max(1, hi - lo)
-            fraction = max(0.0, min(1.0, fraction))
-            dpg.draw_line(
-                (8, height - 6),
-                (width - 8, height - 6),
-                color=theme.rgba(theme.BORDER_SUBTLE),
-                thickness=3.0,
-                parent=tag,
-            )
-            dpg.draw_line(
-                (8, height - 6),
-                (8 + (width - 16) * fraction, height - 6),
-                color=theme.rgba(theme.ACCENT),
-                thickness=3.0,
-                parent=tag,
-            )
-
-    # ─── Accepting candidates in bulk (§18) ──────────────────────────
 
     def _accept_targets(self, targets: Sequence[Tuple[int, int]]) -> int:
         """Accept ``(frame, index)`` candidates into the saved annotations.

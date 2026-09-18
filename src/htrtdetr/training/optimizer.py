@@ -10,8 +10,7 @@ optimizer.py — Optimizer / Scheduler 生成
 
 from __future__ import annotations
 
-import math
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn

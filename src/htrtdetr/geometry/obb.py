@@ -393,8 +393,6 @@ def _convex_intersection_area(c1: torch.Tensor, c2: torch.Tensor) -> torch.Tenso
     無効な候補は「最初の有効点」で埋めると退化三角形になり面積 0 に寄与しないため、
     可変頂点数をマスクだけで扱える (分岐なしでベクトル化できる)。
     """
-    N, M = c1.shape[0], c1.shape[1]
-
     in1 = _points_in_box(c1, c2)                 # (N, M, 4)
     in2 = _points_in_box(c2, c1)                 # (N, M, 4)
     inter_pts, inter_valid = _edge_intersections(c1, c2)   # (N, M, 16, *)

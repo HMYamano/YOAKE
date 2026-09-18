@@ -27,6 +27,7 @@ Stage 4: Unified    (SceneSequenceDataset — full scene + visual)
 from __future__ import annotations
 
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -44,6 +45,7 @@ from ..config.config import HTRTDETRConfig
 from ..utils.misc import AverageMeter, save_checkpoint, load_checkpoint
 from .losses import DetectionLoss, ActionLoss, IDLoss, CombinedLoss
 from .matching import collect_matched_gt
+from .targets import BatchFrameTargets, last_frame_targets, move_targets_to_device
 
 try:
     from torch.amp import GradScaler, autocast
@@ -57,7 +59,19 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 class BaseTrainer:
-    """共通の学習ループ基底クラス"""
+    """共通の学習ループ基底クラス。
+
+    .. deprecated::
+       正式な学習経路は ``htrtdetr.training.Trainer`` (``yoake train stage=N``)。
+       この系統は ``scripts/train_stage{1..4}_{detector,action,id,unified}.py``
+       からのみ使われる互換経路で、インスタンス化時に ``DeprecationWarning`` を出す。
+       挙動は ``tests/test_pipeline_integration.py`` の
+       ``TestIntegrationE_OneStepPerStage`` で stage 1-4 とも固定してあるので、
+       「非推奨だから壊れていても気付かない」状態にはならない。
+    """
+
+    #: サブクラスが警告文で名乗る移行先 (``yoake train stage=N`` の N)
+    _stage_number: int = 0
 
     def __init__(
         self,
@@ -66,6 +80,13 @@ class BaseTrainer:
         device: torch.device,
         output_dir: Path,
     ):
+        warnings.warn(
+            f"{type(self).__name__} (stage_trainers.py) は非推奨です。"
+            f"正式な学習経路は 'yoake train stage={self._stage_number or '<1-4>'}' "
+            "(htrtdetr.training.Trainer) です。",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.cfg = cfg
         self.model = model
         self.device = device
@@ -167,9 +188,9 @@ class BaseTrainer:
             f"{mem_str}"
         )
         if train_parts:
-            print(f"  Train: " + "  ".join(train_parts))
+            print("  Train: " + "  ".join(train_parts))
         if val_parts:
-            print(f"  Val  : " + "  ".join(val_parts))
+            print("  Val  : " + "  ".join(val_parts))
         print()
 
     def _save(self, epoch: int, metric: float, tag: str = "last") -> None:
@@ -204,6 +225,8 @@ class Stage1Trainer(BaseTrainer):
     入力: 単フレーム画像
     損失: Hungarian matching + class focal + bbox L1 + GIoU
     """
+
+    _stage_number = 1
 
     def __init__(self, cfg, model, device, output_dir):
         super().__init__(cfg, model, device, output_dir)
@@ -329,6 +352,8 @@ class Stage2Trainer(BaseTrainer):
     損失: Focal cross-entropy (action classification)
     """
 
+    _stage_number = 2
+
     def __init__(self, cfg, model, device, output_dir):
         super().__init__(cfg, model, device, output_dir)
         self.loss_fn = ActionLoss(
@@ -424,7 +449,9 @@ class Stage2Trainer(BaseTrainer):
         pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [val  ]", total=len(loader))
         for batch in pbar:
             geo = batch["geo_features"].to(self.device)
-            gt_action = batch["action_labels"].to(self.device)
+            # collate_track_windows が出すキーは "action_ids"。"action_labels" は
+            # どの collate も作らないので、検証ループは必ず KeyError で落ちていた。
+            gt_action = batch["action_ids"].to(self.device)
 
             ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
@@ -451,12 +478,57 @@ class Stage3Trainer(BaseTrainer):
     Stage 3: Memory-based ID head の学習。
     入力: per-track T フレームの geometric features
     損失: ID classification (focal CE) + optional triplet metric loss
+
+    identity ラベルは ``TrackWindowDataset`` の ``identity_ids``
+    (= ``(video_id, track_id)`` をデータセット全体で一意化したもの) を使う。
+    動画内ローカルな ``local_track_ids`` を使うと、DataLoader が動画をまたいで
+    shuffle した時に「video A の track 0」と「video B の track 0」が同じクラス /
+    positive pair になり、別個体を同一 identity として学習してしまう。
     """
+
+    _stage_number = 3
 
     def __init__(self, cfg, model, device, output_dir):
         super().__init__(cfg, model, device, output_dir)
         max_ids = cfg.model.id_head.max_ids
         self.loss_fn = IDLoss(cfg.loss, max_ids=max_ids)
+        self.max_ids = max_ids
+
+    def _fit_id_classifier_to_dataset(self, loader: DataLoader) -> None:
+        """
+        identity クラス数が ``id_head.max_ids`` を超えていたら分類ヘッドを広げる。
+
+        ``IDLoss`` は ``max_ids`` 以上のラベルを "unknown" クラスへ畳むので、
+        超過分の教師信号は捨てられる。identity は ``(video_id, track_id)`` で
+        データセット全体に採番されるため、動画を足すたびに必要クラス数が増える —
+        黙って畳むと「学習は回るのに Stage 3 の精度が上がらない」になる。
+
+        ``resize_id_classifier`` は既知 ID の重みを保ったまま出力数だけ増やすので、
+        checkpoint を捨てずに済む。何をしたかは必ず表示する (モデルの形が
+        黙って変わるのは checkpoint 互換性の観点で驚きが大きい)。
+        """
+        n = getattr(getattr(loader, "dataset", None), "num_identities", None)
+        if n is None or n <= self.max_ids:
+            return
+
+        head = getattr(self.model, "id_head", None)
+        if head is None or not hasattr(head, "resize_id_classifier"):
+            print(
+                f"  [warn] identity クラス数 {n} が id_head.max_ids "
+                f"({self.max_ids}) を超えています。超過分は 1 つの unknown クラスへ "
+                "まとめられます。model.id_head.max_ids を増やしてください。"
+            )
+            return
+
+        print(
+            f"  identity クラス数 {n} > id_head.max_ids ({self.max_ids})。"
+            f"ID 分類ヘッドを {self.max_ids} → {n} クラスへ拡張します "
+            "(既知 ID の重みは保持)。"
+        )
+        head.resize_id_classifier(n)
+        head.to(self.device)
+        self.max_ids = n
+        self.loss_fn = IDLoss(self.cfg.loss, max_ids=n).to(self.device)
 
     def train(
         self,
@@ -467,6 +539,7 @@ class Stage3Trainer(BaseTrainer):
     ) -> None:
         self.resume(resume)
         self.model.set_stage(3)
+        self._fit_id_classifier_to_dataset(train_loader)
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         optimizer = self._make_optimizer(trainable)
         scheduler = self._make_scheduler(optimizer, num_epochs)
@@ -511,7 +584,7 @@ class Stage3Trainer(BaseTrainer):
         pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [train]", total=total)
         for step, batch in enumerate(pbar, 1):
             geo = batch["geo_features"].to(self.device)
-            gt_ids = batch["local_track_ids"].to(self.device)
+            gt_ids = _identity_labels(batch).to(self.device)
 
             ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
@@ -547,7 +620,7 @@ class Stage3Trainer(BaseTrainer):
         pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [val  ]", total=len(loader))
         for batch in pbar:
             geo = batch["geo_features"].to(self.device)
-            gt_ids = batch["local_track_ids"].to(self.device)
+            gt_ids = _identity_labels(batch).to(self.device)
 
             ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
@@ -577,6 +650,8 @@ class Stage4Trainer(BaseTrainer):
     入力: シーン全体の T フレームシーケンス (visual + geo features)
     損失: detection + action + ID + temporal smooth
     """
+
+    _stage_number = 4
 
     def __init__(self, cfg, model, device, output_dir):
         super().__init__(cfg, model, device, output_dir)
@@ -658,8 +733,12 @@ class Stage4Trainer(BaseTrainer):
         for step, batch in enumerate(pbar, 1):
             # SceneSequenceDataset バッチ
             images = batch["images"].to(self.device)     # (B, T, 3, H, W)
-            # last-frame targets (detection loss)
-            targets = _move_targets_to_device(batch["targets"], self.device)
+            # ``collate_scene_sequences`` は BatchSequenceTargets (B × T) を返す。
+            # モデルはシーケンスを入力に取り最終フレームについて予測するので、
+            # 損失が見る GT も最終フレームのものに揃える。
+            targets: BatchFrameTargets = last_frame_targets(
+                _move_targets_to_device(batch["targets"], self.device)
+            )
 
             ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
@@ -748,7 +827,9 @@ class Stage4Trainer(BaseTrainer):
         pbar = _make_pbar(loader, desc=f"Ep {epoch:3d}/{num_epochs} [val  ]", total=len(loader))
         for batch in pbar:
             images = batch["images"].to(self.device)
-            targets = _move_targets_to_device(batch["targets"], self.device)
+            targets: BatchFrameTargets = last_frame_targets(
+                _move_targets_to_device(batch["targets"], self.device)
+            )
 
             ctx = autocast("cuda") if self.use_amp else _null_ctx()
             with ctx:
@@ -799,18 +880,31 @@ def _make_pbar(loader, desc: str, total: int):
     return loader
 
 
+def _identity_labels(batch: Dict[str, Any]) -> torch.Tensor:
+    """
+    identity 学習に使うラベルを batch から取り出す。
+
+    新しい collate は dataset 全体で一意な ``identity_ids`` を出す。古い
+    checkpoint / 自作 collate から来た batch には無いことがあるので、その場合だけ
+    ``local_track_ids`` へ落とす (動画が 1 本なら両者は一致する)。
+    """
+    ids = batch.get("identity_ids")
+    if ids is None:
+        ids = batch["local_track_ids"]
+    return ids
+
+
 def _move_targets_to_device(targets, device):
-    """List[Dict[str, Tensor]] を指定デバイスに移動する"""
-    result = []
-    for t in targets:
-        moved = {}
-        for k, v in t.items():
-            if isinstance(v, torch.Tensor):
-                moved[k] = v.to(device)
-            else:
-                moved[k] = v
-        result.append(moved)
-    return result
+    """
+    targets を指定デバイスに移動する。
+
+    ``BatchFrameTargets`` (List[Dict]) と ``BatchSequenceTargets``
+    (List[List[Dict]]) の両方を受け付け、入れ子の深さを保って返す。
+    以前は List[Dict] だけを想定していたため、Stage 4 の
+    ``collate_scene_sequences`` 出力 (B × T) を渡すと
+    ``'list' object has no attribute 'items'`` で落ちていた。
+    """
+    return move_targets_to_device(targets, device)
 
 
 def _accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:

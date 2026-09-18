@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 
 from htrtdetr.annotation import batch, sampling
-from htrtdetr.annotation.features import FrameFeature, distance, farthest_point_order
+from htrtdetr.annotation.features import FrameFeature, farthest_point_order
 
 
 def unit(degrees: float) -> tuple[float, float]:

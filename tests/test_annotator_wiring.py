@@ -29,7 +29,7 @@ np = pytest.importorskip("numpy")
 from types import SimpleNamespace  # noqa: E402
 
 from htrtdetr import annotator as A  # noqa: E402
-from htrtdetr.gui import inspector as INS, shortcuts  # noqa: E402
+from htrtdetr.gui import shortcuts  # noqa: E402
 
 
 @pytest.fixture
@@ -196,7 +196,6 @@ def test_a_machine_box_carries_its_provenance_and_nothing_more():
 def test_the_cli_accepts_the_flags_the_analysis_page_passes():
     """``analysis_panel`` launches the annotator with these; before this work
     the parser rejected ``--import-predictions`` and the hand-off died."""
-    import argparse
     import inspect
     source = inspect.getsource(A.main)
     for flag in ("--import-predictions", "--video", "--load"):

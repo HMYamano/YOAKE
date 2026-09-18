@@ -33,14 +33,14 @@ Stage による動作の違い:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config.config import ModelConfig
-from .detector import RTDETRDetector, DetectionOutput, build_detector
+from .detector import DetectionOutput, build_detector
 from .temporal import HierarchicalTemporalModule
 from .id_head import MemoryIDHead, IdentityMemory
 from .action_head import ActionHead, InteractionFeatureComputer
@@ -53,7 +53,7 @@ from .fusion import (
 from .behavior import BehaviorBranch, BehaviorPrediction
 from ..geometry.obb import cxcywh_to_obb
 from ..tracking.assembly import FrameDetections, build_track_aligned_history
-from ..utils.misc import freeze_module, unfreeze_module, cxcywh_to_xyxy
+from ..utils.misc import freeze_module, unfreeze_module
 from ..data.feature_builder import GEO_FEAT_DIM
 
 
@@ -241,6 +241,7 @@ class HTRTDETR(nn.Module):
                 if cfg.detector.pose.enabled else 0,
                 explain_cfg=getattr(cfg, "explainability", None),
             )
+            assert behavior_cfg is not None  # この分岐に入る条件そのもの
             self.behavior_window = int(behavior_cfg.temporal_window)
         else:
             self.behavior_window = 16
@@ -433,7 +434,6 @@ class HTRTDETR(nn.Module):
         flat = self._flatten_detections(det_results, images.device)
         all_spatial_cat = flat["features"]
         all_boxes_cat = flat["boxes"]
-        batch_index = flat["batch_index"]
 
         if all_spatial_cat.shape[0] > 0:
             routed = self.feature_router(all_spatial_cat, per_det_temporal)
@@ -554,6 +554,7 @@ class HTRTDETR(nn.Module):
                     tids = list(track_ids_per_frame[b][t])
                 else:
                     # tracking は離散的な割当なので勾配は流さない (特徴側には流れる)
+                    assert tracker is not None  # track_ids_per_frame is None のとき必ず作る
                     tracked = tracker.update(
                         frame_index=t,
                         det_obb=obb.detach(),
@@ -719,7 +720,18 @@ class HTRTDETR(nn.Module):
         device: torch.device,
         B: int,
     ):
-        """ID head (学習: GT ベース / 推論: memory マッチング)。"""
+        """
+        ID head (学習: GT ベース / 推論: memory マッチング)。
+
+        学習分岐がゼロ hidden から GRU を回すのは**意図的**で、書き忘れではない。
+        この経路の時間的な文脈は ``self.temporal`` (HTM) が窓全体から作った
+        track-aligned な特徴として既に ``id_feat`` に入っている。GRU をここで
+        再帰させると同じ履歴を二重に積むことになり、窓ごとに独立という学習の
+        前提 (バッチ内のシーケンスは互いに独立) も崩れる。
+
+        フレーム間で持ち越す GRU memory が意味を持つのは推論時だけなので、
+        ``IdentityMemory`` を使うのは下の推論分岐 (``forward_inference``) に限る。
+        """
         if self.training:
             id_logits_list, id_emb_list = [], []
             ptr = 0
@@ -837,6 +849,11 @@ class HTRTDETR(nn.Module):
             bbox_proxy = geo_feats[:, -1, :4]           # (B, 4)
             vel_proxy  = geo_feats[:, -1, 5:7]          # (B, 2)
             id_in = self.id_head._build_input(id_feat, bbox_proxy, vel_proxy)
+            # ゼロ hidden は意図的。各サンプルは既に T フレームぶんの窓であり、
+            # その時間情報は self.temporal が last_feat に畳み込んでいる。ここで
+            # さらに GRU を再帰させると履歴を二重に数えることになるうえ、
+            # バッチ内のサンプルは別 track / 別動画なので引き継ぐ相手がいない。
+            # フレームをまたぐ GRU memory は推論時 (forward_inference) の話。
             h0 = torch.zeros(B, self.cfg.id_head.memory_dim, device=device)
             _, emb = self.id_head.memory_net(id_in, h0)
             logits = self.id_head.id_classifier(emb)

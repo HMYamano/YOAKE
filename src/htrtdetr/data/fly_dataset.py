@@ -18,13 +18,13 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .annotation import DatasetAnno, FrameAnno, ObjectAnno, load_annotation
+from .annotation import DatasetAnno, FrameAnno, ObjectAnno
 from .feature_builder import GeometricFeatureBuilder, FeatureBuilderConfig, GEO_FEAT_DIM
 
 
@@ -251,17 +251,34 @@ class TrackWindowDataset(Dataset):
     """
     per-track スライディングウィンドウ Dataset (Stage 2 / Stage 3)。
 
-    各サンプルは「1 個体 × T フレーム」のウィンドウ。
     - Stage 2: action 分類学習
     - Stage 3: ID 識別学習
+
+
+    === identity ラベルの意味 (重要) ===
+
+    3 つの ID を区別する:
+
+    ``track_id``
+        アノテーション由来の track ID。**動画内でのみ一意**。表示・保存・GUI 用。
+    ``local_track_id``
+        動画ごとに 0 から振り直した ID。後方互換のために残しているが、
+        **動画をまたぐと衝突する** (video A の track 0 と video B の track 0 が
+        どちらも 0 になる)。identity 学習のラベルに使ってはいけない。
+    ``identity_id``
+        ``(video_id, track_id)`` をデータセット全体で一意な整数へ写したもの。
+        **classification / metric learning (triplet 等) のラベルはこれを使う。**
+        local_track_id を使うと、別動画の別個体が同一クラス・positive pair として
+        学習され、ID head が「動画をまたいで同じ個体」と覚えてしまう。
 
     返り値 (1 サンプル):
         images:        (T, 3, H, W) float32 tensor
         geo_features:  (T, GEO_FEAT_DIM) float32 tensor
         boxes_seq:     (T, 4) float32 tensor — normalized [x1,y1,x2,y2]
         action_id:     int — majority action in window (-1 if unannotated)
-        track_id:      int — (global) track ID
+        track_id:      int — annotation track ID (video 内で一意)
         local_track_id: int — within-video remapped track ID [0, N_tracks)
+        identity_id:   int — dataset 全体で一意な学習用 identity クラス
         video_id:      str
         frame_indices: List[int]
     """
@@ -331,9 +348,21 @@ class TrackWindowDataset(Dataset):
         self._build_track_id_map()
 
     def _build_track_id_map(self) -> None:
-        """video_id ごとの track_id → local_id マッピングを構築"""
+        """
+        track_id の 2 種類のマッピングを構築する。
+
+        * ``track_local_id_map[video_id][track_id] -> local_id``
+          動画内で 0 始まり。表示・後方互換用 (**動画をまたぐと衝突する**)。
+        * ``global_identity_map[(video_id, track_id)] -> identity_id``
+          データセット全体で一意。identity 学習のラベルはこちらを使う。
+
+        どちらも ``samples`` の並び順に採番するので、同じ annotation からは
+        常に同じ ID が出る (checkpoint の classifier と対応が取れる)。
+        """
         # {video_id: {track_id: local_id}}
         self.track_local_id_map: Dict[str, Dict[int, int]] = {}
+        # {(video_id, track_id): identity_id}
+        self.global_identity_map: Dict[Tuple[str, int], int] = {}
         for s in self.samples:
             vid = s["video_id"]
             tid = s["track_id"]
@@ -342,6 +371,9 @@ class TrackWindowDataset(Dataset):
             if tid not in self.track_local_id_map[vid]:
                 n = len(self.track_local_id_map[vid])
                 self.track_local_id_map[vid][tid] = n
+            key = (vid, tid)
+            if key not in self.global_identity_map:
+                self.global_identity_map[key] = len(self.global_identity_map)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -349,7 +381,6 @@ class TrackWindowDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx]
         window = sample["window"]
-        T = len(window)
         W = sample["video_width"]
         H = sample["video_height"]
         H_tgt, W_tgt = self.image_size
@@ -396,10 +427,11 @@ class TrackWindowDataset(Dataset):
         else:
             action_id = -1
 
-        # Local track ID
+        # Local track ID (動画内、後方互換) と global identity (学習ラベル)
         vid = sample["video_id"]
         tid = sample["track_id"]
         local_id = self.track_local_id_map.get(vid, {}).get(tid, -1)
+        identity_id = self.global_identity_map.get((vid, tid), -1)
 
         return {
             "images": torch.stack(images, dim=0),                     # (T, 3, H, W)
@@ -408,14 +440,20 @@ class TrackWindowDataset(Dataset):
             "action_id": action_id,
             "track_id": tid,
             "local_track_id": local_id,
+            "identity_id": identity_id,
             "video_id": vid,
             "frame_indices": [fi for fi, _, _ in window],
         }
 
     @property
     def num_local_tracks(self) -> Dict[str, int]:
-        """ビデオごとの track 数 (ID 分類の class 数)"""
+        """ビデオごとの track 数 (動画内 ID の個数)"""
         return {vid: len(mapping) for vid, mapping in self.track_local_id_map.items()}
+
+    @property
+    def num_identities(self) -> int:
+        """データセット全体の identity クラス数 (ID 分類ヘッドの出力数の下限)。"""
+        return len(self.global_identity_map)
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +514,6 @@ class SceneSequenceDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         video, start = self.windows[idx]
         frames = video.frames[start:start + self.window_size]
-        T = len(frames)
         W = video.width or self.image_size[1]
         H = video.height or self.image_size[0]
         H_tgt, W_tgt = self.image_size
@@ -574,6 +611,10 @@ def collate_track_windows(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     TrackWindowDataset 用 collate_fn。
     各サンプルは 1 track × T frames なので images は stack できる。
+
+    ``identity_ids`` が identity 学習 (classification / triplet) 用のラベル。
+    ``local_track_ids`` は動画内 ID なので**動画をまたぐと衝突する**。
+    後方互換のため残すが、損失には使わないこと。
     """
     images = torch.stack([b["images"] for b in batch], dim=0)    # (B, T, 3, H, W)
     geo    = torch.stack([b["geo_features"] for b in batch], dim=0)  # (B, T, GEO_FEAT_DIM)
@@ -582,6 +623,9 @@ def collate_track_windows(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     action_ids = torch.tensor([b["action_id"] for b in batch], dtype=torch.long)  # (B,)
     track_ids  = torch.tensor([b["track_id"]  for b in batch], dtype=torch.long)  # (B,)
     local_ids  = torch.tensor([b["local_track_id"] for b in batch], dtype=torch.long)
+    identity_ids = torch.tensor(
+        [b.get("identity_id", b["local_track_id"]) for b in batch], dtype=torch.long
+    )
 
     meta = [{
         "video_id": b["video_id"],
@@ -595,6 +639,7 @@ def collate_track_windows(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "action_ids": action_ids,
         "track_ids": track_ids,
         "local_track_ids": local_ids,
+        "identity_ids": identity_ids,
         "meta": meta,
     }
 
@@ -610,7 +655,6 @@ def collate_scene_sequences(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     track_mask = torch.stack([b["track_mask"] for b in batch], dim=0)              # (B, max_tracks)
 
     # per-frame GT は可変長なので List[List[...]] のまま
-    B = len(batch)
     T = batch[0]["images"].shape[0]
     all_targets = []  # B × T
     for b in batch:

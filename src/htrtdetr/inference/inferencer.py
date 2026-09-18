@@ -21,15 +21,14 @@ from typing import Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
-from ..config.config import InferenceConfig, ModelConfig
+from ..config.config import InferenceConfig
 from ..models.ht_rtdetr import HTRTDETR
 from ..models.id_head import IdentityMemory
 from ..utils.misc import (
-    load_model_weights, get_device,
-    cxcywh_to_xyxy, Timer, GPUMemoryTracker
+    get_device,
+    cxcywh_to_xyxy, GPUMemoryTracker
 )
 from ..utils.logging import get_logger
 
@@ -286,7 +285,6 @@ class Inferencer:
               action_ids: (N,)
               action_probs: (N, num_actions)
         """
-        T = len(frame_buffer)
         # (1, T, 3, H, W)
         images = torch.cat(frame_buffer, dim=0).unsqueeze(0).to(self.device)
 
@@ -298,7 +296,6 @@ class Inferencer:
 
         # 結果を整形
         H_orig, W_orig = orig_size
-        H_proc, W_proc = images.shape[-2], images.shape[-1]
 
         det_results = output.det_results[0] if output.det_results else {}
 

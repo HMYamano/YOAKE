@@ -32,7 +32,7 @@ class UnknownBackendError(KeyError):
 def _validate_capabilities(cls: Type[StageBase]) -> None:
     """requires/provides のトークンが既知語彙かを検証 (未知はタイポ警告)。"""
     for kind in ("requires", "provides"):
-        tokens = getattr(cls, kind, frozenset())
+        tokens: frozenset = getattr(cls, kind, frozenset())
         unknown = set(tokens) - KNOWN_CAPABILITIES
         if unknown:
             warnings.warn(

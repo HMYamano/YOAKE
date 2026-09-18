@@ -172,7 +172,7 @@ class BatchDialog:
         self._gate()
 
     def _weights(self):
-        from ..annotator import _tk_open_file
+        from .file_dialogs import open_file as _tk_open_file
 
         path = _tk_open_file(
             "Detector checkpoint", [("Checkpoint", "*.pth *.pt"), ("All files", "*.*")]
@@ -182,7 +182,7 @@ class BatchDialog:
         self._gate()
 
     def _gate(self):
-        from ..annotator import _repo_root
+        from .sam_session import repo_root as _repo_root
 
         status = auto_label.check_backend(_repo_root(), dpg.get_value("batch_weights") or "")
         dpg.configure_item("batch_detect", enabled=status.ok)

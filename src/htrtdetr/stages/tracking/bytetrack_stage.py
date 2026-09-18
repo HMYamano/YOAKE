@@ -11,7 +11,7 @@ ctx.state にトラッカ状態を持ち回る。
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import List
 
 import numpy as np
 

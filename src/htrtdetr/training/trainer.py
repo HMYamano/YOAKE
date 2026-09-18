@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -35,10 +34,11 @@ from ..config.config import TrainConfig, LossConfig
 from ..models.ht_rtdetr import HTRTDETR
 from ..training.losses import CombinedLoss
 from ..training.metrics import select_best_metric, is_better, init_best_val
+from ..training.targets import BatchFrameTargets, last_frame_targets
 from ..training.optimizer import build_optimizer, build_scheduler
 from ..utils.misc import (
     set_seed, save_checkpoint, load_checkpoint,
-    AverageMeter, Timer, GPUMemoryTracker, move_batch_to_device,
+    AverageMeter, move_batch_to_device,
     ModelEMA,
 )
 from ..utils.logging import get_logger, MetricsLogger, WandbLogger
@@ -92,6 +92,14 @@ class Trainer:
         )
         self.criterion.set_stage(train_cfg.stage)
 
+        # ID 分類ヘッドの拡張は **EMA を作る前** に済ませる。ModelEMA は生成時の
+        # パラメータ形状を影コピーとして持つので、後から nn.Linear を差し替えると
+        # 更新時に shape mismatch で落ちる。
+        # logger はこの時点ではまだ無い (出力ディレクトリの準備が後) ので、
+        # 伝えたいことは溜めておいて logger ができ次第まとめて出す。
+        self._deferred_log: List[Tuple[str, str]] = []
+        self._fit_id_classifier_to_dataset(max_ids)
+
         # Optimizer & Scheduler
         from ..config.config import OptimizerConfig, SchedulerConfig
         opt_cfg = optimizer_cfg if optimizer_cfg is not None else OptimizerConfig()
@@ -142,6 +150,11 @@ class Trainer:
             train_cfg.output_dir, prefix="results"
         )
 
+        # logger ができる前に決めたこと (ID ヘッドの拡張など) をここで出す。
+        for level, message in self._deferred_log:
+            getattr(self.logger, level)(message)
+        self._deferred_log.clear()
+
         # args.yaml — ハイパーパラメータをテキストで記録
         import dataclasses, yaml as _yaml  # noqa: E401
         args_path = out / "args.yaml"
@@ -189,6 +202,47 @@ class Trainer:
         # resume
         if train_cfg.resume:
             self._resume(train_cfg.resume)
+
+    def _fit_id_classifier_to_dataset(self, max_ids: int) -> None:
+        """
+        dataset の identity 数が ``max_ids`` を超えるなら ID 分類ヘッドを広げる。
+
+        identity は ``(video_id, track_id)`` でデータセット全体に一意採番される
+        (動画をまたいで同じ個体だと誤学習しないため) ので、動画を足すたびに必要な
+        クラス数が増える。``IDLoss`` は超過分を "unknown" クラスへ畳むので、
+        放置すると教師信号が静かに捨てられ、Stage 3 の精度が伸びない理由が
+        分からなくなる。
+
+        ``resize_id_classifier`` は既知 ID の重みを保つので、checkpoint を
+        捨てずに拡張できる。何をしたかは必ずログに残す。
+        """
+        # ID ヘッドを学習しない stage では触らない。Stage 1 は detector だけを
+        # 学習するので、dataset が何個 identity を持っていようとヘッドの形を
+        # 変える理由がない (変えると checkpoint の互換性だけが壊れる)。
+        if self.cfg.stage not in (3, 4):
+            return
+        dataset = getattr(self.train_loader, "dataset", None)
+        n = getattr(dataset, "num_identities", None)
+        if n is None or n <= max_ids:
+            return
+
+        head = getattr(self.model, "id_head", None)
+        if head is None or not hasattr(head, "resize_id_classifier"):
+            self._deferred_log.append((
+                "warning",
+                f"identity クラス数 {n} が id_head.max_ids ({max_ids}) を"
+                "超えています。超過分は unknown クラスへまとめられます。",
+            ))
+            return
+
+        self._deferred_log.append((
+            "info",
+            f"identity クラス数 {n} > id_head.max_ids ({max_ids})。"
+            f"ID 分類ヘッドを {n} クラスへ拡張します (既知 ID の重みは保持)。",
+        ))
+        head.resize_id_classifier(n)
+        self.model = self.model.to(self.device)
+        self.criterion.id_loss.max_ids = n
 
     def _checkpoint_extra(self) -> Dict[str, Any]:
         import dataclasses
@@ -562,8 +616,7 @@ class Trainer:
             # メトリクス更新
             bs = batch["images"].shape[0] if "images" in batch else 1
             n_inst = sum(
-                len(t["boxes"]) for t in (batch["targets"] if isinstance(batch["targets"][0], dict)
-                                          else [t[-1] for t in batch["targets"]])
+                len(t["boxes"]) for t in last_frame_targets(batch["targets"])
             ) if "targets" in batch else 0
             meters["loss"].update(total_loss.item(), bs)
             for key in ("loss_detection", "loss_action", "loss_id"):
@@ -656,11 +709,7 @@ class Trainer:
                         last_targets = targets
                     else:
                         output = eval_model(images)
-                        last_targets = (
-                            [t[-1] for t in targets]
-                            if isinstance(targets[0], list)
-                            else targets
-                        )
+                        last_targets = last_frame_targets(targets)
                     loss_dict = self.criterion(output, last_targets, stage=stage)
 
             loss = loss_dict.get("total_loss", 0.0)
@@ -810,9 +859,7 @@ class Trainer:
         max_scan = 200  # 最大スキャンバッチ数 (速度優先)
 
         for batch in self.train_loader:
-            targets = batch.get("targets", [])
-            if targets and isinstance(targets[0], list):
-                targets = [t[-1] for t in targets]
+            targets = last_frame_targets(batch.get("targets", []))
             for tgt in targets:
                 aids = tgt.get("action_ids", None)
                 if aids is not None:
@@ -865,21 +912,20 @@ class Trainer:
 
         if stage == 1:
             # Single frame
-            images = batch["images"]        # (B, 3, H, W)
-            targets = batch["targets"]      # List[Dict]
+            images = batch["images"]                       # (B, 3, H, W)
+            targets: BatchFrameTargets = batch["targets"]  # List[FrameTargets]
             output = self.model.forward_single_frame(images)
             return self.criterion(output, targets, stage=1)
 
         else:
-            # Sequence
+            # Sequence: collate は BatchSequenceTargets (B × T) を返す
             images = batch["images"]        # (B, T, 3, H, W)
-            targets = batch["targets"]      # List[List[Dict]]
+            targets = batch["targets"]      # BatchSequenceTargets
 
             output = self.model(images)
 
-            # 最終フレームの targets を使う
-            last_targets = [t[-1] for t in targets] if isinstance(targets[0], list) else targets
-            return self.criterion(output, last_targets, stage=stage)
+            # モデルは最終フレームについて予測するので、GT も最終フレームに揃える
+            return self.criterion(output, last_frame_targets(targets), stage=stage)
 
     def _log_epoch(
         self,

@@ -2,6 +2,22 @@
 
 This guide covers environment setup, data preparation, and the four-stage training procedure for YOAKE. Each stage progressively increases model complexity, improving training stability compared to end-to-end training from scratch.
 
+> **Which command to run.** `yoake train stage=<1-4>` is the supported entry
+> point and uses `htrtdetr.training.Trainer`. The
+> `scripts/train_stage*_{detector,action,id,unified}.py` commands shown in the
+> examples below drive the older `stage_trainers.py` backend: they still work,
+> are covered by `tests/test_pipeline_integration.py`, and emit a
+> `DeprecationWarning` on use, but they will be removed. Translate the examples
+> as `train_anno=` → `data.train_root=`, `val_anno=` → `data.val_root=`,
+> `output_dir=` → `train.output_dir=`, `num_epochs=` → `train.max_epochs=`.
+
+> **Identity labels (Stage 3).** Identity classes are unique across the whole
+> dataset, keyed by `(video_id, track_id)`. Two different animals that happen to
+> share a track ID in two different videos are never trained as one identity.
+> Keep `model.id_head.max_ids` at or above the dataset's identity count; the
+> trainer warns when it is lower, because the surplus collapses into a single
+> "unknown" class.
+
 ---
 
 ## Table of Contents
@@ -65,11 +81,17 @@ cd /path/to/YOAKE
 pip install -e ".[all]"
 ```
 
-The `[all]` extra includes `matplotlib`, `opencv-python`, and `wandb`. For a minimal install (no visualization):
+The `[all]` extra is gui + ml + vis + wandb + concept. For training and
+inference without the GUI or experiment tracking:
 
 ```bash
-pip install -e .
+pip install -e ".[ml]"      # torch + torchvision + scipy
 ```
+
+> `pip install -e .` is the **torch-free base install** (annotation I/O and the
+> project layout only). It no longer brings PyTorch, so that `".[gui]"` can stay
+> torch-free for labelling machines. `yoake train` reports this and tells you
+> which extra to install rather than failing on a bare `ImportError`.
 
 ### Verify the installation
 

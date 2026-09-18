@@ -43,9 +43,8 @@ it holds no annotator state — everything it draws arrives in a
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
+from typing import (Any, Callable, Dict, List, Mapping, Optional,
                     Sequence, Set, Tuple)
 
 import dearpygui.dearpygui as dpg

@@ -55,7 +55,10 @@ def _frames_from_dir(path: Path, max_frames: Optional[int]) -> Iterator[FrameRes
             rgb = np.asarray(Image.open(q).convert("RGB"))
         except Exception:  # pragma: no cover
             import cv2
-            rgb = cv2.cvtColor(cv2.imread(str(q)), cv2.COLOR_BGR2RGB)
+            bgr = cv2.imread(str(q))
+            if bgr is None:
+                raise OSError(f"画像を読めません: {q}")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         yield FrameResult(frame_index=idx, image=rgb, width=w, height=h)
 

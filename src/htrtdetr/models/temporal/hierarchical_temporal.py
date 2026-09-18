@@ -18,7 +18,7 @@ Note: 実際の使用では各 detection query ごとに独立して適用する
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn

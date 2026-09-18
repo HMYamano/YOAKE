@@ -1,0 +1,149 @@
+# Modules that pass `mypy --ignore-missing-imports --follow-imports=silent`.
+# CI enforces exactly this list. Add a module here once it type-checks; never
+# remove one to make CI pass. Lines starting with # and blank lines are ignored.
+#
+# Covered: 105 of 142 modules.
+# Still unannotated (next steps, roughly in ascending difficulty):
+#   src/htrtdetr/annotation/features.py
+#   src/htrtdetr/annotation/intervals.py
+#   src/htrtdetr/annotation/quality.py
+#   src/htrtdetr/annotator.py
+#   src/htrtdetr/cli.py
+#   src/htrtdetr/data/annotation.py
+#   src/htrtdetr/data/dataset.py
+#   src/htrtdetr/data/feature_builder.py
+#   src/htrtdetr/data/fly_dataset.py
+#   src/htrtdetr/evaluation/advanced.py
+#   src/htrtdetr/gui/analysis_panel.py
+#   src/htrtdetr/gui/canvas.py
+#   src/htrtdetr/gui/click_segment.py
+#   src/htrtdetr/gui/hub.py
+#   src/htrtdetr/gui/sidecar.py
+#   src/htrtdetr/gui/theme.py
+#   src/htrtdetr/gui/video_segment.py
+#   src/htrtdetr/gui/widgets.py
+#   src/htrtdetr/gui/workspace.py
+#   src/htrtdetr/gui/workspace_operations.py
+#   src/htrtdetr/inference/inferencer.py
+#   src/htrtdetr/inference/streaming.py
+#   src/htrtdetr/models/behavior/evidence_head.py
+#   src/htrtdetr/models/behavior/roi.py
+#   src/htrtdetr/models/detector/rtdetr_wrapper.py
+#   src/htrtdetr/models/id_head/memory_id_head.py
+#   src/htrtdetr/models/temporal/hierarchical_temporal.py
+#   src/htrtdetr/project_cli.py
+#   src/htrtdetr/runners/val_runner.py
+#   src/htrtdetr/stages/detection/_common.py
+#   src/htrtdetr/stages/detection/rtdetr_stage.py
+#   src/htrtdetr/stages/interaction/learned_pair_stage.py
+#   src/htrtdetr/stages/tracking/memory_id_stage.py
+#   src/htrtdetr/training/optimizer.py
+#   src/htrtdetr/training/plots.py
+#   src/htrtdetr/training/stage_trainers.py
+#   src/htrtdetr/training/trainer.py
+#
+src/htrtdetr/__init__.py
+src/htrtdetr/analysis/__init__.py
+src/htrtdetr/analysis/analyzer.py
+src/htrtdetr/annotation/__init__.py
+src/htrtdetr/annotation/batch.py
+src/htrtdetr/annotation/cache.py
+src/htrtdetr/annotation/layout.py
+src/htrtdetr/annotation/objects.py
+src/htrtdetr/annotation/project.py
+src/htrtdetr/annotation/propagation.py
+src/htrtdetr/annotation/review_queue.py
+src/htrtdetr/annotation/sampling.py
+src/htrtdetr/annotation/session.py
+src/htrtdetr/annotation/status.py
+src/htrtdetr/annotation/storage.py
+src/htrtdetr/annotation/tracklet.py
+src/htrtdetr/config/__init__.py
+src/htrtdetr/config/ablation.py
+src/htrtdetr/config/config.py
+src/htrtdetr/data/__init__.py
+src/htrtdetr/data/collate.py
+src/htrtdetr/evaluation/__init__.py
+src/htrtdetr/evaluation/evaluator.py
+src/htrtdetr/geometry/__init__.py
+src/htrtdetr/geometry/obb.py
+src/htrtdetr/gui/__init__.py
+src/htrtdetr/gui/__main__.py
+src/htrtdetr/gui/auto_label.py
+src/htrtdetr/gui/batch_progress.py
+src/htrtdetr/gui/commands.py
+src/htrtdetr/gui/dialogs.py
+src/htrtdetr/gui/embedding.py
+src/htrtdetr/gui/inspector.py
+src/htrtdetr/gui/labeling_ops.py
+src/htrtdetr/gui/monitor.py
+src/htrtdetr/gui/onboarding.py
+src/htrtdetr/gui/predictions.py
+src/htrtdetr/gui/recents.py
+src/htrtdetr/gui/review.py
+src/htrtdetr/gui/runner.py
+src/htrtdetr/gui/settings.py
+src/htrtdetr/gui/shortcuts.py
+src/htrtdetr/gui/smart_annotate.py
+src/htrtdetr/gui/timeline.py
+src/htrtdetr/gui/training_panel.py
+src/htrtdetr/gui/video_browser.py
+src/htrtdetr/gui/video_source.py
+src/htrtdetr/gui/workspace_help.py
+src/htrtdetr/gui_cli.py
+src/htrtdetr/inference/__init__.py
+src/htrtdetr/models/__init__.py
+src/htrtdetr/models/action_head/__init__.py
+src/htrtdetr/models/action_head/action_head.py
+src/htrtdetr/models/behavior/__init__.py
+src/htrtdetr/models/behavior/branch.py
+src/htrtdetr/models/behavior/kinematics.py
+src/htrtdetr/models/detector/__init__.py
+src/htrtdetr/models/detector/base.py
+src/htrtdetr/models/fusion/__init__.py
+src/htrtdetr/models/fusion/fusion.py
+src/htrtdetr/models/ht_rtdetr.py
+src/htrtdetr/models/id_head/__init__.py
+src/htrtdetr/models/temporal/__init__.py
+src/htrtdetr/pipeline/__init__.py
+src/htrtdetr/pipeline/builder.py
+src/htrtdetr/pipeline/io.py
+src/htrtdetr/pipeline/registry.py
+src/htrtdetr/pipeline/resolver.py
+src/htrtdetr/pipeline/runner.py
+src/htrtdetr/pipeline/schema.py
+src/htrtdetr/pipeline/stage.py
+src/htrtdetr/runners/__init__.py
+src/htrtdetr/stages/__init__.py
+src/htrtdetr/stages/_geometry.py
+src/htrtdetr/stages/detection/__init__.py
+src/htrtdetr/stages/detection/fused_stage.py
+src/htrtdetr/stages/detection/yolo_stage.py
+src/htrtdetr/stages/interaction/__init__.py
+src/htrtdetr/stages/interaction/gnn_stage.py
+src/htrtdetr/stages/interaction/heuristic_stage.py
+src/htrtdetr/stages/interaction/pair_features.py
+src/htrtdetr/stages/motion/__init__.py
+src/htrtdetr/stages/motion/kinematic_stage.py
+src/htrtdetr/stages/pose/__init__.py
+src/htrtdetr/stages/pose/keypoint_stage.py
+src/htrtdetr/stages/relation/__init__.py
+src/htrtdetr/stages/relation/geometric_stage.py
+src/htrtdetr/stages/stabilization/__init__.py
+src/htrtdetr/stages/stabilization/temporal_nms_stage.py
+src/htrtdetr/stages/tracking/__init__.py
+src/htrtdetr/stages/tracking/bytetrack_stage.py
+src/htrtdetr/stages/tracking/obb_track_stage.py
+src/htrtdetr/tracking/__init__.py
+src/htrtdetr/tracking/assembly.py
+src/htrtdetr/tracking/associator.py
+src/htrtdetr/tracking/track_buffer.py
+src/htrtdetr/tracking/tracker.py
+src/htrtdetr/training/__init__.py
+src/htrtdetr/training/losses.py
+src/htrtdetr/training/matching.py
+src/htrtdetr/training/metrics.py
+src/htrtdetr/training/targets.py
+src/htrtdetr/utils/__init__.py
+src/htrtdetr/utils/logging.py
+src/htrtdetr/utils/misc.py

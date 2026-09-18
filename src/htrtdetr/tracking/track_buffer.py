@@ -161,14 +161,35 @@ class TrackState:
         return None
 
     def velocity(self) -> torch.Tensor:
-        """直近 2 観測から中心速度 [dx, dy] を推定する (観測 1 つ以下ならゼロ)。"""
-        _, obb, valid = self.history()
-        idx = valid.nonzero(as_tuple=True)[0]
-        if idx.numel() < 2:
-            return torch.zeros(2, device=self.device, dtype=self.dtype)
-        last, prev = idx[-1], idx[-2]
-        dt = max(int(last - prev), 1)
-        return (obb[last, :2] - obb[prev, :2]) / dt
+        """
+        直近 2 観測から中心速度 [dx, dy] を **1 フレームあたり**で推定する。
+
+        時間差はリングバッファ上の位置差ではなく ``_frames`` に記録した**実フレーム
+        番号**から取る。位置差を使うと、フレームを間引いて解析した場合 (frame 0 と
+        frame 10 を連続スロットに書いた場合) に dt=1 と誤り、速度が 10 倍になる。
+
+        次のいずれかに当たる場合はゼロを返す (誤った速度で association を歪めない):
+          * 有効な観測が 1 つ以下
+          * dt <= 0 (同一フレームの二重 push / フレーム番号の巻き戻り)
+        """
+        zero = torch.zeros(2, device=self.device, dtype=self.dtype)
+        # 新しい方から遡って有効な観測を 2 つ拾う (リングの巻き戻りに追従する)。
+        pos = (self._pos - 1) % self.window
+        found: List[int] = []
+        for _ in range(self._filled):
+            if bool(self._valid[pos]):
+                found.append(pos)
+                if len(found) == 2:
+                    break
+            pos = (pos - 1) % self.window
+        if len(found) < 2:
+            return zero
+
+        last, prev = found[0], found[1]
+        dt = int(self._frames[last]) - int(self._frames[prev])
+        if dt <= 0:
+            return zero
+        return (self._obb[last, :2] - self._obb[prev, :2]) / float(dt)
 
 
 class TrackFeatureCache:
@@ -263,11 +284,17 @@ class TrackFeatureCache:
         観測されなかった既存 track には自動で ``push_missing`` を入れるので、
         全 track のバッファが同じフレーム軸で揃う (下流で時間の整合を取る必要がない)。
 
+        **不変条件**: ``track_ids[i]`` / ``features[i]`` / ``obbs[i]`` は同じ検出 i を
+        指す。3 つの配列は必ず**同じ検出順**で渡すこと。呼び出し側が「マッチした
+        track を先に、新規 track を後に」のような処理順で track_ids を作ると、
+        別個体の特徴が track の履歴へ入り、tracking 表示は正しいのに時間モデル・
+        行動推定・identity が静かに汚染される。
+
         Args:
             frame_index: フレーム番号
-            track_ids: 各検出の track ID (長さ N)
-            features: (N, feat_dim)
-            obbs: (N, 5) [cx, cy, w, h, theta] 正規化座標
+            track_ids: 各検出の track ID (長さ N、検出 index 順)
+            features: (N, feat_dim) — 行 i が検出 i
+            obbs: (N, 5) [cx, cy, w, h, theta] 正規化座標 — 行 i が検出 i
         """
         ids = [int(t) for t in track_ids]
         if features.shape[0] != len(ids) or obbs.shape[0] != len(ids):
@@ -281,6 +308,14 @@ class TrackFeatureCache:
             )
 
         observed = set(ids)
+        if len(observed) != len(ids):
+            # 同一フレームに同じ track_id が 2 回来ると、その track だけ時間軸が
+            # 1 フレームぶん余分に進み、以後の履歴が他 track とずれる。
+            dup = sorted({t for t in ids if ids.count(t) > 1})
+            raise ValueError(
+                f"frame {frame_index} に重複した track_id {dup} があります "
+                "(1 フレームで 1 track に付く観測は高々 1 件)"
+            )
         for i, tid in enumerate(ids):
             state = self._tracks.get(tid)
             if state is None:
@@ -326,6 +361,7 @@ class TrackFeatureCache:
             ids:   長さ N の track_id リスト (feats の行に対応)
         """
         ids = track_ids if track_ids is not None else self.active_ids()
+        ids = [int(tid) for tid in ids if int(tid) in self._tracks]
         if not ids:
             empty = torch.zeros(0, self.window, self.feat_dim,
                                 device=self.device, dtype=self.dtype)

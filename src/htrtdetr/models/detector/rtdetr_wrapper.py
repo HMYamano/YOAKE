@@ -17,12 +17,12 @@ rtdetr_wrapper.py — RT-DETR 風 Detector 実装
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet18, resnet34, resnet50, ResNet18_Weights
+from torchvision.models import resnet18, ResNet18_Weights
 
 from .base import BaseDetector, DetectionOutput
 from ...config.config import DetectorConfig

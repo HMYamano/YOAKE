@@ -17,13 +17,12 @@ CPU / CUDA / MPS すべてで動き、勾配も流れる (学習時に backbone 
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...geometry.obb import obb_to_aabb, obb_to_context_aabb
+from ...geometry.obb import obb_to_context_aabb
 
 __all__ = ["RotatedROIExtractor", "ContextROIExtractor", "build_roi_affine"]
 

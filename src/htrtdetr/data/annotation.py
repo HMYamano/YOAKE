@@ -1135,7 +1135,7 @@ def print_annotation_stats(anno: DatasetAnno) -> None:
     total_frames = sum(len(v.frames) for v in anno.videos)
     total_objects = sum(len(fr.objects) for v in anno.videos for fr in v.frames)
 
-    print(f"=== Annotation Statistics ===")
+    print("=== Annotation Statistics ===")
     print(f"Videos:       {len(anno.videos)}")
     print(f"Frames:       {total_frames}")
     print(f"Objects:      {total_objects}")

@@ -10,9 +10,25 @@ streaming 推論の 1 フレーム分の流れ:
         ↓  TrackFeatureCache      track ごとのリングバッファへ push
     track_id 付き detections + track 履歴
 
-``MemoryIDHead`` (GRU メモリ) を置き換えるものではなく、**その外側の幾何的な追跡**
-を担う。GRU による appearance embedding を ``det_embed`` として渡せば両者は協調し、
-embedding を渡さなければ純粋な幾何追跡として単体で動く。
+=== 責務の分担 (ID assignment authority) ===
+
+``OnlineTracker`` が **final track ID の唯一の決定者**である。``MemoryIDHead`` は
+その外側ではなく内側 — appearance / identity embedding の生成器 — として働き、
+ID を決めない。streaming 推論の流れは:
+
+    detector → MemoryIDHead.embed()  (identity embedding, ID は決めない)
+             → OnlineTracker         (association → final track ID)
+             → MemoryIDHead.commit_memory()  (確定した ID で GRU memory を更新)
+
+``MemoryIDHead.forward_inference()`` は自前で ID を決めるが、それは tracker を
+持たない構成 (``HTRTDETR._run_id_head`` / ``memory_id_stage``) 専用の経路である。
+両方を同じフレームに適用して ID を二重に決めてはならない。
+
+=== 配列の不変条件 ===
+
+All per-detection arrays are aligned by original detection index:
+``det_obb[i]`` / ``det_features[i]`` / ``det_scores[i]`` / ``det_embed[i]`` と、
+このモジュールが組み立てる track_id 配列の要素 i は、常に同じ検出 i を指す。
 """
 
 from __future__ import annotations
@@ -22,7 +38,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .associator import OBBAssociator
+from .associator import OBBAssociator, _optimal_assignment
 from .track_buffer import TrackFeatureCache
 
 __all__ = ["OnlineTracker", "TrackedObject"]
@@ -30,7 +46,14 @@ __all__ = ["OnlineTracker", "TrackedObject"]
 
 @dataclass
 class TrackedObject:
-    """1 フレーム分の追跡結果 (検出 1 件に対応)。"""
+    """
+    1 フレーム分の追跡結果 (検出 1 件に対応)。
+
+    ``detection_index`` は ``OnlineTracker.update`` に渡した ``det_obb`` /
+    ``det_features`` / ``det_scores`` / ``det_embed`` の**行番号**である。
+    この対応は追跡器の出力全体を通じて保たれる不変条件で、下流 (特徴キャッシュ・
+    時間モデル・行動推定) が「どの行がどの個体か」を知る唯一の手がかりになる。
+    """
     detection_index: int
     track_id: int
     obb: torch.Tensor          # (5,) [cx, cy, w, h, theta]
@@ -108,15 +131,24 @@ class OnlineTracker:
         """
         1 フレーム分の検出を取り込み、track_id を割り当てる。
 
+        **不変条件**: 引数の per-detection 配列 (``det_obb`` / ``det_features`` /
+        ``det_scores`` / ``det_embed``) はすべて行 i が同じ検出 i を指す。
+        割り当てた track ID も ``track_ids_by_detection[i]`` という検出 index 順の
+        配列で持ち回り、そのままリングバッファへ渡す。
+        マッチ → re-ID → 新規という**処理順で ID を append すると、features /
+        obbs の行順とずれて別個体の履歴を混ぜてしまう**ので、処理順ではなく
+        検出 index で書き込むこと。
+
         Returns:
-            検出順に並んだ TrackedObject のリスト
+            検出 index の昇順に並んだ TrackedObject のリスト
         """
         D = int(det_obb.shape[0])
         if det_scores is None:
             det_scores = torch.ones(D, device=det_obb.device)
 
         results: List[Optional[TrackedObject]] = [None] * D
-        assigned_ids: List[int] = []
+        # 検出 index -> track_id。-1 は「まだ未割当」。
+        track_ids_by_detection: List[int] = [-1] * D
 
         active = self.cache.active_ids()
         unmatched = list(range(D))
@@ -141,7 +173,7 @@ class OnlineTracker:
                     obb=det_obb[di], score=float(det_scores[di]),
                     match_score=score,
                 )
-                assigned_ids.append(tid)
+                track_ids_by_detection[di] = tid
             unmatched = res.unmatched_detections
 
         # --- 2. 消失 track との再同定 ---
@@ -150,7 +182,7 @@ class OnlineTracker:
             if lost:
                 unmatched = self._try_reid(
                     unmatched, lost, det_obb, det_scores, det_embed,
-                    has_obb, results, assigned_ids,
+                    has_obb, results, track_ids_by_detection,
                 )
 
         # --- 3. 残りは新規 track ---
@@ -161,15 +193,29 @@ class OnlineTracker:
                 detection_index=di, track_id=tid,
                 obb=det_obb[di], score=float(det_scores[di]), is_new=True,
             )
-            assigned_ids.append(tid)
+            track_ids_by_detection[di] = tid
 
         # --- 4. リングバッファを更新 ---
+        # track_ids / features / obbs はいずれも検出 index 順なので、
+        # cache の行 i は常に同じ個体を指す。
+        if D and min(track_ids_by_detection) < 0:
+            missing = [i for i, t in enumerate(track_ids_by_detection) if t < 0]
+            raise RuntimeError(
+                f"検出 {missing} に track_id が割り当てられませんでした "
+                "(tracking failure を無言で捨てないための不変条件チェック)"
+            )
         self.cache.update(
             frame_index=frame_index,
-            track_ids=assigned_ids,
+            track_ids=track_ids_by_detection,
             features=det_features,
             obbs=det_obb,
         )
+        # Appearance memory has the same lifetime as its track, including when
+        # an empty frame expires the last re-identification candidate.
+        self._embeddings = {
+            tid: embedding for tid, embedding in self._embeddings.items()
+            if tid in self.cache
+        }
         if det_embed is not None:
             for obj in results:
                 if obj is not None:
@@ -213,7 +259,7 @@ class OnlineTracker:
         det_embed: Optional[torch.Tensor],
         has_obb: bool,
         results: List[Optional[TrackedObject]],
-        assigned_ids: List[int],
+        track_ids_by_detection: List[int],
     ) -> List[int]:
         """
         未マッチ検出を消失 track と照合して ID を復元する。
@@ -234,22 +280,28 @@ class OnlineTracker:
         cos = torch.mm(sub_embed, lost_embed.t())
         sim = (cos + 1.0) * 0.5                       # [0, 1]
 
-        still: List[int] = []
-        used_lost: set = set()
-        for k, di in enumerate(unmatched):
-            best = int(sim[k].argmax())
-            if float(sim[k, best]) >= self.reid_threshold and best not in used_lost:
-                tid = lost[best]
-                used_lost.add(best)
-                results[di] = TrackedObject(
-                    detection_index=di, track_id=tid,
-                    obb=det_obb[di], score=float(det_scores[di]),
-                    is_reid=True, match_score=float(sim[k, best]),
-                )
-                assigned_ids.append(tid)
-            else:
-                still.append(di)
-        return still
+        # Resolve competing candidates jointly. A row-wise argmax discards
+        # valid alternatives whenever an earlier detection claimed its best ID.
+        # Penalize invalid pairs before assignment so they cannot displace a
+        # valid match merely to improve the sum of similarities.
+        cost = (1.0 - sim).masked_fill(
+            sim < self.reid_threshold, float(min(sim.shape) + 1)
+        )
+        rows, cols = _optimal_assignment(cost)
+        matched = set()
+        for k, best in zip(rows, cols):
+            score = float(sim[k, best])
+            if score < self.reid_threshold:
+                continue
+            di, tid = unmatched[k], lost[best]
+            results[di] = TrackedObject(
+                detection_index=di, track_id=tid,
+                obb=det_obb[di], score=float(det_scores[di]),
+                is_reid=True, match_score=score,
+            )
+            track_ids_by_detection[di] = tid
+            matched.add(di)
+        return [di for di in unmatched if di not in matched]
 
     # ------------------------------------------------------------------ #
     # 読み出し

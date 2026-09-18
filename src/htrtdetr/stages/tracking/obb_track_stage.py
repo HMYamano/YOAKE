@@ -17,7 +17,7 @@ torch 非依存 (numpy のみ) なので、YOLO-OBB など外部検出器とも�
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import List
 
 import numpy as np
 

@@ -26,7 +26,7 @@ Purity: no dearpygui, no torch, no cv2, no numpy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from .quality import (

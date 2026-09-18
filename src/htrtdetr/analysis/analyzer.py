@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -96,7 +96,6 @@ class ActionTimelineVisualizer:
         fig, ax = plt.subplots(figsize=(max(12, len(list(track_timelines.values())[0]) / 5), n_tracks * 0.8 + 2))
 
         for row, (track_id, timeline) in enumerate(sorted(track_timelines.items())):
-            T = len(timeline)
             for t, action_id in enumerate(timeline):
                 if 0 <= action_id < len(self.action_names):
                     color = self.colors[action_id]
@@ -250,7 +249,7 @@ def plot_distribution(
     counts = [distribution[n] for n in names]
 
     fig, ax = plt.subplots(figsize=(max(6, len(names)), 4))
-    bars = ax.bar(range(len(names)), counts)
+    ax.bar(range(len(names)), counts)
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels(names, rotation=45, ha="right")
     ax.set_ylabel("Count")
@@ -407,7 +406,7 @@ class AblationResultManager:
             return
 
         # 表示するメトリクスを決める
-        all_keys = set()
+        all_keys: set = set()
         for m in self.results.values():
             all_keys.update(m.keys())
 

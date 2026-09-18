@@ -40,7 +40,7 @@ import json
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -214,7 +214,50 @@ class FrameAugmentation:
 
 
 # ---------------------------------------------------------------------------
-# 単フレーム Dataset (Stage 1: detection 学習用)
+# Identity labels
+# ---------------------------------------------------------------------------
+
+def build_global_identity_map(videos) -> Dict[Tuple[str, int], int]:
+    """
+    ``(video_id, track_id)`` → データセット全体で一意な identity クラス。
+
+    アノテーションの ``track_id`` は **動画内でのみ一意**である (仕様: 
+    docs/DATASET_FORMAT.md)。それをそのまま ID 分類のラベルに使うと、DataLoader が
+    動画をまたいで shuffle した瞬間に「video A の track 0」と「video B の track 0」
+    が同じクラスになり、別個体を同一 identity として学習してしまう。metric
+    learning では positive pair にすらなる。
+
+    表示・保存用の track_id は変えない。学習ラベルだけをここで分離する。
+
+    採番は ``videos`` の並び順に決まるので、同じ annotation からは常に同じ ID が
+    出る (checkpoint の classifier と対応が取れる)。
+    """
+    mapping: Dict[Tuple[str, int], int] = {}
+    for video in videos:
+        vid = getattr(video, "video_id", "")
+        for frame in getattr(video, "frames", []):
+            for obj in getattr(frame, "objects", []):
+                tid = int(getattr(obj, "track_id", -1))
+                if tid < 0:
+                    continue                      # 未追跡は identity を持たない
+                key = (vid, tid)
+                if key not in mapping:
+                    mapping[key] = len(mapping)
+    return mapping
+
+
+def identity_ids_for(frame, video_id: str, mapping) -> np.ndarray:
+    """1 フレーム分の identity ラベル (未追跡・未知は -1 = ignore)。"""
+    if not frame.objects:
+        return np.zeros(0, dtype=np.int64)
+    return np.array(
+        [mapping.get((video_id, int(o.track_id)), -1) for o in frame.objects],
+        dtype=np.int64,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 画像パスの検証
 # ---------------------------------------------------------------------------
 
 def validate_image_paths(
@@ -272,6 +315,10 @@ def validate_image_paths(
     return n_found, n_checked, missing
 
 
+# ---------------------------------------------------------------------------
+# 単フレーム Dataset (Stage 1: detection 学習用)
+# ---------------------------------------------------------------------------
+
 class SingleFrameDataset(Dataset):
     """
     1 フレームを 1 サンプルとして返す Dataset。
@@ -300,16 +347,26 @@ class SingleFrameDataset(Dataset):
         aug_cfg = augment_cfg or {}
         self.augmentation = FrameAugmentation(**aug_cfg) if augment else None
 
-        # 全フレームをフラットなリストに展開
+        # 全フレームをフラットなリストに展開。identity ラベルは
+        # (video_id, track_id) で決まるので、各フレームの出どころも覚えておく。
         self.samples: List[FrameAnnotation] = []
+        self._sample_video_ids: List[str] = []
         for video in videos:
             self.samples.extend(video.frames)
+            self._sample_video_ids.extend([video.video_id] * len(video.frames))
+        self.global_identity_map = build_global_identity_map(videos)
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    @property
+    def num_identities(self) -> int:
+        """データセット全体の identity クラス数。"""
+        return len(self.global_identity_map)
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         frame = self.samples[idx]
+        video_id = self._sample_video_ids[idx] if idx < len(self._sample_video_ids) else ""
         image_path = str(self.data_root / frame.image_path) if self.data_root.name else frame.image_path
 
         # 画像読み込み
@@ -337,6 +394,7 @@ class SingleFrameDataset(Dataset):
             if frame.objects else np.zeros(0, dtype=np.int64)
         action_ids = np.array([obj.action_id for obj in frame.objects], dtype=np.int64) \
             if frame.objects else np.zeros(0, dtype=np.int64)
+        identity_ids = identity_ids_for(frame, video_id, self.global_identity_map)
 
         # データ拡張
         if self.augmentation is not None:
@@ -363,7 +421,8 @@ class SingleFrameDataset(Dataset):
             "image": image_tensor,                    # (3, H, W)
             "boxes": torch.from_numpy(boxes_norm),    # (N, 4) [x1, y1, x2, y2] normalized
             "class_ids": torch.from_numpy(class_ids), # (N,)
-            "track_ids": torch.from_numpy(track_ids), # (N,)
+            "track_ids": torch.from_numpy(track_ids), # (N,) 動画内で一意 (表示・保存用)
+            "identity_ids": torch.from_numpy(identity_ids),  # (N,) dataset 全体で一意 (学習用)
             "action_ids": torch.from_numpy(action_ids),# (N,)
             "frame_index": frame.frame_index,
             "image_path": frame.image_path,
@@ -451,6 +510,8 @@ class SlidingWindowDataset(Dataset):
                     continue
                 self.windows.append((video, start))
 
+        self.global_identity_map = build_global_identity_map(videos)
+
         # 拡張時に一貫した flip を適用するためのフラグ (シーケンス内で統一)
         self._single_frame_ds = SingleFrameDataset.__new__(SingleFrameDataset)
         self._single_frame_ds.image_size = image_size
@@ -476,6 +537,11 @@ class SlidingWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.windows)
 
+    @property
+    def num_identities(self) -> int:
+        """データセット全体の identity クラス数 (ID 分類ヘッドの出力数の下限)。"""
+        return len(self.global_identity_map)
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         video, start = self.windows[idx]
         frames = video.frames[start:start + self.window_size]
@@ -490,6 +556,7 @@ class SlidingWindowDataset(Dataset):
         all_boxes = []
         all_class_ids = []
         all_track_ids = []
+        all_identity_ids = []
         all_action_ids = []
         frame_indices = []
 
@@ -517,6 +584,9 @@ class SlidingWindowDataset(Dataset):
                 if frame.objects else np.zeros(0, dtype=np.int64)
             action_ids = np.array([obj.action_id for obj in frame.objects], dtype=np.int64) \
                 if frame.objects else np.zeros(0, dtype=np.int64)
+            identity_ids = identity_ids_for(
+                frame, video.video_id, self.global_identity_map
+            )
 
             # 空間拡張を適用 (flip のみシーケンス全体で統一)
             h, w = image.shape[:2]
@@ -554,6 +624,7 @@ class SlidingWindowDataset(Dataset):
             all_boxes.append(torch.from_numpy(boxes_norm))
             all_class_ids.append(torch.from_numpy(class_ids))
             all_track_ids.append(torch.from_numpy(track_ids))
+            all_identity_ids.append(torch.from_numpy(identity_ids))
             all_action_ids.append(torch.from_numpy(action_ids))
             frame_indices.append(frame.frame_index)
 
@@ -561,7 +632,8 @@ class SlidingWindowDataset(Dataset):
             "images": torch.stack(images, dim=0),     # (T, 3, H, W)
             "boxes": all_boxes,                        # List[(N_t, 4)]
             "class_ids": all_class_ids,                # List[(N_t,)]
-            "track_ids": all_track_ids,                # List[(N_t,)]
+            "track_ids": all_track_ids,                # List[(N_t,)] 動画内で一意
+            "identity_ids": all_identity_ids,          # List[(N_t,)] dataset 全体で一意
             "action_ids": all_action_ids,              # List[(N_t,)]
             "frame_indices": frame_indices,            # List[int]
             "video_id": video.video_id,

@@ -19,14 +19,22 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+# Base: what every install needs, and nothing that pulls a CUDA wheel.
+#
+# torch / torchvision / scipy moved to the `ml` extra. The GUI, the annotation
+# I/O and the project layout are torch-free by design — `htrtdetr.gui` probes
+# for PyTorch at runtime and offers `pip install torch torchvision` when it is
+# absent, so "labelling machine without 2.5 GB of CUDA wheels" is a supported
+# configuration, not a broken one. Keeping torch here made that impossible to
+# express: even `pip install -e ".[gui]"` dragged the whole ML stack in.
+#
+# NOTE for existing users: `pip install -e .` no longer installs PyTorch.
+# Use `pip install -e ".[ml]"` for training/inference, or `".[all]"` for both.
 dependencies = [
-    "torch>=2.1.0",
-    "torchvision>=0.16.0",
-    "Pillow>=9.0.0",
     "numpy>=1.24.0",
+    "Pillow>=9.0.0",
     "pyyaml>=6.0",
     "tqdm>=4.65.0",
-    "scipy>=1.10.0",
 ]
 
 [project.scripts]
@@ -35,6 +43,20 @@ annotate = "htrtdetr.annotator:main"
 gui = "htrtdetr.gui:main"
 
 [project.optional-dependencies]
+# --- The three groups that matter ---------------------------------------
+#
+#   pip install -e .              base only (no PyTorch)
+#   pip install -e ".[gui]"       + labelling / training / analysis GUI
+#   pip install -e ".[ml]"        + training and inference
+#   pip install -e ".[all]"       everything that installs cleanly from PyPI
+#
+# Extras cannot reference other extras portably across the build backends this
+# repo has to work with, so `all` repeats their contents instead of composing
+# them. Keep the duplicates in step with the groups above.
+
+# Model training / inference. Separate from the GUI so a labelling machine is
+# not forced to download CUDA wheels.
+ml = ["torch>=2.1.0", "torchvision>=0.16.0", "scipy>=1.10.0"]
 annotate = ["opencv-python>=4.8.0", "dearpygui>=1.11.0"]
 gui = ["opencv-python>=4.8.0", "dearpygui>=1.11.0"]
 # Video propagation in the annotator: one prompt carried across a window.
@@ -61,9 +83,32 @@ sam2 = ["sam2>=1.1.0", "huggingface_hub>=0.23.0"]
 # half-installed trap here of the kind sam2 has.
 concept = ["transformers>=4.40.0"]
 vis = ["matplotlib>=3.7.0", "opencv-python>=4.8.0"]
-dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "black", "isort", "mypy"]
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "black", "isort", "mypy", "ruff"]
 wandb = ["wandb>=0.16.0"]
-all = ["matplotlib>=3.7.0", "opencv-python>=4.8.0", "wandb>=0.16.0", "transformers>=4.40.0"]
+
+# Everything that pip can install unattended = gui + ml + vis + wandb + concept.
+#
+# `sam2` is deliberately NOT here. It is not safely installable as an ordinary
+# PyPI dependency (it needs a matching torch already present, builds CUDA
+# extensions, and cannot reach a checkpoint without huggingface_hub), so
+# folding it into `all` would turn one bad wheel into a failed install of
+# everything. Install it explicitly with `pip install -e ".[sam2]"` into the
+# Python that runs tools/sam_sidecar.py — see the README.
+all = [
+    # gui
+    "opencv-python>=4.8.0",
+    "dearpygui>=1.11.0",
+    # ml
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "scipy>=1.10.0",
+    # vis
+    "matplotlib>=3.7.0",
+    # wandb
+    "wandb>=0.16.0",
+    # concept ("Find all in frame")
+    "transformers>=4.40.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -76,11 +121,50 @@ target-version = ["py310"]
 profile = "black"
 line_length = 100
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [".tmpbuild", "outputs", "runs", "weights", "convert"]
+
+[tool.ruff.lint]
+# The whole of pyflakes is enforced: undefined names, redefinitions, unused
+# imports and unused locals are all errors, and the tree is clean. Anything that
+# fails here is new, so a red CI means a real problem rather than a backlog.
+#
+# Not yet selected, and each its own future change because it rewrites code
+# rather than deleting dead lines:
+#   * UP  — typing modernisation (Dict -> dict, ~2900 sites)
+#   * I   — import sorting
+select = [
+    "E9",    # syntax / IO errors
+    "F",     # pyflakes (incl. F401 unused-import, F841 unused-variable)
+    "B0",    # bugbear: likely bugs
+    "PLE",   # pylint errors
+    "T100",  # forgotten breakpoint()
+]
+ignore = [
+    "B007",  # unused loop variable: style, and often clearer when named
+    "B008",  # function call in default arg: intentional in the GUI callbacks
+    "B009",  # getattr with a constant: style
+    # Late binding in a closure is a real bug class, but the only site that
+    # trips it (gui/auto_label._clip_poly) defines and calls the closure inside
+    # the same iteration, so there is nothing to bind late. Re-enable if that
+    # ever stops being the only hit.
+    "B023",
+    "PLE0605",  # false positive on `__all__ += [...]` in data/__init__.py
+]
+
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
+filterwarnings = [
+    # The legacy stage_trainers backend announces itself on every construction.
+    # tests/test_pipeline_integration.py asserts that it does; everywhere else
+    # the message is noise that hides real warnings.
+    "ignore:.*stage_trainers.py.*:DeprecationWarning",
+]
 markers = [
     "gui: opens a dearpygui window; deselect with -m 'not gui'",
     "live_model: loads a real model checkpoint (downloads on first run); deselect with -m 'not live_model'",

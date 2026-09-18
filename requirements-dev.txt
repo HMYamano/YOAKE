@@ -1,2 +1,11 @@
--e .
+# Development / test environment.
+#
+# The test suite exercises the model, the training loops and the GUI modules,
+# so it needs both the `ml` and `gui` extras. `pip install -e .` alone is the
+# torch-free base install and would skip every model test.
+-e .[ml,gui]
 pytest>=7.0.0
+
+# tests/test_repo_meta.py reads pyproject.toml. tomllib is stdlib from 3.11;
+# on 3.10 those checks would silently skip without this.
+tomli>=2.0.0; python_version < "3.11"

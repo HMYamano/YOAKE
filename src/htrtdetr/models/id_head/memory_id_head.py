@@ -1,25 +1,44 @@
 """
 memory_id_head.py — Memory-based ID Head
 
-設計方針:
-- 各個体の appearance / geometry / motion / action 情報を GRU memory に蓄積
-- 新しい detection query との類似度を cosine similarity で計算
-- 既存 ID の再同定 / 新規 ID の割り当てを行う
-- IoU-based assignment (Hungarian matching) と similarity matching を組み合わせる
-- 将来的に metric learning loss (triplet / contrastive) を追加しやすい構造
+=== 責務の分担 (ID subsystem 全体の地図) ===
 
-ID 割り当てアルゴリズム:
-1. 現フレームの detection feature から ID embedding を計算
+``Detector``
+    見え (appearance) の元になる query feature と bbox を出す。ID は持たない。
+``MemoryIDHead``
+    feature + geometry (+ motion) から **identity embedding** を作る。
+    加えて ``IdentityMemory`` を 1 フレーム進める。
+``IdentityMemory``
+    track ごとの GRU hidden / 最後の embedding / bbox / velocity / TTL を保持する。
+    hidden は次に同じ track を観測したときの GRU 初期状態として使われる。
+``OnlineTracker`` (``htrtdetr.tracking``)
+    幾何 + 外観で association を行い、**final track ID を決める**。
+
+**ID assignment authority は構成によって 1 つに決まる:**
+
+* ``OnlineTracker`` がある構成 (streaming 推論) — tracker が authority。
+  ID head は ``embed()`` で embedding を出し、``commit_memory()`` で
+  tracker が決めた ID の memory を更新するだけで、ID を決めない。
+* tracker が無い構成 (``HTRTDETR._run_id_head`` の推論分岐 /
+  ``stages/tracking/memory_id_stage``) — ``forward_inference()`` が
+  自前で Hungarian 割り当てを行い authority になる。
+
+同じフレームに両方を適用してはいけない (ID が二重に決まる)。
+
+=== ``forward_inference`` の ID 割り当てアルゴリズム ===
+
+1. detection feature から ID embedding を計算 (track 未確定なのでゼロ hidden)
 2. memory 内の各 ID の embedding との cosine similarity を計算
 3. IoU (bbox overlap) と similarity の組み合わせでコスト行列を構築
 4. Hungarian algorithm で最適割り当て
 5. threshold 以下の場合は新規 ID を割り当て
-6. unmatched な memory は TTL を減らし、0 になれば削除
+6. 確定した ID ごとに**前フレームの hidden** から GRU を回し直して memory へ書き戻す
+7. unmatched な memory は TTL を減らし、0 になれば削除 (hidden も失われる)
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -68,12 +87,23 @@ class IdentityMemory:
     1 動画シーケンスのすべての ID の memory を管理するクラス。
 
     各 ID に対して以下を保持:
-    - gru_hidden: GRU の hidden state (memory の実体)
-    - last_bbox: 最後に見た bbox [cx, cy, w, h]
-    - last_embedding: 最後の ID embedding
-    - velocity: フレーム間の移動速度 [dx, dy]
-    - ttl: あと何フレーム残っているか
-    - frame_count: 何フレーム観測されたか
+
+    ``gru_hidden``
+        GRU の hidden state (memory の実体)。**次にこの track を観測したときの
+        GRU 初期状態として使われる** — これが引き継がれないと、毎フレーム
+        ゼロから計算し直すだけの死んだ状態になる。
+    ``last_bbox``
+        最後に見た bbox [cx, cy, w, h]
+    ``last_embedding``
+        最後に memory を通して得た ID embedding。association の照合相手。
+    ``velocity``
+        フレーム間の移動速度 [dx, dy]
+    ``ttl``
+        あと何フレーム残っているか。観測されるたび ``memory_ttl`` に戻り、
+        観測されないフレームごとに 1 減る。0 になると track ごと破棄され、
+        hidden state も失われる (= 再出現時は新しい track として始まる)。
+    ``frame_count``
+        何フレーム観測されたか
     """
 
     def __init__(
@@ -93,6 +123,9 @@ class IdentityMemory:
         # track_id → state のマッピング
         self.tracks: Dict[int, Dict] = {}
         self._next_id = 0
+        # 外部 tracker の track ID → この memory の内部 ID。
+        # OnlineTracker が authority の構成 (commit_memory) でのみ使う。
+        self.external_id_map: Dict[int, int] = {}
 
     def get_active_ids(self, species_class: Optional[int] = None) -> List[int]:
         """TTL > 0 の active な ID リストを返す。
@@ -124,6 +157,37 @@ class IdentityMemory:
             return None
         hs = [self.tracks[tid]["gru_hidden"] for tid in ids]
         return torch.stack(hs, dim=0)  # (N, memory_dim)
+
+    def gather_previous_state(
+        self,
+        track_ids: List[int],
+        memory_dim: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        指定した track の**前フレームの** hidden state と velocity を集める。
+
+        これが GRU memory の引き継ぎ口。未知の track (新規 / 破棄済み) はゼロで
+        埋めるので、新規 track は「ゼロ hidden から始める」という自然な初期条件に
+        なる。
+
+        Args:
+            track_ids: 検出 index 順の track ID。-1 は「track 未確定」。
+        Returns:
+            hidden: (N, memory_dim) — 行 i が track_ids[i] の前フレーム hidden
+            velocity: (N, 2)
+        """
+        n = len(track_ids)
+        hidden = torch.zeros(n, memory_dim, device=device, dtype=dtype)
+        velocity = torch.zeros(n, 2, device=device, dtype=dtype)
+        for i, tid in enumerate(track_ids):
+            state = self.tracks.get(int(tid))
+            if state is None:
+                continue
+            hidden[i] = state["gru_hidden"].to(device=device, dtype=dtype)
+            velocity[i] = state["velocity"].to(device=device, dtype=dtype)
+        return hidden, velocity
 
     def update_track(
         self,
@@ -189,6 +253,7 @@ class IdentityMemory:
     def reset(self) -> None:
         """メモリをリセットする (新しいシーケンス開始時)"""
         self.tracks.clear()
+        self.external_id_map.clear()
         self._next_id = 0
 
 
@@ -418,6 +483,99 @@ class MemoryIDHead(nn.Module):
         }
 
     @torch.no_grad()
+    def embed(
+        self,
+        features: torch.Tensor,   # (N, feature_dim)
+        bboxes: torch.Tensor,     # (N, 4) [cx, cy, w, h]
+    ) -> torch.Tensor:
+        """
+        association 用の **identity embedding だけ** を計算する (ID は決めない)。
+
+        ``OnlineTracker`` が final track ID の authority である構成 (streaming 推論)
+        で使う入口。track がまだ決まっていない段階なので GRU は履歴を持てず、
+        ここでの embedding は純粋に feed-forward な「見え」の表現になる。
+        時間方向の memory は、ID が確定したあとに ``commit_memory`` で更新する。
+
+        Returns:
+            (N, embedding_dim) — L2 正規化済み。行 i は検出 i。
+        """
+        n = features.shape[0]
+        device = features.device
+        if n == 0:
+            return torch.zeros(0, self.cfg.embedding_dim, device=device)
+        x = self._build_input(
+            features, bboxes,
+            torch.zeros(n, 2, device=device, dtype=features.dtype),
+        )
+        h0 = torch.zeros(n, self.cfg.memory_dim, device=device, dtype=features.dtype)
+        _, embeddings = self.memory_net(x, h0)
+        return embeddings
+
+    @torch.no_grad()
+    def commit_memory(
+        self,
+        memory: IdentityMemory,
+        track_ids: Sequence[int],  # (N,) 検出 index 順の確定 track ID
+        features: torch.Tensor,    # (N, feature_dim)
+        bboxes: torch.Tensor,      # (N, 4) [cx, cy, w, h]
+        species_classes: Optional[Sequence[int]] = None,
+    ) -> Dict[int, int]:
+        """
+        外部 (OnlineTracker) が決めた track ID で GRU memory を 1 フレーム進める。
+
+        各 track の**前フレームの hidden state** を初期状態として GRU を回し、
+        得られた新しい hidden を書き戻す。これにより hidden は「保存されるだけの
+        死んだ状態」ではなく、次フレームの計算に実際に効く履歴になる。
+
+        ``OnlineTracker`` の track ID 空間と ``IdentityMemory`` の内部 ID 空間は
+        別物なので、対応表 (tracker ID → memory ID) を保持して読み替える。
+
+        Args:
+            track_ids: 検出 index 順。行 i は ``features[i]`` / ``bboxes[i]``。
+                       -1 (未確定) は無視する。
+        Returns:
+            tracker ID → memory ID の対応 (この呼び出しで触れたものだけ)
+        """
+        n = features.shape[0]
+        if n == 0 or len(track_ids) == 0:
+            memory.decrement_ttl([])
+            memory.remove_dead_tracks()
+            return {}
+
+        link: Dict[int, int] = memory.external_id_map
+
+        # 既知 track は memory ID へ、未知 track は -1 (= 新規) に。
+        mem_ids = [link.get(int(t), -1) if int(t) >= 0 else -1 for t in track_ids]
+        hidden, velocities = memory.gather_previous_state(
+            mem_ids, self.cfg.memory_dim, features.device, features.dtype
+        )
+        x = self._build_input(features, bboxes, velocities)
+        new_hidden, embeddings = self.memory_net(x, hidden)
+
+        touched: List[int] = []
+        for i, ext in enumerate(int(t) for t in track_ids):
+            if ext < 0:
+                continue
+            mid = mem_ids[i]
+            if mid >= 0 and mid in memory.tracks:
+                memory.update_track(mid, embeddings[i], bboxes[i], new_hidden[i])
+            else:
+                sp = int(species_classes[i]) if species_classes is not None else 0
+                mid = memory.add_new_track(
+                    embeddings[i], bboxes[i], new_hidden[i], species_class=sp
+                )
+                link[ext] = mid
+            touched.append(mid)
+
+        memory.decrement_ttl(touched)
+        dead = {tid for tid, s in memory.tracks.items() if s["ttl"] <= 0}
+        memory.remove_dead_tracks()
+        if dead:
+            for ext in [e for e, m in link.items() if m in dead]:
+                del link[ext]
+        return {int(t): mem_ids[i] for i, t in enumerate(track_ids) if int(t) >= 0}
+
+    @torch.no_grad()
     def forward_inference(
         self,
         features: torch.Tensor,                      # (N, feature_dim)
@@ -426,8 +584,23 @@ class MemoryIDHead(nn.Module):
         species_classes: Optional[torch.Tensor] = None,  # (N,) int, 種クラスID
     ) -> Dict[str, torch.Tensor]:
         """
-        推論時の forward。
+        推論時の forward (ID head 自身が ID を決める経路)。
         memory と照合して track_id を割り当て、memory を更新する。
+
+        ``OnlineTracker`` を併用する構成では**こちらを使ってはいけない**
+        (ID を二重に決めることになる)。その場合は ``embed`` + ``commit_memory``
+        を使い、final track ID は tracker に委ねる。
+
+        === GRU memory の流れ ===
+
+        1. association 用の embedding を**ゼロ hidden から** feed-forward で作る。
+           どの track かはまだ分からないので、履歴を混ぜようがない。
+        2. memory の ``last_embedding`` と照合して track を決める。
+        3. 決まった track の**前フレームの hidden** を初期状態に GRU を回し直し、
+           新しい hidden と embedding を memory へ書き戻す。
+
+        3 が無いと hidden は毎フレームゼロから始まり、保存した値が二度と読まれない
+        (= memory が名ばかりになる)。
 
         species_classes が指定され use_species_separated_pools=True の場合、
         同種の memory のみとマッチングを行う（異種間の ID 混同を防ぐ）。
@@ -437,25 +610,30 @@ class MemoryIDHead(nn.Module):
         Returns:
             track_ids: (N,) 割り当てた track ID
             id_scores: (N,) 最高 similarity スコア
-            embeddings: (N, embedding_dim)
+            embeddings: (N, embedding_dim) — association に使った embedding
         """
         N = features.shape[0]
         device = features.device
 
         if N == 0:
+            # 検出ゼロのフレームでも時間は進む。ここで TTL を落とさないと、
+            # 個体が画面から消えたまま memory が永久に残り、ずっと後の別個体に
+            # 古い identity が復元されてしまう。
+            memory.decrement_ttl([])
+            memory.remove_dead_tracks()
             return {
                 "track_ids": torch.zeros(0, dtype=torch.long, device=device),
                 "id_scores": torch.zeros(0, device=device),
                 "embeddings": torch.zeros(0, self.cfg.embedding_dim, device=device),
             }
 
-        # velocity はゼロ初期化（memory から取得する拡張は forward_train と共通化可能）
-        velocities = torch.zeros(N, 2, device=device)
+        # --- 1. association 用の embedding (track 未確定なのでゼロ hidden) ---
+        velocities = torch.zeros(N, 2, device=device, dtype=features.dtype)
         x = self._build_input(features, bboxes, velocities)
-        hidden_states = torch.zeros(N, self.cfg.memory_dim, device=device)
-
-        # GRU で embedding を計算
-        new_hidden, embeddings = self.memory_net(x, hidden_states)
+        hidden_states = torch.zeros(
+            N, self.cfg.memory_dim, device=device, dtype=features.dtype
+        )
+        _, embeddings = self.memory_net(x, hidden_states)
 
         track_ids = torch.full((N,), -1, dtype=torch.long, device=device)
         id_scores = torch.zeros(N, device=device)
@@ -508,13 +686,24 @@ class MemoryIDHead(nn.Module):
                         track_ids[det_i] = active_ids[mem_j]
                         id_scores[det_i] = sim[det_i, mem_j]
 
+        # --- 3. memory を 1 フレーム進める ---
+        # ここで初めて「どの検出がどの track か」が分かるので、その track の
+        # 前フレーム hidden を初期状態にして GRU を回し直す。これが memory の
+        # 引き継ぎ本体で、書き戻した hidden は次フレームのこの処理で読まれる。
+        assigned = [int(t) for t in track_ids.tolist()]
+        prev_hidden, prev_vel = memory.gather_previous_state(
+            assigned, self.cfg.memory_dim, device, features.dtype
+        )
+        x_mem = self._build_input(features, bboxes, prev_vel)
+        new_hidden, mem_embeddings = self.memory_net(x_mem, prev_hidden)
+
         # 未割り当ての detection に新規 ID を割り当て
         matched_ids = []
         for i in range(N):
             sp_class = int(species_classes[i].item()) if species_classes is not None else 0
             if track_ids[i].item() == -1:
                 new_id = memory.add_new_track(
-                    embeddings[i], bboxes[i], new_hidden[i],
+                    mem_embeddings[i], bboxes[i], new_hidden[i],
                     species_class=sp_class,
                 )
                 track_ids[i] = new_id
@@ -523,7 +712,7 @@ class MemoryIDHead(nn.Module):
             else:
                 tid = track_ids[i].item()
                 matched_ids.append(tid)
-                memory.update_track(tid, embeddings[i], bboxes[i], new_hidden[i])
+                memory.update_track(tid, mem_embeddings[i], bboxes[i], new_hidden[i])
 
         # TTL 更新
         memory.decrement_ttl(matched_ids)
@@ -564,6 +753,49 @@ class MemoryIDHead(nn.Module):
                 result[r] = (r, -1)  # 新規 ID
 
         return [(r, c) for r, (r, c) in enumerate(result)]
+
+    def resize_id_classifier(self, max_ids: int) -> None:
+        """
+        ID 分類ヘッドの出力数を ``max_ids + 1`` に張り替える (既存の重みは保持)。
+
+        identity は ``(video_id, track_id)`` でデータセット全体に採番されるので、
+        動画を足すたびに必要なクラス数が増える。``max_ids`` を超えた identity は
+        ``IDLoss`` で "unknown" クラス (index ``max_ids``) へ畳まれ、その教師信号は
+        捨てられる — 学習は進むのに精度が上がらない、という分かりにくい形になる。
+
+        ここで拡張すれば、**学習済みの既知 ID の重みを保ったまま**クラス数だけ
+        増やせる (checkpoint を捨てて最初からやり直す必要がない):
+
+        * 既存クラスの行はそのままコピーする
+        * 増えた行は新しく初期化する
+        * "unknown" 行は常に末尾なので、旧 ``max_ids`` 行目から新しい末尾へ移す
+
+        縮小もできるが、範囲外になった ID の重みは失われる。
+
+        Args:
+            max_ids: 新しい既知 ID 数 (出力次元は ``max_ids + 1``)
+        """
+        max_ids = int(max_ids)
+        if max_ids < 1:
+            raise ValueError(f"max_ids must be >= 1, got {max_ids}")
+        old = self.id_classifier
+        old_max = old.out_features - 1
+        if max_ids == old_max:
+            return
+
+        new = nn.Linear(self.cfg.embedding_dim, max_ids + 1).to(
+            device=old.weight.device, dtype=old.weight.dtype
+        )
+        keep = min(old_max, max_ids)
+        with torch.no_grad():
+            new.weight[:keep] = old.weight[:keep]
+            new.bias[:keep] = old.bias[:keep]
+            # "unknown" は常に末尾行。旧末尾 (old_max) から新末尾へ移す。
+            new.weight[max_ids] = old.weight[old_max]
+            new.bias[max_ids] = old.bias[old_max]
+
+        self.id_classifier = new
+        self.cfg.max_ids = max_ids
 
     def create_memory(self, device: torch.device) -> IdentityMemory:
         """新しい IdentityMemory を生成するファクトリメソッド"""

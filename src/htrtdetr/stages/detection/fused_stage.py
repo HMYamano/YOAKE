@@ -78,6 +78,7 @@ class FusedHTRTDETRStage(StageBase):
             if len(buffer) > ws:
                 buffer.pop(0)
             images = torch.cat(buffer, dim=0).unsqueeze(0).to(self._device)  # (1,T,3,H,W)
+            assert model is not None  # setup() で必ず作られる
             with inference_ctx(self._device):
                 out = model(images, memory_list=[self._memory])
             det = out.det_results[0] if out.det_results else {}

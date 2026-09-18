@@ -42,9 +42,8 @@ lives (P1).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
-                    Sequence, Tuple)
+from typing import (Any, Callable, Optional,
+                    Tuple)
 
 import dearpygui.dearpygui as dpg
 

@@ -612,7 +612,7 @@ class WorkspaceOperations:
         return result
 
     def start_project_batch(self, scope, options):
-        from ..annotator import _repo_root
+        from .sam_session import repo_root as _repo_root
 
         thread = getattr(self, "_batch_thread", None)
         if thread is not None and thread.is_alive():
@@ -938,7 +938,7 @@ class WorkspaceOperations:
         import dearpygui.dearpygui as dpg
 
         from ..annotation.project import scan_folder
-        from ..annotator import _tk_ask_dir
+        from .file_dialogs import ask_dir as _tk_ask_dir
 
         folder = _tk_ask_dir("Project videos folder")
         if folder is not None:

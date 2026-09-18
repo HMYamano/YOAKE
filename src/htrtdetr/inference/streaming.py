@@ -35,16 +35,14 @@ from __future__ import annotations
 import contextlib
 import json
 import time
-from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from ..config.config import InferenceConfig
-from ..geometry.obb import cxcywh_to_obb, obb_to_aabb, obb_to_corners
+from ..geometry.obb import cxcywh_to_obb, obb_to_corners
 from ..models.ht_rtdetr import HTRTDETR
 from ..tracking import OnlineTracker
 from ..utils.logging import get_logger
@@ -311,7 +309,13 @@ class StreamingInferencer:
         boxes = dets["boxes"].float()
         n = int(boxes.shape[0])
         if n == 0:
-            self.tracker.cache.update(fi, [], feats, torch.zeros(0, 5, device=self.device))
+            self.tracker.update(fi, torch.zeros(0, 5, device=self.device), feats)
+            # 検出ゼロでも時間は進む。ID memory の TTL を落とさないと、画面から
+            # 消えた個体の memory が残り続け、ずっと後の別個体へ古い identity が
+            # 復元されうる。
+            self.model.id_head.commit_memory(
+                self.memory, [], feats, torch.zeros(0, 4, device=self.device)
+            )
             self.latency.add("total", time.perf_counter() - t_start)
             self.latency.finish_frame()
             return StreamingResult(fi, np.zeros((0, 4), dtype=np.float32))
@@ -319,10 +323,12 @@ class StreamingInferencer:
         has_obb = "obb" in dets
         obb = dets["obb"].float() if has_obb else cxcywh_to_obb(boxes)
 
-        # --- Tracking (ring buffer への push も含む) ---
+        # --- Tracking ---
+        # ID assignment authority は OnlineTracker。ID head は identity embedding を
+        # 作るだけで ID を決めない (以前は forward_inference が独自に ID を採番し、
+        # その結果を捨てたうえで GRU memory だけを自前の ID 空間で更新していた)。
         with self.latency.measure("tracking"):
-            id_out = self.model.id_head.forward_inference(feats, boxes, self.memory)
-            embeddings = id_out["embeddings"].float()
+            embeddings = self.model.id_head.embed(feats, boxes).float()
             tracked = self.tracker.update(
                 frame_index=fi,
                 det_obb=obb,
@@ -332,9 +338,15 @@ class StreamingInferencer:
                 has_obb=has_obb,
             )
 
-        track_ids = np.full(n, -1, dtype=int)
-        for obj in tracked:
-            track_ids[obj.detection_index] = obj.track_id
+            track_ids = np.full(n, -1, dtype=int)
+            for obj in tracked:
+                track_ids[obj.detection_index] = obj.track_id
+
+            # tracker が決めた ID で GRU memory を 1 フレーム進める。
+            # これで hidden state が同じ個体の次フレームへ引き継がれる。
+            self.model.id_head.commit_memory(
+                self.memory, [int(t) for t in track_ids], feats, boxes,
+            )
 
         # --- Temporal: ring buffer の履歴を HTM に通す (再検出なし) ---
         with self.latency.measure("temporal"):
@@ -352,7 +364,8 @@ class StreamingInferencer:
         # --- Behavior ---
         with self.latency.measure("behavior"):
             action_ids, action_probs, evidence, gates, heads, ctx_boxes = self._run_behavior(
-                obb_hist, mask, det_out, temporal_last, hist, active_ids, track_ids, n
+                obb_hist, mask, det_out, temporal_last, hist, active_ids, track_ids, n,
+                det_keypoints=dets.get("keypoints"),
             )
 
         # --- 画素座標へ戻す ---
@@ -391,6 +404,7 @@ class StreamingInferencer:
     def _run_behavior(
         self, obb_hist, mask, det_out, temporal_last, hist, active_ids,
         track_ids: np.ndarray, n: int,
+        det_keypoints: Optional[torch.Tensor] = None,
     ):
         """行動認識を track 単位で走らせ、検出順に並べ直す。"""
         empty = (np.full(n, -1, dtype=int), None, [], [], [], None)
@@ -405,6 +419,18 @@ class StreamingInferencer:
         batch_index = torch.zeros(
             obb_hist.shape[0], dtype=torch.long, device=self.device
         )
+        row_of = {tid: i for i, tid in enumerate(active_ids)}
+        keypoints = None
+        if cfg_b.use_pose and det_keypoints is not None:
+            # Detector output is in detection order; behavior consumes track
+            # history order. Missing tracks have no visible keypoints.
+            keypoints = det_keypoints.new_zeros(
+                (len(active_ids), *det_keypoints.shape[1:]), dtype=torch.float32
+            )
+            for i, tid in enumerate(track_ids):
+                row = row_of.get(int(tid))
+                if row is not None:
+                    keypoints[row] = det_keypoints[i].float()
         with self._autocast():
             pred = self.model.behavior(
                 obb_history=obb_hist,
@@ -413,9 +439,9 @@ class StreamingInferencer:
                 batch_index=batch_index,
                 detector_features=hist[:, -1] if cfg_b.use_detector_feat else None,
                 temporal_features=temporal_last if cfg_b.use_temporal else None,
+                keypoints=keypoints,
             )
 
-        row_of = {tid: i for i, tid in enumerate(active_ids)}
         action_ids = np.full(n, -1, dtype=int)
         action_probs = None
         evidence: List[Dict[str, float]] = []

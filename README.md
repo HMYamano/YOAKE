@@ -103,16 +103,27 @@ Two planes coexist and remain independent:
 
 ## Requirements
 
-- Python >= 3.10
-- PyTorch >= 2.1.0
-- torchvision >= 0.16.0
-- numpy >= 1.24.0
-- scipy >= 1.10.0 (Hungarian matching)
-- Pillow >= 9.0.0
-- pyyaml >= 6.0
-- opencv-python >= 4.8.0 (video I/O, optional)
-- matplotlib >= 3.7.0 (visualization, optional)
-- wandb >= 0.16.0 (experiment tracking, optional)
+Python >= 3.10. Everything else is grouped so that a labelling machine does not
+have to install the training stack:
+
+| Group | Install | Contents |
+|---|---|---|
+| base | `pip install -e .` | numpy >= 1.24, Pillow >= 9.0, pyyaml >= 6.0, tqdm >= 4.65 |
+| `gui` | `pip install -e ".[gui]"` | opencv-python >= 4.8, dearpygui >= 1.11 |
+| `ml` | `pip install -e ".[ml]"` | torch >= 2.1, torchvision >= 0.16, scipy >= 1.10 (Hungarian matching) |
+| `vis` | `pip install -e ".[vis]"` | matplotlib >= 3.7 |
+| `wandb` | `pip install -e ".[wandb]"` | wandb >= 0.16 (experiment tracking) |
+| `concept` | `pip install -e ".[concept]"` | transformers >= 4.40 ("Find all in frame") |
+| `all` | `pip install -e ".[all]"` | gui + ml + vis + wandb + concept |
+
+`sam2` is intentionally **not** part of `all`: it needs a matching PyTorch
+already present and builds CUDA extensions, so bundling it would turn one bad
+wheel into a failed install of everything. Install it on its own, into the
+Python that runs `tools/sam_sidecar.py` — see [Video propagation](#gui-labeling--training--video-analysis).
+
+> **Changed:** `pip install -e .` used to install PyTorch. It no longer does, so
+> that `".[gui]"` can stay torch-free. For training or inference use `".[ml]"`
+> or `".[all]"`.
 
 **GPU**: NVIDIA RTX 8000 or equivalent recommended. Minimum 16 GB VRAM at default batch size 4. Tested with CUDA 11.8 and CUDA 12.1.
 
@@ -132,13 +143,19 @@ pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorc
 pip install -e ".[all]"
 ```
 
-For a minimal install without visualization or experiment tracking:
+For training and inference without the GUI or experiment tracking:
 
 ```bash
-pip install -e .
+pip install -e ".[ml]"
 ```
 
-For development and tests:
+For a labelling-only machine, with no PyTorch and no CUDA wheels:
+
+```bash
+pip install -e ".[gui]"
+```
+
+For development and tests (this installs `.[ml,gui]`, which the suite needs):
 
 ```bash
 pip install -r requirements-dev.txt
@@ -156,12 +173,17 @@ If your shell cannot find `python` or `pytest`, use the repository CI workflow a
 A DearPyGui hub (inspired by [YORU](https://github.com/Kamikouchi-lab/YORU)) bundles
 video **labeling**, staged **training with a live metric monitor**, and **interactive
 video analysis** (overlayed playback + per-track action timeline). It drives the
-`yoake` CLI under the hood, so the GUI itself is torch-free.
+`yoake` CLI under the hood, so the GUI itself is torch-free — `".[gui]"` installs
+no PyTorch, and the hub tells you what is locked and how to unlock it. Training
+and automatic detection need `".[ml]"` as well; everything else (labelling,
+propagation, project management, analysis playback) works without it.
 
 ```bash
-pip install -e ".[gui]"     # dearpygui + opencv-python
+pip install -e ".[gui]"     # dearpygui + opencv-python, no PyTorch
 yoake gui                    # or:  python -m htrtdetr.gui  /  gui
 ```
+
+All three commands start the same hub.
 
 Boxes are drawn per frame, carried forward with `Space` (propagate) or the
 auto-tracker, and labeled with track ID and action. Output stays in the standard
@@ -314,19 +336,30 @@ python tools/analyze.py mode=distribution \
 
 ## Staged Training
 
-Full details, hyperparameter explanations, and troubleshooting are in [docs/TRAINING_GUIDE.md](docs/TRAINING_GUIDE.md).
+`yoake train` is the supported entry point for every stage. Full details,
+hyperparameter explanations, and troubleshooting are in
+[docs/TRAINING_GUIDE.md](docs/TRAINING_GUIDE.md).
+
+```bash
+yoake train stage=1 config=configs/stage1_small.yaml
+yoake train stage=2 data.train_root=data/train data.val_root=data/val
+```
+
+> The `scripts/train_stage*_{detector,action,id,unified}.py` scripts drive the
+> legacy `stage_trainers.py` backend. They still work and are still tested, but
+> they emit a `DeprecationWarning` and will be removed. Prefer `yoake train`.
 
 ### Stage 1 — Spatial Detector
 
 Trains ResNet-18 + FPN + AIFI + DETR decoder to detect animals. All other modules are inactive.
 
 ```bash
-python scripts/train_stage1_detector.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    output_dir=outputs/stage1 \
-    num_epochs=100 \
-    batch_size=4
+yoake train stage=1 \
+    data.train_root=data/train/annotations.json \
+    data.val_root=data/val/annotations.json \
+    train.output_dir=outputs/stage1 \
+    train.max_epochs=100 \
+    data.batch_size=4
 ```
 
 ### Stage 2 — Action Head
@@ -334,25 +367,29 @@ python scripts/train_stage1_detector.py \
 Freezes the detector. Trains the HTM and MLP action head using geometric track features.
 
 ```bash
-python scripts/train_stage2_action.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    output_dir=outputs/stage2 \
-    num_epochs=30
+yoake train stage=2 \
+    data.train_root=data/train/annotations.json \
+    data.val_root=data/val/annotations.json \
+    train.output_dir=outputs/stage2 \
+    train.max_epochs=30
 ```
 
 ### Stage 3 — ID Head
 
 Freezes the detector. Trains the HTM and GRU memory ID head. Runs in parallel with Stage 2.
 
+Identity classes are keyed by `(video_id, track_id)` across the whole dataset, so
+track 0 of one video and track 0 of another are never learned as the same animal.
+Set `model.id_head.max_ids` at or above the dataset's identity count — the
+trainer prints a warning if it is too low, because the surplus would otherwise
+collapse into a single "unknown" class.
+
 ```bash
-python scripts/train_stage3_id.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    output_dir=outputs/stage3 \
-    num_epochs=30
+yoake train stage=3 \
+    data.train_root=data/train/annotations.json \
+    data.val_root=data/val/annotations.json \
+    train.output_dir=outputs/stage3 \
+    train.max_epochs=30
 ```
 
 ### Stage 4 — Unified Fine-Tuning
@@ -360,14 +397,11 @@ python scripts/train_stage3_id.py \
 Unlocks all modules. Initializes from Stages 1–3. Uses combined detection + action + ID + temporal smoothness loss.
 
 ```bash
-python scripts/train_stage4_unified.py \
-    train_anno=data/train/annotations.json \
-    val_anno=data/val/annotations.json \
-    stage1_ckpt=outputs/stage1/checkpoint_best.pth \
-    stage2_ckpt=outputs/stage2/checkpoint_best.pth \
-    stage3_ckpt=outputs/stage3/checkpoint_best.pth \
-    output_dir=outputs/stage4 \
-    num_epochs=30
+yoake train stage=4 \
+    data.train_root=data/train/annotations.json \
+    data.val_root=data/val/annotations.json \
+    train.output_dir=outputs/stage4 \
+    train.max_epochs=30
 ```
 
 ---

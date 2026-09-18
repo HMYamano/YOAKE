@@ -10,7 +10,6 @@ config.py — YOAKE 全モジュール共通 dataclass 設定群
 
 from __future__ import annotations
 
-import copy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple

@@ -227,6 +227,55 @@ class TestStreamingVsBatch:
 
 
 class TestStreamingEdgeCases:
+    def test_empty_frames_expire_tracker_embeddings(self, model, frames, monkeypatch):
+        si = _make(model)
+        si.tracker.cache.max_age = 0
+        si.tracker.cache.reid_max_age = 1
+        si.process_frame(frames[0])
+        assert si.tracker._embeddings
+        monkeypatch.setattr(model.cfg.detector, "score_threshold", 1.1)
+        for frame in frames[1:3]:
+            assert len(si.process_frame(frame)) == 0
+        assert len(si.tracker.cache) == 0
+        assert si.tracker._embeddings == {}
+
+    def test_pose_features_reach_behavior_in_track_order(self, frames):
+        cfg = build_model_config("small")
+        cfg.detector.backbone.pretrained = False
+        cfg.detector.head.num_queries = 3
+        cfg.detector.score_threshold = 0.0
+        cfg.detector.pose.enabled = True
+        cfg.detector.pose.num_keypoints = 2
+        cfg.behavior.use_pose = True
+        m = build_model(cfg).eval()
+        si = _make(m)
+        captured = []
+
+        def capture_pose(module, args, kwargs):
+            captured.append(kwargs["keypoints"].detach().clone())
+
+        # Force history order to differ from detection order.
+        original_history = si.tracker.track_history
+
+        def reversed_history():
+            hist, obb, mask, ids = original_history()
+            return hist.flip(0), obb.flip(0), mask.flip(0), ids[::-1]
+
+        si.tracker.track_history = reversed_history
+        handle = m.behavior.register_forward_pre_hook(capture_pose, with_kwargs=True)
+        try:
+            with torch.inference_mode():
+                det = m.detector(si.preprocess(frames[0]))
+                expected = m.det_adapter.extract_valid_detections(
+                    det.pred_logits, det.pred_boxes, det.query_features,
+                    score_threshold=0.0, pred_keypoints=det.pred_keypoints,
+                )[0]["keypoints"]
+            result = si.process_frame(frames[0])
+        finally:
+            handle.remove()
+        assert result.action_probs is not None
+        assert torch.allclose(captured[0], expected.flip(0))
+
     def test_no_detections_frame(self, frames):
         cfg = build_model_config("small")
         cfg.detector.backbone.pretrained = False

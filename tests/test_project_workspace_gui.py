@@ -173,11 +173,15 @@ def app(viewport, tmp_path):
 
 
 def test_create_folder_annotate_switch_save_restart_reopen(app, tmp_path, monkeypatch):
-    import htrtdetr.annotator as module
+    from htrtdetr.gui import file_dialogs
 
     # Drive the actual setup and folder callbacks used by a new user.
     app._show_setup_screen()
-    monkeypatch.setattr(module, "_tk_ask_dir", lambda *args, **kw: tmp_path)
+    # The folder picker lives in gui.file_dialogs (it used to be a module-level
+    # function on annotator.py). Stub it there: the workspace code resolves it
+    # from that module at call time, so this is the one seam that works for both
+    # the setup screen and the workspace callbacks.
+    monkeypatch.setattr(file_dialogs, "ask_dir", lambda *args, **kw: tmp_path)
     app._setup_add_folder()
     dpg.set_value("setup_proj_name", "experiment")
     dpg.set_value("setup_proj_dir", str(tmp_path / "project"))

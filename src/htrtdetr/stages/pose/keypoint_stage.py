@@ -48,6 +48,7 @@ class KeypointStage(StageBase):
             if fr.image is None or not fr.detections:
                 continue
             boxes = np.stack([np.asarray(d.bbox, np.float32) for d in fr.detections], 0)
+            assert self._predictor is not None  # setup() で必ず作られる
             kpts = self._predictor(fr.image, boxes)   # (N, K, 3)
             for d, kp in zip(fr.detections, kpts):
                 d.keypoints = np.asarray(kp, np.float32)

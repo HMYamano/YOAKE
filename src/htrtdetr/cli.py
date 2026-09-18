@@ -725,6 +725,39 @@ def _print_help() -> None:
         sys.stdout.buffer.write(b"\n")
 
 
+#: これらのコマンドは PyTorch を必要とする。base install (``pip install -e .``)
+#: は torch-free なので、無い環境では import が
+#: ``ModuleNotFoundError: No module named 'torch'`` で落ちる。それは原因も直し方も
+#: 伝えないので、ここで先に見て、何を入れれば良いかを言う。
+_TORCH_COMMANDS = {"train", "val", "predict", "pipeline"}
+
+
+def _require_torch(command: str) -> None:
+    """torch が必要なコマンドで、無ければ直し方を示して終了する。"""
+    from importlib.util import find_spec
+
+    if find_spec("torch") is not None:
+        return
+    print(
+        f"yoake {command}: PyTorch がこの Python にインストールされていません。\n"
+        "\n"
+        "  YOAKE の base install は torch-free です (ラベリング用マシンに CUDA\n"
+        "  ホイールを入れずに済むように、GUI とアノテーション I/O だけで動きます)。\n"
+        "  学習・推論には ml extra を入れてください:\n"
+        "\n"
+        "      pip install -e \".[ml]\"      # torch + torchvision + scipy\n"
+        "      pip install -e \".[all]\"     # GUI も含めて全部\n"
+        "\n"
+        "  CUDA 版を明示したい場合は先に PyTorch を入れてください:\n"
+        "      pip install torch torchvision --index-url "
+        "https://download.pytorch.org/whl/cu118\n"
+        "\n"
+        "  torch を必要としないコマンド: yoake gui / yoake project / yoake analyze",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def main() -> None:
     argv = sys.argv[1:]
     if not argv or argv[0] in {"-h", "--help", "help"}:
@@ -733,6 +766,9 @@ def main() -> None:
 
     command = argv[0]
     rest = argv[1:]
+
+    if command in _TORCH_COMMANDS:
+        _require_torch(command)
 
     if command == "train":
         stage_str, rest = _extract_kv(rest, "stage", default="1")

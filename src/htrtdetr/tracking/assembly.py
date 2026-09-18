@@ -16,7 +16,7 @@ GT で揃え、tracker の誤りは評価指標 (IDF1/HOTA) 側で測るのが�
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import torch
 

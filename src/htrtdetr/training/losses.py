@@ -16,6 +16,7 @@ losses.py — 損失関数群
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
@@ -26,14 +27,12 @@ import torch.nn.functional as F
 from ..config.config import LossConfig
 from ..geometry.obb import (
     aabb_to_obb,
-    canonicalize_obb,
-    cxcywh_to_obb,
     encode_angle,
-    normalize_angle,
     probiou,
     rotated_iou,
 )
 from ..utils.misc import generalized_box_iou, xyxy_to_cxcywh, cxcywh_to_xyxy
+from .targets import last_frame_targets
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +182,7 @@ class HungarianMatcher(nn.Module):
                 # rotated IoU cost — GT に OBB があればそれを、無ければ theta=0 を使う
                 gt_obb = targets[b].get("obb")
                 gt_obb = aabb_to_obb(gt_boxes) if gt_obb is None else gt_obb
+                assert pred_obb is not None  # rotated は pred_obb がある時だけ True
                 cost_giou = -rotated_iou(pred_obb[b], gt_obb)   # (Q, N_i)
             else:
                 # GIoU cost — both in xyxy
@@ -247,6 +247,16 @@ class DetectionLoss(nn.Module):
         Returns:
             losses: Dict[str, Tensor]
         """
+        # バッチ次元の食い違いは黙って通すと「別画像の GT で学習する」形になる。
+        # (Hungarian matcher は targets[b] を引くので、len(targets) > B なら
+        #  余りが無視され、< B なら IndexError になる。)
+        if len(targets) != pred_logits.shape[0]:
+            raise ValueError(
+                f"targets の件数 ({len(targets)}) が batch size "
+                f"({pred_logits.shape[0]}) と一致しません。シーケンス targets "
+                "(B × T) を渡していませんか (last_frame_targets を通してください)"
+            )
+
         # Hungarian matching
         indices = self.matcher(pred_logits, pred_boxes, targets, pred_obb=pred_obb)
 
@@ -320,6 +330,7 @@ class DetectionLoss(nn.Module):
                 "loss_obb_angle": zero, "loss_obb_probiou": zero, "loss_obb": zero,
             }
 
+        assert self.obb_loss is not None  # 呼び出し側が obb_enabled を確認済み
         return self.obb_loss(
             torch.cat(pred_list, 0),
             torch.cat(angle_list, 0),
@@ -492,6 +503,29 @@ class OBBLoss(nn.Module):
 # Pose Loss (任意)
 # ---------------------------------------------------------------------------
 
+def _assert_same_rows(
+    pred: Optional[torch.Tensor],
+    gt: Optional[torch.Tensor],
+    what: str,
+) -> None:
+    """
+    予測と GT の第 0 次元が揃っていることを確かめる (silent broadcasting 防止)。
+
+    どちらかが None (= その損失を使わない) の場合は何もしない。比較は
+    ``shape[0]`` の整数 2 つだけなので、学習ループに乗せても実測可能な
+    コストにはならない。
+    """
+    if pred is None or gt is None:
+        return
+    if pred.shape[0] != gt.shape[0]:
+        raise ValueError(
+            f"{what} の予測と GT で検出数が一致しません: "
+            f"pred={tuple(pred.shape)}, gt={tuple(gt.shape)}. "
+            "GT を持たない画像はプレースホルダ行で埋めてください "
+            "(行を飛ばすと broadcasting で別画像の GT が使われます)"
+        )
+
+
 class PoseLoss(nn.Module):
     """
     キーポイントと head-tail polarity の損失 (どちらも任意)。
@@ -513,6 +547,13 @@ class PoseLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         losses: Dict[str, torch.Tensor] = {}
         total = None
+
+        # 予測と GT の第 0 次元 (= 検出数) は必ず一致していなければならない。
+        # 一致しないまま L1 / cross_entropy を取ると broadcasting が成立してしまい、
+        # ある画像の GT が別の画像の予測へ静かに適用される。「keypoint 未アノテーション」
+        # の画像はゼロ行 (可視性 0) として渡され、下の vis マスクで損失から外れる。
+        _assert_same_rows(pred_keypoints, gt_keypoints, "pose keypoint")
+        _assert_same_rows(pred_polarity, gt_polarity, "pose polarity")
 
         if pred_keypoints is not None and gt_keypoints is not None \
                 and pred_keypoints.shape[0] > 0:
@@ -710,6 +751,10 @@ class IDLoss(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.max_ids = max_ids
+        #: ``max_ids`` を超えたため "unknown" クラスへ畳まれたラベルの累計。
+        #: 0 でなければ ``model.id_head.max_ids`` が small すぎる。
+        self.num_clamped: int = 0
+        self._clamp_warned = False
 
     def forward(
         self,
@@ -720,7 +765,28 @@ class IDLoss(nn.Module):
         if id_logits.shape[0] == 0:
             return {"loss_id": id_logits.sum() * 0.0}
 
-        # track_id を [0, max_ids) にクランプ (-1 は ignore)
+        # 分類ヘッドの出力は max_ids 個の既知 ID + 1 個の "unknown" クラス。
+        # max_ids 以上の identity はすべて unknown (= index max_ids) になる。
+        # open-set ID head としては正しい意味だが、**教師信号がそのぶん捨てられる**
+        # ので、黙って起きると「Stage 3 の精度が上がらない理由が分からない」に
+        # なる。一度だけ実数つきで知らせる。
+        # (triplet loss は clamp 前の生ラベルを使うので、別個体が positive pair に
+        #  なることはない — これは P0-3 とは別種の「supervision を捨てる」問題。)
+        over = int((gt_track_ids >= self.max_ids).sum())
+        if over:
+            self.num_clamped += over
+            if not self._clamp_warned:
+                self._clamp_warned = True
+                warnings.warn(
+                    f"identity ラベルのうち {over} 件が max_ids={self.max_ids} 以上の "
+                    "ため unknown クラスへ畳まれました。"
+                    "model.id_head.max_ids を dataset の identity 数以上に上げるか、"
+                    "MemoryIDHead.resize_id_classifier() で拡張してください。",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        # track_id を [0, max_ids] にクランプ (-1 は ignore、max_ids は unknown)
         valid_ids = gt_track_ids.clamp(max=self.max_ids)
 
         loss_cls = softmax_focal_loss(
@@ -758,7 +824,11 @@ class IDLoss(nn.Module):
         if valid.sum() < 3:
             return embeddings.sum() * 0.0
 
-        total_loss = 0.0
+        # accumulator は必ず Tensor で始める。float の 0.0 で始めると、
+        # triplet が 1 つも作れなかったバッチ (= バッチ内の identity がすべて
+        # 相異なる場合。identity を dataset 全体で一意にすると普通に起きる) で
+        # 戻り値が Python float になり、呼び出し側の .item() / backward が壊れる。
+        total_loss = embeddings.sum() * 0.0
         count = 0
 
         for i in range(N):
@@ -875,8 +945,11 @@ class CombinedLoss(nn.Module):
 
         # ----- Stage 1: Detection -----
         if s >= 1:
-            # targets は List[Dict] (1 フレーム)
-            frame_targets = targets if isinstance(targets[0], dict) else targets[-1]
+            # BatchSequenceTargets (B × T) なら各シーケンスの最終フレームを取る。
+            # 以前は ``targets[-1]`` としていたが、これは「最後のバッチ要素の
+            # シーケンス全体」であってフレームではない。B != T のとき長さ T の
+            # リストが B 個分の GT として使われ、静かに別画像の GT で学習していた。
+            frame_targets = last_frame_targets(targets)
             det_losses = self.detection_loss(
                 model_output.pred_logits,
                 model_output.pred_boxes,
@@ -912,7 +985,7 @@ class CombinedLoss(nn.Module):
 
         # ----- Stage 2: Action -----
         if s in (2, 4):
-            frame_targets = targets if isinstance(targets[0], dict) else targets[-1]
+            frame_targets = last_frame_targets(targets)
             behavior = getattr(model_output, "behavior", None)
 
             if behavior is not None and behavior.head_logits:
@@ -934,8 +1007,8 @@ class CombinedLoss(nn.Module):
 
         # ----- Stage 3: ID -----
         if s in (3, 4) and model_output.id_logits is not None:
-            frame_targets = targets if isinstance(targets[0], dict) else targets[-1]
-            gt_track = self._collect_gt_track_ids(frame_targets, model_output)
+            frame_targets = last_frame_targets(targets)
+            gt_track = self._collect_gt_identity_ids(frame_targets, model_output)
             if gt_track is not None:
                 id_losses = self.id_loss(
                     model_output.id_logits,
@@ -989,11 +1062,30 @@ class CombinedLoss(nn.Module):
 
     @staticmethod
     def _gather_det_field(model_output, key: str) -> Optional[torch.Tensor]:
-        """det_results から指定フィールドを全バッチ分 concat する。"""
-        if model_output.det_results is None:
+        """
+        det_results から指定フィールドを全バッチ分 concat する。
+
+        行 i は「det_results を順に連結した予測」の行 i に対応する。予測を持つ
+        画像と持たない画像が混在すると GT 側と行数が合わなくなるので、その場合は
+        黙って飛ばさずに落とす (broadcasting で別画像の GT が使われるより良い)。
+        """
+        det_results = model_output.det_results
+        if det_results is None:
             return None
-        parts = [d[key] for d in model_output.det_results if key in d]
-        return torch.cat(parts, dim=0) if parts else None
+        parts = [d[key] for d in det_results if key in d]
+        if not parts:
+            return None
+        missing = [
+            b for b, d in enumerate(det_results)
+            if key not in d and int(d.get("boxes", torch.zeros(0, 4)).shape[0]) > 0
+        ]
+        if missing:
+            raise ValueError(
+                f"det_results[{missing}] に '{key}' がありません。予測の一部だけに "
+                f"'{key}' があると GT と行数が揃わず、broadcasting で別画像の GT が "
+                "使われます"
+            )
+        return torch.cat(parts, dim=0)
 
     def _collect_multi_head_targets(
         self, targets, model_output, head_names: List[str]
@@ -1028,14 +1120,29 @@ class CombinedLoss(nn.Module):
         gt = collect_matched_gt(model_output.det_results, targets, key="action_ids")
         return gt if gt.numel() > 0 else None
 
-    def _collect_gt_track_ids(self, targets, model_output) -> Optional[torch.Tensor]:
-        """det_results の各 bbox と GT annotation を IoU マッチングして track_id を収集する。
+    def _collect_gt_identity_ids(self, targets, model_output) -> Optional[torch.Tensor]:
+        """
+        det_results の各 bbox に identity ラベルを IoU マッチングで割り当てる。
 
-        matching.py の collect_matched_gt を利用して greedy IoU ベースの割り当てを行う。
+        **``identity_ids`` を優先する。** アノテーションの ``track_id`` は
+        *動画内でのみ* 一意なので、それを ID 分類のラベルに使うと、DataLoader が
+        動画をまたいで shuffle した瞬間に「video A の track 0」と「video B の
+        track 0」が同じクラスになり、別個体を同一 identity として学習してしまう
+        (metric learning では positive pair にすらなる)。dataset 側が
+        ``(video_id, track_id)`` から作った全体一意な ``identity_ids`` を出すので、
+        それがあればそちらを使う。
+
+        古い dataset / 自作 collate には ``identity_ids`` が無いので、その場合だけ
+        ``track_ids`` に落ちる (単一動画なら両者は一致する)。
         IoU < threshold の未マッチ検出は -1 (IDLoss で ignore される)。
         """
         if model_output.det_results is None:
             return None
         from .matching import collect_matched_gt
-        gt = collect_matched_gt(model_output.det_results, targets, key="track_ids")
+
+        key = "identity_ids" if any("identity_ids" in t for t in targets) else "track_ids"
+        gt = collect_matched_gt(model_output.det_results, targets, key=key)
         return gt if gt.numel() > 0 else None
+
+    #: 旧名。外部から呼ばれていた可能性があるので別名を残す。
+    _collect_gt_track_ids = _collect_gt_identity_ids

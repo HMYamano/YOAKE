@@ -11,9 +11,13 @@ GUI 本体は torch 非依存で起動します（torch は学習/推論を実�
 ## 起動
 
 ```bash
-pip install -e ".[gui]"     # dearpygui + opencv-python
+pip install -e ".[gui]"     # dearpygui + opencv-python (PyTorch は入りません)
 yoake gui                    # または:  python -m htrtdetr.gui  /  gui
 ```
+
+3 つの起動方法はどれも同じハブを開きます。学習と自動検出だけは PyTorch を要る
+ので、その 2 つを使う場合は `pip install -e ".[ml]"` も入れてください
+(ハブ側は何がロックされているかと、その解除方法を表示します)。
 
 ハブ左ナビ:
 

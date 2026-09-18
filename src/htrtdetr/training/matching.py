@@ -11,7 +11,7 @@ Stage 4 (unified) で detection 出力に GT action / track ID を割り当て�
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -21,7 +21,9 @@ from ..utils.misc import box_iou, cxcywh_to_xyxy
 #: 検出へ引き写すスカラー GT 属性。``polarity`` がここに無かったため
 #: ``collect_matched_gt(..., key="polarity")`` は常に全 -1 を返し、
 #: ``PoseLoss`` の cross_entropy が「全部 ignore」で NaN になっていた。
-_SCALAR_GT_KEYS = ("class_ids", "track_ids", "action_ids", "polarity")
+_SCALAR_GT_KEYS = (
+    "class_ids", "track_ids", "identity_ids", "action_ids", "polarity",
+)
 
 
 def assign_gt_to_detections(
@@ -162,22 +164,60 @@ def collect_matched_gt_tensor(
     多次元 GT (keypoints など) を検出にマッチさせて concat する。
 
     ``collect_matched_gt`` はスカラーラベル (action_id / track_id) 用で 1D しか
-    扱えないため、(N, K, 3) のような GT にはこちらを使う。未マッチの検出には
-    ゼロ行が入る (損失側で可視性マスクにより無視される)。
+    扱えないため、(N, K, 3) のような GT にはこちらを使う。
+
+    **不変条件**: 戻り値の行 i は、``det_results`` を順に連結した予測の行 i に
+    対応する。GT を持たない画像を読み飛ばすと予測と GT の第 0 次元がずれ、
+    PyTorch の broadcasting によってエラーにならないまま**別画像の GT で損失を
+    計算する**ため、そのような画像にはゼロ行 (= 可視性 0 のプレースホルダ) を
+    入れて行数を合わせる。未マッチの検出も同じくゼロ行になる。
 
     Returns:
-        (N_total, ...) — GT の後続次元を保った tensor
+        (N_total, ...) — GT の後続次元を保った tensor。
+        ``key`` をどの target も持たない場合のみ空 tensor を返す。
     """
+    # プレースホルダ行を作るために、後続次元と dtype の見本を先に探す。
+    sample: Optional[torch.Tensor] = None
+    for tgt in targets:
+        attr = tgt.get(key)
+        if attr is not None:
+            sample = attr
+            break
+    if sample is None:
+        return torch.zeros(0)
+
     parts: List[torch.Tensor] = []
     for det, tgt in zip(det_results, targets):
         pred_boxes = det.get("boxes", torch.zeros(0, 4))
-        gt_attr = tgt.get(key)
-        n_pred = pred_boxes.shape[0]
-        if gt_attr is None or n_pred == 0:
+        n_pred = int(pred_boxes.shape[0])
+        if n_pred == 0:
             continue
+
+        gt_attr = tgt.get(key)
+        if gt_attr is None:
+            # この画像には GT が無い。行数だけ合わせたゼロを置き、
+            # 損失側の可視性マスク (keypoints なら v=0) で除外させる。
+            parts.append(
+                torch.zeros(
+                    (n_pred,) + tuple(sample.shape[1:]),
+                    dtype=sample.dtype,
+                    device=pred_boxes.device,
+                )
+            )
+            continue
+
         gt_attr = gt_attr.to(pred_boxes.device)
         asgn = assign_gt_to_detections(pred_boxes, tgt, iou_threshold)
         idx = asgn["matched_gt_idx"]
+        if gt_attr.shape[0] == 0:
+            parts.append(
+                torch.zeros(
+                    (n_pred,) + tuple(gt_attr.shape[1:]),
+                    dtype=gt_attr.dtype,
+                    device=pred_boxes.device,
+                )
+            )
+            continue
         matched = gt_attr[idx.clamp(min=0)]
         matched[idx < 0] = 0
         parts.append(matched)

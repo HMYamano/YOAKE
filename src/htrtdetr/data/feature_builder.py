@@ -24,13 +24,12 @@ Stage 2/3 の初期学習で安定した gradient を与える。
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 
-from .annotation import ObjectAnno, FrameAnno
+from .annotation import FrameAnno
 
 # Feature dimension (変更する場合は train config の feature_dim も要調整)
 GEO_FEAT_DIM = 10
@@ -171,7 +170,6 @@ class GeometricFeatureBuilder:
             return {}
 
         frame_indices = [fr.frame_index for fr in frames]
-        T = len(frame_indices)
 
         result: Dict[int, np.ndarray] = {}
         for track_id, bbox_by_frame in track_bbox.items():

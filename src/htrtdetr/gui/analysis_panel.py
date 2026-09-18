@@ -1061,20 +1061,21 @@ class AnalysisPanel:
     def _read_frame(self, idx: int):
         """フレームを読む。連番なら seek せず逐次 read する。
 
-        ``cap.set(POS_FRAMES)`` は fps が整数でない動画で 1 フレームずれることがあり、
-        frame 0 では一致するので気付きにくい。再生 (+1) は必ず逐次読みにする。
+        デコード位置の管理は ``gui/video_source`` と共有する (annotator 側と同じ
+        処理を 2 箇所に持つと片方だけ直って挙動が分かれるため)。``_decoded_idx``
+        の -2 は「位置不明」を表す既存の番兵なので、helper の ``None`` に読み替える。
         """
         import cv2
 
+        from . import video_source
+
         if self.cap is None:
             return None
-        if idx != self._decoded_idx + 1:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, bgr = self.cap.read()
-        if not ok:
-            self._decoded_idx = -2
+        here = self._decoded_idx if self._decoded_idx >= 0 else None
+        bgr, decoded = video_source.read_frame_sequential(self.cap, idx, here)
+        self._decoded_idx = -2 if decoded is None else decoded
+        if bgr is None:
             return None
-        self._decoded_idx = idx
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     def goto(self, idx: int) -> None:

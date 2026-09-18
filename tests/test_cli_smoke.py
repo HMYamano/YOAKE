@@ -272,10 +272,10 @@ class TestPredictAnalyzeEntryPoints:
         monkeypatch.setattr(analysis_mod, "run_id_switch_analysis", lambda p, o: calls.append(("id_switches", p, o)))
         monkeypatch.setattr(analysis_mod, "run_confidence_analysis", lambda p, o: calls.append(("confidence", p, o)))
 
-        run_analyze([f"mode=timeline", f"predictions={pred}", f"output_dir={tmp_path}"])
-        run_analyze([f"mode=distribution", f"annotation={ann}", f"output_dir={tmp_path}"])
-        run_analyze([f"mode=id_switches", f"predictions={pred}", f"output_dir={tmp_path}"])
-        run_analyze([f"mode=confidence", f"predictions={pred}", f"output_dir={tmp_path}"])
+        run_analyze(["mode=timeline", f"predictions={pred}", f"output_dir={tmp_path}"])
+        run_analyze(["mode=distribution", f"annotation={ann}", f"output_dir={tmp_path}"])
+        run_analyze(["mode=id_switches", f"predictions={pred}", f"output_dir={tmp_path}"])
+        run_analyze(["mode=confidence", f"predictions={pred}", f"output_dir={tmp_path}"])
 
         assert [name for name, *_ in calls] == ["timeline", "distribution", "id_switches", "confidence"]
 
@@ -330,3 +330,67 @@ class TestPathHelpers:
 
         path = resolve_annotation_path(r"C:\work\data\annotations.json")
         assert str(path).lower().endswith("annotations.json")
+
+
+# ---------------------------------------------------------------------------
+# torch-free base install
+# ---------------------------------------------------------------------------
+
+#: torch が find_spec から見えない状態を作ってから CLI を起動する子プロセス。
+#: 実際に torch をアンインストールせずに「base install のまま学習コマンドを
+#: 叩いた」状況を再現する。
+_HIDE_TORCH_AND_RUN = '''
+import sys, importlib.util
+_real = importlib.util.find_spec
+def _fake(name, package=None):
+    if name == "torch" or name.startswith("torch."):
+        return None
+    return _real(name, package)
+importlib.util.find_spec = _fake
+sys.argv = ["yoake"] + {argv!r}
+from htrtdetr.cli import main
+main()
+'''
+
+
+class TestTorchFreeBaseInstall:
+    """
+    ``pip install -e .`` は torch-free (GUI とラベリングだけで動く) なので、
+    学習・推論コマンドは torch の無い環境で必ず呼ばれうる。そのとき
+    ``ModuleNotFoundError: No module named 'torch'`` だけが出るのは、原因も
+    直し方も伝えない。何を入れれば良いかを言って終了することを固定する。
+    """
+
+    def _run_without_torch(self, argv: list) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [PYTHON, "-c", _HIDE_TORCH_AND_RUN.format(argv=argv)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(REPO_ROOT),
+            env={
+                **os.environ,
+                "PYTHONPATH": str(SRC_ROOT),
+                "PYTHONIOENCODING": "utf-8",
+            },
+        )
+
+    @pytest.mark.parametrize("command", ["train", "val", "predict", "pipeline"])
+    def test_torch_commands_explain_how_to_install(self, command):
+        r = self._run_without_torch([command])
+        assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        message = r.stderr + r.stdout
+        assert "PyTorch" in message
+        assert ".[ml]" in message, "直し方 (ml extra) が示されていない"
+        assert "ModuleNotFoundError" not in message, "素の ImportError が漏れている"
+
+    def test_help_still_works_without_torch(self):
+        r = self._run_without_torch(["--help"])
+        assert r.returncode == 0
+        assert "train" in r.stdout
+
+    def test_non_torch_commands_are_not_blocked(self):
+        """``yoake project`` は torch を要らないので、この門で止めてはいけない。"""
+        r = self._run_without_torch(["project"])
+        assert ".[ml]" not in (r.stderr + r.stdout)

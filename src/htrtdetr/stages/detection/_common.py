@@ -50,7 +50,6 @@ def inference_ctx(device: str):
 
 def load_htrtdetr(checkpoint: str, device: str):
     """checkpoint から HTRTDETR と復元 config をロードする (stage4, eval)。"""
-    import torch
 
     from ...cli import load_runtime_config_from_checkpoint
     from ...models import build_model

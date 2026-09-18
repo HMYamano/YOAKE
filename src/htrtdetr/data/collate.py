@@ -9,10 +9,9 @@ collate.py — DataLoader 用 collate 関数
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import torch
-import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -38,12 +37,17 @@ def collate_single_frame(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     targets = []
     meta = []
     for item in batch:
-        targets.append({
+        target = {
             "boxes": item["boxes"],
             "class_ids": item["class_ids"],
             "track_ids": item["track_ids"],
             "action_ids": item["action_ids"],
-        })
+        }
+        # identity_ids は dataset 全体で一意な学習用ラベル (track_ids は動画内のみ)。
+        # 古い自作 dataset から来た batch には無いので、あるときだけ載せる。
+        if "identity_ids" in item:
+            target["identity_ids"] = item["identity_ids"]
+        targets.append(target)
         meta.append({
             "frame_index": item["frame_index"],
             "image_path": item["image_path"],
@@ -75,12 +79,15 @@ def collate_sequence(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         frame_targets = []
         T = len(item["boxes"])
         for t in range(T):
-            frame_targets.append({
+            frame_target = {
                 "boxes": item["boxes"][t],
                 "class_ids": item["class_ids"][t],
                 "track_ids": item["track_ids"][t],
                 "action_ids": item["action_ids"][t],
-            })
+            }
+            if "identity_ids" in item:
+                frame_target["identity_ids"] = item["identity_ids"][t]
+            frame_targets.append(frame_target)
         all_targets.append(frame_targets)
 
     meta = []

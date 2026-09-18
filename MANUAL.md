@@ -163,12 +163,21 @@ pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorc
 ```bash
 cd /path/to/YOAKE
 
-# Full install (includes visualization tools + W&B logging)
+# Full install (GUI + training/inference + visualization + W&B logging)
 pip install -e ".[all]"
 
-# Minimal install
+# Training and inference only (no GUI)
+pip install -e ".[ml]"
+
+# Labelling machine: GUI only, no PyTorch, no CUDA wheels
+pip install -e ".[gui]"
+
+# Base only (annotation I/O; no PyTorch)
 pip install -e .
 ```
+
+> **Changed:** `pip install -e .` used to install PyTorch and no longer does.
+> Use `".[ml]"` or `".[all]"` for training and inference.
 
 ### 4. Verify Installation
 

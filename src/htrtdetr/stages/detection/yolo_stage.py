@@ -10,7 +10,6 @@ ultralytics 未インストールでも import は通り、setup 時に明確な
 
 from __future__ import annotations
 
-from typing import Optional
 
 import numpy as np
 
@@ -53,6 +52,7 @@ class YOLOStage(StageBase):
         for fr in window.frames:
             if fr.image is None:
                 continue
+            assert self._model is not None  # setup() で必ずロードされる
             res = self._model.predict(
                 fr.image, imgsz=self.imgsz, conf=self.score_threshold, verbose=False
             )[0]

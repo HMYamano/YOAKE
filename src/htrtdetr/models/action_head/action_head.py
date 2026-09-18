@@ -19,7 +19,7 @@ action_head.py — Action Classification Head
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn

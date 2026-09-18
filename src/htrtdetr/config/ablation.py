@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import csv
 import json
-from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -141,7 +140,7 @@ class ResultsCollector:
                 ensure_ascii=False,
             )
 
-        print(f"Ablation results saved:")
+        print("Ablation results saved:")
         print(f"  CSV : {path}")
         print(f"  JSON: {json_path}")
 
