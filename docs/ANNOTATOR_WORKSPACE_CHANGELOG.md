@@ -41,7 +41,7 @@ Project manifestは確定したデータ世代を参照します。Autosave中�
 | `annotation/objects.py`, `annotation/storage.py` | GUI編集モデルとatomic JSON書込み |
 | `annotation/batch.py` | 動画単位の推論、キャッシュ、キャンセル、失敗分離、動画をまたぐサンプリング配分 |
 | `gui/workspace.py`, `gui/workspace_operations.py` | 既存アプリとの接続、非同期保存、レビュー、追跡結果の反映 |
-| `gui/video_browser.py`, `gui/batch_progress.py` | 複数選択・フィルタ付き動画一覧、処理範囲と進捗 |
+| `gui/video_browser.py` | 複数選択・フィルタ付き動画一覧、一括処理の入口 |
 | `gui/onboarding.py`, `gui/workspace_help.py` | 初回ガイド、ワークフローと実登録キーに基づくHelp |
 | `tests/test_annotation_project.py` | 保存、互換性、キャッシュ、バッチ、依存関係の回帰テスト |
 | `tests/test_project_workspace_gui.py` | 実Viewportを使う複数動画の編集・保存・再開テスト |
@@ -51,8 +51,9 @@ Project manifestは確定したデータ世代を参照します。Autosave中�
 ## User workflow
 
 Create Project → Add Folder → Project Videosで動画を選択 → Draw／Click animal →
-ClassとBehaviorを設定 → Continue this animal → 必要に応じてAuto Annotate Project →
-Review Nextで動画をまたいでAccept／Reject／修正 → Mark Done → Save and Export Frames。
+ClassとBehaviorを設定 → Continue this animal → 必要に応じてPick frames to label／
+Pre-label videos with the model → Review Nextで動画をまたいでAccept／Reject／修正 →
+Mark Done → Save and Export Frames。
 
 Current video、Selected videos、All unfinished videos、All unannotated videos、Entire projectを
 一括処理の対象にできます。サンプリング予算はProject全体で配分し、動画間の均等配分も選べます。
@@ -150,3 +151,27 @@ mypyは導入済みNumPyの型定義がPython 3.12構文を使うため、`--pyt
 
 `annotator._finish_propagation` は `workspace_operations._finish_video_propagation` に置き換わっており、
 どこからも呼ばれない重複でした。
+
+## Auto Annotate の入口を1つにする（2026-09-24）
+
+同じ `start_project_batch` に対して入口が3つあり、名前も似ていました
+——`Project > Auto Annotate Project...`、`Project > Smart Sample Project...`、
+`Review > Smart Annotate...`。前の2つは `BatchDialog` で、違いは
+`Generate object candidates` の初期値だけ。3つ目は `SmartAnnotateDialog` で、
+やはり同じ `BatchOptions` を同じ関数へ渡していました。
+
+| 変更 | 内容 |
+|---|---|
+| 入口 | `SmartAnnotateDialog` 1つに統合。`gui/batch_progress.py` は削除 |
+| 名前 | `Pre-label videos with the model...` と `Pick frames to label...`（機構名ではなく得られるもの） |
+| checkpoint | 実行時オプションから Project 設定へ。`Project > Model...`（Settings の Model タブ）と上部バーの `Model:` チップ。保存キー (`weights` / `config`) は不変 |
+| モデル未設定 | グレーアウトをやめ、1文＋`Choose a model...` ボタン |
+| `Connect detections into tracklets` | 廃止。`use_track_ids` から導出 |
+| `Candidate score threshold` | `SmartAnnotateDialog` の Advanced へ移設（既定 0.3） |
+| 進捗 | 5段階表示を `BatchRunner` の実際の順序に並べ替え、`operation` から駆動。動画ごと／全体の2本のバーと動画ごとの結果一覧は段階表示の下に残置 |
+| 進捗イベント | `batch_dialog` と `smart_dialog` への二重配送を1本化 |
+| 実行後 | 件数入りのボタンで次の行動へ（`Start on 12 samples` / `Review 412 candidates and 37 locations`）。0件ならボタンを出さない |
+| 事前ラベルのみの実行 | 選択が無いことを「読めた動画が無い」と報告していた不具合を修正。失敗判定は「1本も読めなかったか」で行う |
+
+死んでいた `_finish_analysis` / `_log_sampling`（`project.sampling_log` が同じ
+ファイルを書いているため二重）も削除しました。

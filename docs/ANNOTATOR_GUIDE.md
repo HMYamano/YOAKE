@@ -23,7 +23,7 @@ annotate --folder videos --recursive
 3. **Project Videos** で動画を選びます。動画を開くまで全フレームの読み込みは行いません。
 4. `W` でboxを描くか、`C` の **Click animal** で個体をクリックします。Inspectorでクラスと行動を設定します。
 5. boxを選択して **Continue this animal** で続きを作成します。
-6. **Auto Annotate Project / Smart Annotate** で候補・確認するフレームを生成します。
+6. **Pick frames to label**（`Ctrl+R`）で塗るフレームを選び、モデルがあれば **Pre-label videos with the model** で候補も出します。どちらも同じ窓です。
 7. **Review Next** で動画をまたいで確認し、Accept / Reject / 編集を行います。
 8. 完了した動画を **Mark Done** にし、`Ctrl+S` または **Save and Export Frames** で保存します。
 
@@ -67,7 +67,7 @@ Timelineは動画ごとに切り替わります。全動画をつないだ一本
 | `N`（New track）・`T`（Set Track ID）・Follow boxes to the next frame | 拒否し、設定の場所を状態行に表示 |
 | Continue this animal | Copy to next frame のみ（Fast tracking / Accurate propagationは同一性を運ぶ操作なので） |
 | 品質チェック | Possible ID switch・Track stops and restarts・位置/サイズ/向きの急変を実行しない。低確信度・個体数・重なり・merged boxは従来どおり |
-| Auto Annotate Project | Connect detections into tracklets をロック |
+| Pre-label videos with the model | tracklet の接続を行わない（設定から導出するので、チェックボックス自体がありません） |
 
 **すでに保存されているTrack IDは書き換えません。** チェックボックス1つで既存の作業を消し、戻しても復元できないという事態を避けるためです。オフは「これから」の挙動だけを変えます。
 
@@ -99,39 +99,73 @@ Continue this animalのAutomaticは、動画伝播が利用可能ならそれを
 
 Click animalのバックエンド指定は **Settings > Assistance > Advanced assistance** にあります。既存の `Space` による前フレームからのコピーと `A` による次フレーム追跡も使用できます。追跡結果は候補として確認します。
 
-## Auto Annotate Project（学習後の加速手段）
+## モデルの置き場所（Project > Model...）
 
-**checkpoint が要る唯一の機能です。** 上のループは checkpoint 無しで回るので、ここは「学習を1周させた後、ラベリングを速くするために戻ってくる場所」です。未設定でも欠陥ではありません。
+**checkpoint が要るのは事前ラベリングだけです。** 下のループは checkpoint 無しで回るので、ここは「学習を1周させた後、ラベリングを速くするために戻ってくる場所」です。未設定でも欠陥ではありません。
 
-Projectメニュー、またはProject Videosの **Auto Annotate...** を開きます。
+checkpoint は Project の設定です。**Project > Model...**（= Settings の Model タブ）で
+Checkpoint と Config を指定します。いま何が設定されているかは上部バーの
+**Model: none / Model: best.pth** チップで分かり、チップをクリックすると同じタブが開きます。
+このタブは常に「この環境で実際に推論できるか」の1行を表示します（PyTorch の有無、
+ファイルの有無、その両方が揃った場合の "Ready to run auto-annotation."）。
 
-- Scope: Current video / Selected videos / All unfinished videos / All unannotated videos / Entire project
-- Checkpoint: 学習済みモデルのファイル。必要ならConfigも指定
-- Generate object candidates: 既存のpredict CLIを別プロセスで実行
-- Connect detections into tracklets: 既存IDを維持し、IDがない検出は同じクラスの隣接フレーム間で関連付け
-- Select informative frames / clips: レビューするフレームや行動区間を提案
+モデルが無いときは、事前ラベリングのチェックボックスを灰色で見せる代わりに
+**No model yet. You can still pick which frames to label. [Choose a model...]** を出します。
+フレーム選択も手作業も、モデル無しでそのまま使えます。
 
-依存関係やcheckpointが不足している場合、検出オプションを無効化し理由を表示します。推論が不要なサンプリング・手作業はそのまま利用できます。自動Acceptは行いません。
+## Pick frames to label / Pre-label videos with the model
 
-現在動画・全体の進捗、完了・キャッシュ再利用・失敗を表示します。Cancelは進行中の推論プロセスを停止し、完了済み動画の結果を残します。1動画が失敗しても他の動画を処理し、失敗理由を結果一覧に残します。
+この2つは **同じ1つのウィンドウ** です。違いは *Generate annotation candidates* が
+最初からオンかどうかだけで、エンジンも進捗表示も結果も共通です
+（以前は Auto Annotate Project・Smart Sample Project・Smart Annotate という3つの入口が
+同じ処理を呼んでいました）。
 
-キャッシュキーには動画のパス・サイズ・更新日時、モデル、設定を含めます。同じ条件なら完了済みの推論を再利用します。再実行しても既存のAccept/Rejectや人手アノテーションを上書きしません。
+| 入口 | 開くもの |
+|---|---|
+| Project > **Pre-label videos with the model...** | Scope = Project 全体、事前ラベリング **オン** |
+| Project > **Pick frames to label...**（`Ctrl+R`） | Scope = Project 全体、事前ラベリング **オフ** |
+| 上部バー **Pick frames to label** | Scope = 現在の動画 |
+| Project Videos の2つのボタン | 上の2つと同じ |
 
-## Smart Annotate / Smart Sample
+窓の中身は次のとおりです。
 
-Smart Annotateでも対象動画のScopeを選択できます。サンプル数は対象Project全体の予算です。**Balance samples across videos** を有効にすると各動画に基本配分し、余った枠を全体のスコアで選びます。短い動画で取れなかった枠は再配分します。
+- **Scope**: Current video / Selected videos / All unfinished videos / All unannotated videos / Entire project。切り替えると見出しの「6 videos, 241,900 frames」が追従します
+- **What are you annotating?**: Individuals / Behavior / Individuals + behavior
+- **How much time do you have?**: サンプル数（50/100/200）または時間（5/15/30分）。予算はScope全体に対する数です
+- **Generate annotation candidates**: Project > Model... の checkpoint で predict CLI を別プロセス実行します
+- **Choose which frames to label**: レビューするフレームや行動区間を提案します。オフにするとフレーム走査を丸ごと省くので、事前ラベリングだけの実行が大幅に速くなります
+- **Choose the informative samples automatically**: オフは等間隔、オンは中身に基づく選択
+- **Use the GPU**
+- **Balance samples across videos**: 各動画に基本配分し、余った枠を全体のスコアで選びます。短い動画で取れなかった枠は再配分します
+- **Advanced**: strategy、random seed、clip length、scan stride、candidate score threshold（既定 0.3）
+
+**Connect detections into tracklets のチェックボックスはありません。** Project の
+`use_track_ids` から導出します（オンなら繋ぎ、オフなら繋ぐ先が無い）。
+どちらの答えも1つしか無い問いだったためです。
+
+実行中は、いま処理している動画の5段階（Reading the video / Generating annotation candidates /
+Checking tracks and behavior / Computing embeddings / Choosing informative frames）と
+その動画の進捗バー、さらに **Video 3 of 6** の行・全体の進捗バー・動画ごとの結果一覧を表示します。
+段階の並びは `BatchRunner` が実際に行う順序です。
+
+Cancelは進行中の推論プロセスを停止し、完了済み動画の結果を残します。1動画が失敗しても
+他の動画を処理し、失敗理由を結果一覧に残します。自動Acceptは行いません。
+
+終了時は **やったことの次に来る行動** をボタンで出します。サンプルを選んだなら
+**Start on 12 samples**、候補や品質問題ができたなら **Review 412 candidates and 37 locations**
+（押すと Review Next に入ります）。どちらも0件なら、押しても何も起きないボタンは出しません。
 
 既存のuniform、random、diversity、uncertainty、interactionなどの戦略を使用します。見た目の特徴は利用可能なembedding providerを使い、追加モデルがなければ組み込みのフレーム記述子にフォールバックします。
 
 サンプルはそれぞれの動画のTimelineに表示します。動画の長さや重ならないclip数により、実際に選べる数が予算を下回る場合があります。選択内容・seed・Scope内の動画IDは `sampling_log.json` に保存します。
 
-Smart AnnotateのGenerate annotation candidatesは、Auto Annotate Projectで設定したcheckpointを使用して実際に推論します。モデル未設定の場合は無効化されます。予測ファイルの読込はFile > Load Predictions as Candidatesから行えます。
+キャッシュキーには動画のパス・サイズ・更新日時、モデル、設定を含めます。同じ条件なら完了済みの推論を再利用します。再実行しても既存のAccept/Rejectや人手アノテーションを上書きしません。予測ファイルの読込はFile > Load Predictions as Candidatesから行えます。
 
 ## ラベリングのループ（モデル不要）
 
 **このループは学習を含みません。** ラベルが十分になったと判断してから Train / Analyze に進みます。
 
-1. **Smart Annotate** で次に塗るフレームを選ぶ
+1. **Pick frames to label** で次に塗るフレームを選ぶ
 2. 候補を出す。3通りあり、クリップ単位が最も効率的です:
    - **Follow animals across this clip** / **across every sampled clip**（Reviewメニュー）— クリップ内で最も個体が写っているフレームの箱を種に、**全個体をまとめて**クリップ全体へ伝播します
    - **Find all in frame** — 言葉でそのフレームの全個体を検出
@@ -141,7 +175,7 @@ Smart AnnotateのGenerate annotation candidatesは、Auto Annotate Projectで設
 
 4 が効くのが要点です。`diversity` の farthest-point 探索は既にラベル済みのフレームを**種**として開始するため、2 回目は 1 回目の続きになり、振り直しにはなりません。1 回 20〜50 フレーム程度の小分けで回してください。何をラベルしたかが次に何を訊かれるかを変えるので、その効果は回と回の間にしか現れません。
 
-学習済み checkpoint があるとこのループは**速くなります**（Auto Annotate が動画単位で事前ラベルし、uncertainty がサンプリングに加わります）。ただしここまで来るのに必須ではありません。
+学習済み checkpoint があるとこのループは**速くなります**（Pre-label videos with the model が動画単位で事前ラベルし、uncertainty がサンプリングに加わります）。ただしここまで来るのに必須ではありません。
 
 ### クリップ単位の伝播
 
@@ -149,7 +183,7 @@ Smart AnnotateのGenerate annotation candidatesは、Auto Annotate Projectで設
 
 1. **Timelineのsamplesレーンでクリップを直接クリック** — Inspectorが「Sampled clip」表示になり、範囲・サンプルされた理由・**何個体をどのフレームから追うか**とボタンが出ます。クリックは選択だけで、実行はしません（伝播は数分かかり、クリックでは取り消せないため。箱をクリックしても編集ではなく選択になるのと同じ形です）。マーカーと違いクリック位置へのシークも行います — クリップは範囲なので、狙ったフレームが情報になります
 2. Reviewメニューの **Follow animals across this clip** — 再生位置を含むサンプルクリップ
-3. Reviewメニューの **Follow animals across every sampled clip** — Smart Annotateが提案した全クリップ
+3. Reviewメニューの **Follow animals across every sampled clip** — Pick frames to labelが提案した全クリップ
 
 Inspectorの「Would follow」欄が最も重要です。伝播はプロンプトされた個体しか追えないので、**実行前に何個体が対象かが分かります**。0個体なら何をすべきか（W / C / Find all in frame）を表示し、ボタンはロックされます。
 
