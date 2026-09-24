@@ -712,12 +712,13 @@ class WorkspaceOperations:
                         )
                         for index in range(5):
                             self.smart_dialog.set_step(index, "done")
+                        candidates, issues = self.project_review_counts()
                         self.smart_dialog.finish(
                             first,
                             total_samples=sum(selection.total for _, selection in selected),
                             summary=f"Across {len(selected)} videos. Details below show the starting video.",
-                            predictions=sum(v.pending for v in project.videos.values()),
-                            issues=sum(len(v.queue) for v in project.videos.values()),
+                            predictions=candidates,
+                            issues=issues,
                         )
                     else:
                         self.smart_dialog.fail(
@@ -855,6 +856,21 @@ class WorkspaceOperations:
                         )
                     )
         return items
+
+    def project_review_counts(self):
+        """``(candidates, issues)`` waiting across the project.
+
+        One definition for both finished states: Smart Annotate's result block
+        and the project batch's review button quote the same two numbers, so
+        they cannot drift into disagreeing about what a run produced.
+        """
+        project = getattr(self, "project", None)
+        if project is None:
+            return (0, 0)
+        return (
+            sum(video.pending for video in project.videos.values()),
+            sum(len(video.queue) for video in project.videos.values()),
+        )
 
     def review_next_project(self):
         items = self.project_review_items()

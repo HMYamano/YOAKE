@@ -209,6 +209,49 @@ def test_the_project_batch_form_keeps_run_on_screen(app):
     widgets.forget_dialog("project_batch")
 
 
+def test_a_finished_project_batch_offers_the_review_it_produced(app, monkeypatch):
+    """A run that ends in "3 completed, 1 cached" is a dead end.
+
+    The finished state has to carry the user into the review, so the count and
+    the next action are the same button - and that button has to be reachable,
+    which is what the rest of this file is about.
+    """
+    app.open_batch_dialog("auto")
+    _pump()
+    monkeypatch.setattr(app, "project_review_counts", lambda: (412, 37))
+    visited = []
+    monkeypatch.setattr(app, "review_next_project", lambda: visited.append("review") or True)
+
+    app.batch_dialog.event({"kind": "finished", "results": [], "cancelled": False})
+    _pump()
+    assert dpg.is_item_shown("batch_review")
+    assert not dpg.is_item_shown("batch_followup")
+    label = dpg.get_item_label("batch_review")
+    assert "412" in label and "37" in label, label
+    _assert_button_inside("project_batch", "batch_review")
+
+    dpg.get_item_callback("batch_review")()
+    _pump()
+    assert visited == ["review"]
+    assert not dpg.is_item_shown("project_batch")
+    dpg.delete_item("project_batch")
+    widgets.forget_dialog("project_batch")
+
+
+def test_a_project_batch_that_found_nothing_offers_no_button(app, monkeypatch):
+    """A button that does nothing when pressed is worse than no button."""
+    app.open_batch_dialog("auto")
+    _pump()
+    monkeypatch.setattr(app, "project_review_counts", lambda: (0, 0))
+    app.batch_dialog.event({"kind": "finished", "results": [], "cancelled": True})
+    _pump()
+    assert not dpg.is_item_shown("batch_review")
+    assert dpg.is_item_shown("batch_followup")
+    assert "Nothing to review" in dpg.get_value("batch_followup")
+    dpg.delete_item("project_batch")
+    widgets.forget_dialog("project_batch")
+
+
 def test_the_video_browser_fits(app):
     app.show_video_browser()
     _pump()

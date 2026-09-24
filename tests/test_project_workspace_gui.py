@@ -260,6 +260,26 @@ def test_next_review_crosses_videos_and_keeps_ground_truth(app):
     assert not b.annotations
 
 
+def test_project_review_counts_span_every_video(app):
+    """The one arithmetic behind both finished states.
+
+    Smart Annotate's result block and the project batch's review button quote
+    these two numbers, so they have to cover the project rather than the video
+    that happens to be open - a batch over six videos that reported only the
+    open one's candidates would send the user to review 40 of 412.
+    """
+    assert app.project_review_counts() == (0, 0)
+    a, b = app.project.videos.values()
+    a.review = ReviewSession({5: [Candidate([6, 6, 26, 26], class_id=1)]})
+    b.review = ReviewSession(
+        {
+            8: [Candidate([7, 7, 27, 27], class_id=1)],
+            9: [Candidate([1, 1, 11, 11], class_id=1)],
+        }
+    )
+    assert app.project_review_counts()[0] == 3
+
+
 def test_late_batch_result_is_applied_to_origin_video(app):
     origin = app.project.videos["a"]
     app.switch_video("b")

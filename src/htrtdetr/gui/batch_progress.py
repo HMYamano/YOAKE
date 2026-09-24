@@ -10,6 +10,22 @@ from ..annotation.project import SCOPES
 from . import auto_label, theme, widgets
 
 
+def review_label(candidates: int, issues: int) -> str:
+    """The finished-run button's label, or ``""`` when there is nothing to do.
+
+    The count is in the label because the button is the only place the run's
+    outcome and the next action meet: "Review 412 candidates" says both what
+    happened and what to press. An empty string is the caller's signal to show
+    no button at all.
+    """
+    parts = []
+    if candidates > 0:
+        parts.append(f"{candidates:,} candidate{'s' if candidates != 1 else ''}")
+    if issues > 0:
+        parts.append(f"{issues:,} location{'s' if issues != 1 else ''}")
+    return "Review " + " and ".join(parts) if parts else ""
+
+
 class BatchDialog:
     """The project-wide Auto Annotate / Smart Sample form.
 
@@ -23,9 +39,10 @@ class BatchDialog:
     #: Preferred size. :func:`widgets.place_dialog` shrinks it to whatever the
     #: viewport actually has.
     WIDTH, HEIGHT = 660, 720
-    #: Run / Cancel, two progress bars, the current-operation line and the
-    #: results box, none of which may scroll away while a batch is running.
-    FOOTER_H = 250
+    #: Run / Cancel, two progress bars, the current-operation line, the
+    #: results box and the review button a finished run offers, none of which
+    #: may scroll away while a batch is running.
+    FOOTER_H = 336
 
     def __init__(self, app):
         self.app = app
@@ -168,8 +185,21 @@ class BatchDialog:
             dpg.add_input_text(
                 tag="batch_results", multiline=True, readonly=True, height=84, width=-1
             )
+            # A run that ends in a count is a dead end: the user is told 412
+            # candidates exist and left to find Review Next on their own. The
+            # finished state offers the next action instead, and only when
+            # there is one -- a button that does nothing when pressed teaches
+            # that the feature is broken (GUI_DESIGN.md P6).
+            widgets.primary_button("Review", self._review, tag="batch_review", height=34, width=-1)
+            dpg.configure_item("batch_review", show=False)
+            dpg.add_text("", tag="batch_followup", color=theme.TEXT_DIM, wrap=610, show=False)
         widgets.place_dialog(self.tag, self.WIDTH, self.HEIGHT)
         self._gate()
+
+    def _review(self, *_a):
+        """Close, and take the user to the first thing this run produced."""
+        dpg.hide_item(self.tag)
+        self.app.review_next_project()
 
     def _weights(self):
         from .file_dialogs import open_file as _tk_open_file
@@ -227,6 +257,8 @@ class BatchDialog:
             dpg.configure_item("batch_run", enabled=False)
             dpg.configure_item("batch_cancel", enabled=True)
             dpg.set_value("batch_results", "")
+            dpg.configure_item("batch_review", show=False)
+            dpg.configure_item("batch_followup", show=False)
 
     def event(self, event):
         if not dpg.does_item_exist(self.tag):
@@ -256,3 +288,17 @@ class BatchDialog:
             )
             if not event["cancelled"]:
                 dpg.set_value("batch_overall_progress", 1.0)
+            # Cancel keeps whatever the finished videos produced, so the offer
+            # is made on the counts, not on how the run ended.
+            self._offer_review()
+
+    def _offer_review(self):
+        """Turn the finished state into the one action that follows from it."""
+        label = review_label(*self.app.project_review_counts())
+        dpg.configure_item("batch_review", label=label or "Review", show=bool(label))
+        dpg.configure_item("batch_followup", show=not label)
+        if not label:
+            dpg.set_value(
+                "batch_followup",
+                "Nothing to review. No candidates and no quality issues were found.",
+            )
