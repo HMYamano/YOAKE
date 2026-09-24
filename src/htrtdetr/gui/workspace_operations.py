@@ -583,13 +583,34 @@ class WorkspaceOperations:
         self._refresh_workspace()
         self._status(describe_clip_run(pairs, clips=clips, skipped=skipped))
 
-    def open_batch_dialog(self, mode="auto"):
-        from .batch_progress import BatchDialog
+    def scope_summary(self, scope):
+        """``(label, frames, fps, count)`` for what a scope covers.
 
-        self._ensure_project()
-        if not hasattr(self, "batch_dialog"):
-            self.batch_dialog = BatchDialog(self)
-        self.batch_dialog.show(mode)
+        Smart Annotate asks for this rather than reading the project itself,
+        which is what lets one dialog quote "courtship_01.mp4, 40,850 frames"
+        and "6 videos, 241,900 frames" from the same header.
+        """
+        project = self._ensure_project()
+        videos = list(project.scope(scope, self._video_session.video_id))
+        if not videos:
+            return ("No videos in this scope", 0, 25.0, 0)
+        # A video is measured when it is first read, so a scope can hold
+        # videos with no frame count yet. Summing over them anyway quotes
+        # "3 videos, 40 frames" for three 40-frame videos, which is worse
+        # than quoting no total at all.
+        measured = [video for video in videos if video.num_frames]
+        frames = (
+            sum(int(video.num_frames) for video in measured)
+            if len(measured) == len(videos)
+            else 0
+        )
+        rates = [float(video.fps) for video in videos if video.fps]
+        fps = rates[0] if rates else 25.0
+        if len(videos) == 1:
+            first = videos[0]
+            name = first.path.name if first.path else first.video_id
+            return (name, frames, fps, 1)
+        return (f"{len(videos)} videos", frames, fps, len(videos))
 
     def _batch_inputs(self, scope):
         result = []
@@ -628,6 +649,7 @@ class WorkspaceOperations:
             if not capability.ok:
                 self._show_unavailable("Automatic detection", capability.message)
                 return False
+        self._batch_video_index = None
         cache_dir = project.directory or Path(tempfile.gettempdir()) / "YOAKE" / project.identity
         runner = BatchRunner(
             _repo_root(), cache_dir, encoder=self.embedding_provider() if options.sample else None
@@ -651,15 +673,14 @@ class WorkspaceOperations:
     def _batch_event(self, project, event, options):
         if self.project is not project:
             return  # Late results cannot land in another project.
-        dialog = getattr(self, "batch_dialog", None)
-        if dialog is not None:
-            dialog.event(event)
-        if getattr(self, "_smart_running", False) and event["kind"] == "progress":
-            self.smart_dialog.set_progress(
-                event["overall"], f"{event['video_id']}: {event['operation']}"
-            )
+        if event["kind"] == "progress":
+            self._report_batch_progress(event)
         if event["kind"] == "video":
             result = event["result"]
+            self.smart_dialog.add_result(
+                f"{result.video_id}: {result.status}"
+                + (f" - {result.error}" if result.error else "")
+            )
             video = project.videos[result.video_id]
             if result.status == "failed":
                 video.ui["last_failure"] = result.error
@@ -700,30 +721,7 @@ class WorkspaceOperations:
                 if event["cancelled"]:
                     self.smart_dialog.stopped("Stopped. Results from completed videos were kept.")
                 else:
-                    selected = [
-                        (r.video_id, r.selection)
-                        for r in event["results"]
-                        if r.selection is not None
-                    ]
-                    self._smart_selections = dict(selected)
-                    if selected:
-                        first = self._smart_selections.get(
-                            self._video_session.video_id, selected[0][1]
-                        )
-                        for index in range(5):
-                            self.smart_dialog.set_step(index, "done")
-                        candidates, issues = self.project_review_counts()
-                        self.smart_dialog.finish(
-                            first,
-                            total_samples=sum(selection.total for _, selection in selected),
-                            summary=f"Across {len(selected)} videos. Details below show the starting video.",
-                            predictions=candidates,
-                            issues=issues,
-                        )
-                    else:
-                        self.smart_dialog.fail(
-                            "No readable videos in the scope. Check Project Videos for missing files."
-                        )
+                    self._report_batch_finished(event)
             self._save_due = time.time() + 4
             self._render_timeline()
             self._refresh_workspace()
@@ -732,6 +730,70 @@ class WorkspaceOperations:
                 if event["cancelled"]
                 else "Project operation finished. Review suggestions or open a sampled frame."
             )
+
+    def _report_batch_progress(self, event):
+        """One event, one dialog.
+
+        The steps describe the video being worked on, so they start over when
+        the run moves to the next one; the second bar and the line above it
+        are what say which video that is.
+        """
+        from .smart_annotate import step_for_operation
+
+        if event["index"] != getattr(self, "_batch_video_index", None):
+            self._batch_video_index = event["index"]
+            self.smart_dialog.reset_steps()
+        self.smart_dialog.advance_to_step(step_for_operation(event["operation"]))
+        self.smart_dialog.set_progress(event["fraction"], event["operation"])
+        self.smart_dialog.set_overall(
+            event["overall"],
+            f"Video {event['index']} of {event['total']}: {event['video_id']}",
+        )
+
+    def _report_batch_finished(self, event):
+        """What the run produced, and the button that follows from it.
+
+        A run that only pre-labelled has no selection, and used to be reported
+        as "no readable videos" for want of one. Failure is now decided by
+        whether any video was read, not by whether sampling was asked for.
+        """
+        from .smart_annotate import STEPS
+
+        results = event["results"]
+        read = [r for r in results if r.status != "failed"]
+        failed = [r for r in results if r.status == "failed"]
+        selected = [(r.video_id, r.selection) for r in results if r.selection is not None]
+        self._smart_selections = dict(selected)
+        for index in range(len(STEPS)):
+            self.smart_dialog.set_step(index, "done")
+        self.smart_dialog.set_progress(1.0, "Finished.")
+        self.smart_dialog.set_overall(1.0)
+        if not read:
+            self.smart_dialog.fail(
+                "No readable videos in the scope. Check Project Videos for missing files."
+            )
+            return
+
+        first = None
+        total_samples = None
+        notes = []
+        if selected:
+            first = self._smart_selections.get(self._video_session.video_id, selected[0][1])
+            if len(selected) > 1:
+                total_samples = sum(selection.total for _, selection in selected)
+                notes.append(
+                    f"Across {len(selected)} videos. Details below show the starting video."
+                )
+        if failed:
+            notes.append(f"{len(failed)} of {len(results)} videos failed; the list above says why.")
+        candidates, issues = self.project_review_counts()
+        self.smart_dialog.finish(
+            first,
+            total_samples=total_samples,
+            summary=" ".join(notes),
+            predictions=candidates,
+            issues=issues,
+        )
 
     def _merge_video_candidates(self, video, candidates):
         if video.review is None:

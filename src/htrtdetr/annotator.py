@@ -22,12 +22,10 @@ Keyboard shortcuts (when canvas is focused):
 from __future__ import annotations
 
 import copy
-import json
 import math
 import queue
 import shutil
 import threading
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -514,6 +512,9 @@ class AnnotationApp(
             on_analyze=self.start_analysis,
             on_cancel=self.stop_analysis,
             on_apply=self.apply_selection,
+            on_review=lambda: self.review_next_project(),
+            on_pick_model=lambda: self.open_settings("model"),
+            on_scope=self.scope_summary,
         )
 
         self._ensure_project()
@@ -928,12 +929,12 @@ class AnnotationApp(
                     label="Copy Videos into Project Folder", callback=self.collect_videos
                 )
                 dpg.add_menu_item(
-                    label="Auto Annotate Project...",
-                    callback=lambda: self.open_batch_dialog("auto"),
+                    label="Pre-label videos with the model...",
+                    callback=lambda: self.open_smart_annotate("auto", "project"),
                 )
                 dpg.add_menu_item(
-                    label="Smart Sample Project...",
-                    callback=lambda: self.open_batch_dialog("sample"),
+                    label=shortcuts.with_key("Pick frames to label...", "auto.annotate"),
+                    callback=lambda: self.open_smart_annotate("sample", "project"),
                 )
                 dpg.add_menu_item(
                     label="Check Project Quality",
@@ -955,10 +956,6 @@ class AnnotationApp(
                 dpg.add_menu_item(label="Checks...", callback=lambda: self.open_settings("checks"))
 
             with dpg.menu(label="Review"):
-                dpg.add_menu_item(
-                    label=shortcuts.with_key("Smart Annotate...", "auto.annotate"),
-                    callback=self.open_smart_annotate,
-                )
                 dpg.add_menu_item(label="Project Review Inbox", callback=self.show_project_review)
                 dpg.add_menu_item(label="Review Inbox", callback=self.toggle_inbox)
                 dpg.add_menu_item(label="Review issues one by one", callback=self.open_review_mode)
@@ -1061,10 +1058,11 @@ class AnnotationApp(
                 # Settings were pushed past the right edge and could not be
                 # reached at all until the window was made wider.
                 widgets.toolbar_button(
-                    "Smart Annotate...",
-                    self.open_smart_annotate,
+                    "Pick frames to label",
+                    lambda *_: self.open_smart_annotate("sample"),
                     tag="top_smart",
                     height=26,
+                    shortcut=shortcuts.label_for("auto.annotate"),
                     help_text="Analyze this video and choose the frames and "
                     "clips worth your time, instead of scrolling "
                     "for somewhere to start.",
@@ -1529,7 +1527,7 @@ class AnnotationApp(
             "review.accept_all": self._accept_all_here,
             "review.discard_all": self._discard_all_here,
             "auto.track_forward": self._track_forward_selected,
-            "auto.annotate": self.open_smart_annotate,
+            "auto.annotate": lambda: self.open_smart_annotate("sample"),
             "auto.toggle_autotrack": self._toggle_auto_track_key,
             # edit
             "edit.delete": self.delete_selected,
@@ -1714,7 +1712,7 @@ class AnnotationApp(
                 13,
             ),
             (
-                shortcuts.with_key("Smart Annotate chooses the frames for you", "auto.annotate"),
+                shortcuts.with_key("Pick frames to label chooses them for you", "auto.annotate"),
                 theme.TEXT_FAINT,
                 13,
             ),
@@ -3759,15 +3757,40 @@ class AnnotationApp(
 
     # ─── Smart Annotate ──────────────────────────────────────────────
 
-    def open_smart_annotate(self) -> None:
-        if self.cap is None:
-            self._status("Open a video first (Ctrl+O), then run Smart Annotate.")
-            return
+    #: What the two menu entries mean, as ``(window title, pre-label on)``.
+    #: They are the same form: the only thing that ever differed between Auto
+    #: Annotate Project and Smart Sample Project was this checkbox.
+    SMART_MODES = {
+        "auto": ("Pre-label videos with the model", True),
+        "sample": ("Pick frames to label", False),
+    }
+
+    def open_smart_annotate(self, mode: str = "sample", scope: str = "") -> None:
+        """The one dialog, opened the way the entry point means it.
+
+        No video needs to be open: this runs over a scope, and the project
+        entries are reached from Project Videos without opening anything.
+        """
+        project = self._ensure_project()
+        if scope == "project" or (not scope and self.cap is None):
+            scope = "Selected videos" if project.selected_videos else "Entire project"
+        elif not scope:
+            scope = "Current video"
+        title, prelabel = self.SMART_MODES.get(mode, self.SMART_MODES["sample"])
         self._refresh_capability_gates()
+        name, frames, fps, videos = self.scope_summary(scope)
+        if not videos:
+            self._status("No videos in this scope. Add or select videos in Project Videos.")
+            return
         self.smart_dialog.show(
-            video_name=self.video_path.name if self.video_path else "video",
-            num_frames=self.num_frames,
-            fps=self.fps,
+            video_name=name,
+            num_frames=frames,
+            fps=fps,
+            videos=videos,
+            scope=scope,
+            prelabel=prelabel,
+            sample=True,
+            title=title,
         )
 
     def start_analysis(self, request, options: Dict[str, Any]) -> None:
@@ -3788,6 +3811,13 @@ class AnnotationApp(
             weights=weights,
             config=project.settings.get("config", ""),
             device="cuda" if options.get("use_gpu") else "cpu",
+            score_threshold=float(options.get("score_threshold", 0.3)),
+            # Derived, not asked. A project that follows individuals has no
+            # reason to leave its detections unconnected, and one that does
+            # not has nothing to connect them into - so the checkbox that used
+            # to ask was a question with one right answer either way.
+            connect_tracks=bool(project.settings.get("use_track_ids", True)),
+            sample=bool(options.get("sample", True)),
             stride=max(1, int(options.get("stride", 15))),
             request=request,
             balanced=options.get("balanced", True),
@@ -3803,38 +3833,6 @@ class AnnotationApp(
     def stop_analysis(self) -> None:
         self._analysis_stop = True
         self.stop_project_batch()
-
-    def _finish_analysis(self, selection, request) -> None:
-        """Main-thread tail of the scan: rebuild the copilot and report."""
-        self._selection = selection
-        self.rebuild_copilot()
-        self.smart_dialog.set_step(4, "done", f"{len(self._queue):,} to review")
-        predictions = sum(len(v) for v in self._candidate_map().values())
-        self.smart_dialog.finish(selection, predictions=predictions, issues=len(self._queue))
-        self._log_sampling(request, selection)
-        self._render_timeline()
-
-    def _log_sampling(self, request, selection) -> None:
-        """Record what produced this selection, for reproducibility (§40, §41)."""
-        record = dict(request.to_metadata())
-        record.update(
-            {
-                "selected_frames": len(selection.frames),
-                "selected_clips": len(selection.clips),
-                "pool_size": selection.pool_size,
-                "estimated_seconds": round(selection.estimated_seconds, 1),
-                "video": self.video_path.name if self.video_path else "",
-                "when": datetime.now().isoformat(timespec="seconds"),
-            }
-        )
-        self._sampling_log = getattr(self, "_sampling_log", [])
-        self._sampling_log.append(record)
-        if self.project_dir is not None:
-            try:
-                path = self.project_dir / "sampling_log.json"
-                path.write_text(json.dumps(self._sampling_log, indent=2), encoding="utf-8")
-            except OSError:
-                pass  # a log that cannot be written is not fatal
 
     def apply_selection(self, selection) -> None:
         """Take the user to the first sample and show the plan on the timeline."""
@@ -4502,7 +4500,7 @@ class AnnotationApp(
             "continue_animal": self.continue_animal,
             "click_animal": lambda: self.set_tool("click"),
             "draw_animal": lambda: self.set_tool("draw"),
-            "auto_annotate": lambda: self.open_batch_dialog("auto"),
+            "auto_annotate": lambda: self.open_smart_annotate("auto"),
             "guided_help": self.show_onboarding,
             "set_class": self._insp_set_class,
             "set_track": self._insp_set_track,

@@ -452,7 +452,7 @@ BINDINGS: tuple[Binding, ...] = (
     _b("auto.track_forward", "T", (), "Review",
        "Track the selected box forward from this frame"),
     _b("auto.annotate", "R", ("Ctrl",), "Review",
-       "Open Auto-Annotate"),
+       "Open Pick frames to label"),
     _b("auto.toggle_autotrack", "T", ("Ctrl",), "Review",
        "Turn auto-track mode on or off"),
 

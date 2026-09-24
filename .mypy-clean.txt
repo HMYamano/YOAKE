@@ -70,7 +70,6 @@ src/htrtdetr/geometry/obb.py
 src/htrtdetr/gui/__init__.py
 src/htrtdetr/gui/__main__.py
 src/htrtdetr/gui/auto_label.py
-src/htrtdetr/gui/batch_progress.py
 src/htrtdetr/gui/commands.py
 src/htrtdetr/gui/dialogs.py
 src/htrtdetr/gui/embedding.py

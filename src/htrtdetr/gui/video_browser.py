@@ -59,12 +59,12 @@ class VideoBrowser:
                     dpg.add_button(label="Clear selection", callback=self._clear_selection)
                 with dpg.group(horizontal=True):
                     dpg.add_button(
-                        label="Auto Annotate...",
-                        callback=lambda: self.app.open_batch_dialog("auto"),
+                        label="Pre-label with the model...",
+                        callback=lambda: self.app.open_smart_annotate("auto", "project"),
                     )
                     dpg.add_button(
-                        label="Smart Sample...",
-                        callback=lambda: self.app.open_batch_dialog("sample"),
+                        label="Pick frames to label...",
+                        callback=lambda: self.app.open_smart_annotate("sample", "project"),
                     )
                     dpg.add_button(
                         label="Quality Check",

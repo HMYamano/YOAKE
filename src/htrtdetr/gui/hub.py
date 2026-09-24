@@ -714,9 +714,9 @@ class Hub:
     )
 
     _RECOMMENDED_LOOP: Tuple[str, ...] = (
-        "Step 1 is the loop, and it closes without a model. Run Smart Annotate "
-        "to pick the frames, let Find all in frame or Continue propose the "
-        "boxes, review them, and run Smart Annotate again - the next pass "
+        "Step 1 is the loop, and it closes without a model. Run Pick frames to "
+        "label to choose them, let Find all in frame or Continue propose the "
+        "boxes, review them, and run it again - the next pass "
         "scores frames by how unlike your existing labels they are, so it "
         "carries on from where you stopped instead of re-rolling.",
         "Label in rounds of 20-50 frames rather than one long sitting. The "
@@ -727,9 +727,9 @@ class Hub:
         "stage buttons say. Watch the validation curve, not the training one.",
         "Analyze on a video the model has not seen, and step through the "
         "timeline instead of trusting the summary numbers.",
-        "A trained checkpoint then makes step 1 faster - Auto Annotate "
-        "pre-labels whole videos and uncertainty joins the sampling - but it "
-        "was never required to get here.",
+        "A trained checkpoint then makes step 1 faster - Pre-label videos with "
+        "the model does whole videos at a time and uncertainty joins the "
+        "sampling - but it was never required to get here.",
     )
 
     def _build_workflow(self, parent: str) -> None:
@@ -867,7 +867,7 @@ class Hub:
             "span of frames.",
             f"Track forward ({key('auto.track_forward')}) propagates a box you "
             "drew across later frames. It needs OpenCV only, never PyTorch.",
-            f"Auto-annotate ({key('auto.annotate')}) runs a trained detector "
+            f"Pick frames to label ({key('auto.annotate')}) runs a trained detector "
             "and brings the result back as candidates you accept or discard.",
             f"Save with {key('file.save')}. Candidates are never written to "
             "annotations.json.",

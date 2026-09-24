@@ -201,55 +201,46 @@ def test_smart_annotate_keeps_start_annotating_on_screen(app):
     _pump()
 
 
-def test_the_project_batch_form_keeps_run_on_screen(app):
-    app.open_batch_dialog("auto")
+def test_the_project_entry_points_open_one_dialog(app):
+    """Pre-label and Pick frames are the same window, and its Run stays on
+    screen in both - there is no second project form to fall off the bottom."""
+    for mode in ("auto", "sample"):
+        app.open_smart_annotate(mode, "project")
+        _pump()
+        _assert_button_inside(app.smart_dialog.tag, app.smart_dialog._t("go"))
+    app.smart_dialog.hide()
     _pump()
-    _assert_button_inside("project_batch", "batch_run")
-    dpg.delete_item("project_batch")
-    widgets.forget_dialog("project_batch")
 
 
-def test_a_finished_project_batch_offers_the_review_it_produced(app, monkeypatch):
+def test_a_finished_run_offers_the_review_it_produced(app):
     """A run that ends in "3 completed, 1 cached" is a dead end.
 
     The finished state has to carry the user into the review, so the count and
     the next action are the same button - and that button has to be reachable,
     which is what the rest of this file is about.
     """
-    app.open_batch_dialog("auto")
+    app.open_smart_annotate("auto", "project")
+    app.smart_dialog.finish(None, predictions=412, issues=37)
     _pump()
-    monkeypatch.setattr(app, "project_review_counts", lambda: (412, 37))
-    visited = []
-    monkeypatch.setattr(app, "review_next_project", lambda: visited.append("review") or True)
-
-    app.batch_dialog.event({"kind": "finished", "results": [], "cancelled": False})
-    _pump()
-    assert dpg.is_item_shown("batch_review")
-    assert not dpg.is_item_shown("batch_followup")
-    label = dpg.get_item_label("batch_review")
+    review = app.smart_dialog._t("review")
+    assert dpg.is_item_shown(review)
+    label = dpg.get_item_label(review)
     assert "412" in label and "37" in label, label
-    _assert_button_inside("project_batch", "batch_review")
-
-    dpg.get_item_callback("batch_review")()
+    _assert_button_inside(app.smart_dialog.tag, review)
+    app.smart_dialog.hide()
     _pump()
-    assert visited == ["review"]
-    assert not dpg.is_item_shown("project_batch")
-    dpg.delete_item("project_batch")
-    widgets.forget_dialog("project_batch")
 
 
-def test_a_project_batch_that_found_nothing_offers_no_button(app, monkeypatch):
+def test_a_run_that_found_nothing_offers_no_review_button(app):
     """A button that does nothing when pressed is worse than no button."""
-    app.open_batch_dialog("auto")
+    app.open_smart_annotate("auto", "project")
+    app.smart_dialog.finish(None, predictions=0, issues=0)
     _pump()
-    monkeypatch.setattr(app, "project_review_counts", lambda: (0, 0))
-    app.batch_dialog.event({"kind": "finished", "results": [], "cancelled": True})
+    assert not dpg.is_item_shown(app.smart_dialog._t("review"))
+    assert dpg.is_item_shown(app.smart_dialog._t("apply"))
+    assert dpg.get_item_label(app.smart_dialog._t("apply")) == "Close"
+    app.smart_dialog.hide()
     _pump()
-    assert not dpg.is_item_shown("batch_review")
-    assert dpg.is_item_shown("batch_followup")
-    assert "Nothing to review" in dpg.get_value("batch_followup")
-    dpg.delete_item("project_batch")
-    widgets.forget_dialog("project_batch")
 
 
 def test_the_video_browser_fits(app):

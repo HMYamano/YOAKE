@@ -317,7 +317,7 @@ class Inspector:
             widgets.primary_button("Click an animal (C)", self._cb("click_animal"), height=28)
             widgets.secondary_button("Draw a box (W)", self._cb("draw_animal"), height=28)
             widgets.secondary_button(
-                "Detect automatically...", self._cb("auto_annotate"), height=28
+                "Pre-label with the model...", self._cb("auto_annotate"), height=28
             )
             dpg.add_text("", tag=self._t("n_frame"), color=theme.TEXT)
             dpg.add_text("", tag=self._t("n_time"), color=theme.TEXT_DIM)

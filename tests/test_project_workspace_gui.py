@@ -282,28 +282,28 @@ def test_the_model_tab_owns_the_checkpoint(app, tmp_path):
     assert dpg.get_item_label("top_model") == "Model: none"
 
 
-def test_auto_annotate_without_a_model_offers_one_instead_of_greying_out(app):
+def test_pre_labelling_without_a_model_offers_one_instead_of_greying_out(app):
     """A locked checkbox with its reason three widgets further down reads as a
     broken dialog. Without a model the option is not there at all, and what is
     there is the way to get one."""
     app.project.settings["weights"] = ""
-    app.open_batch_dialog("auto")
+    app.open_smart_annotate("auto", "project")
     dpg.render_dearpygui_frame()
-    assert not dpg.is_item_shown("batch_model_group")
-    assert dpg.is_item_shown("batch_nomodel_group")
-    assert dpg.does_item_exist("batch_pick_model")
-    assert not dpg.get_value("batch_detect")
-    # The checkpoint fields are gone from this form for good.
-    assert not dpg.does_item_exist("batch_weights")
-    assert not dpg.does_item_exist("batch_config")
-    dpg.hide_item("project_batch")
+    dialog = app.smart_dialog
+    assert not dpg.is_item_shown(dialog._t("prelabel_group"))
+    assert dpg.is_item_shown(dialog._t("nomodel_group"))
+    assert dpg.does_item_exist(dialog._t("pick_model"))
+    assert not dpg.get_value(dialog._t("prelabel"))
+    # Frame picking never needed a model and is still on offer.
+    assert dpg.get_value(dialog._t("sample"))
+    dialog.hide()
 
 
-def test_auto_annotate_takes_the_checkpoint_from_the_project(app, tmp_path, monkeypatch):
+def test_the_run_takes_the_checkpoint_from_the_project(app, tmp_path, monkeypatch):
     checkpoint = tmp_path / "best.pth"
     checkpoint.write_bytes(b"not a real checkpoint")
     app.project.settings.update(weights=str(checkpoint), config="cfg.yml")
-    app.open_batch_dialog("auto")
+    app.open_smart_annotate("auto", "project")
     dpg.render_dearpygui_frame()
 
     started = {}
@@ -312,18 +312,19 @@ def test_auto_annotate_takes_the_checkpoint_from_the_project(app, tmp_path, monk
         "start_project_batch",
         lambda scope, options: started.update(scope=scope, options=options) or False,
     )
-    app.batch_dialog._run()
+    app.start_analysis(app.smart_dialog.request(), dict(app.smart_dialog.options(),
+                                                        generate_candidates=True))
     assert started["options"].weights == str(checkpoint)
     assert started["options"].config == "cfg.yml"
-    dpg.hide_item("project_batch")
+    app.smart_dialog.hide()
 
 
-def test_choosing_a_model_unlocks_an_open_auto_annotate(app, tmp_path):
+def test_choosing_a_model_unlocks_the_open_dialog(app, tmp_path):
     """The dialog that said "no model" has to notice when one arrives."""
     app.project.settings["weights"] = ""
-    app.open_batch_dialog("auto")
+    app.open_smart_annotate("auto", "project")
     dpg.render_dearpygui_frame()
-    assert dpg.is_item_shown("batch_nomodel_group")
+    assert dpg.is_item_shown(app.smart_dialog._t("nomodel_group"))
 
     checkpoint = tmp_path / "best.pth"
     checkpoint.write_bytes(b"not a real checkpoint")
@@ -337,9 +338,31 @@ def test_choosing_a_model_unlocks_an_open_auto_annotate(app, tmp_path):
     from htrtdetr.gui.sam_session import repo_root
 
     if auto_label_mod.check_backend(repo_root(), str(checkpoint)).ok:
-        assert dpg.is_item_shown("batch_model_group")
-        assert dpg.get_value("batch_detect")
-    dpg.hide_item("project_batch")
+        assert dpg.is_item_shown(app.smart_dialog._t("prelabel_group"))
+        assert not dpg.is_item_shown(app.smart_dialog._t("nomodel_group"))
+    app.smart_dialog.hide()
+
+
+def test_the_finished_dialog_walks_into_the_review(app):
+    """The candidates a run produced are the next action, so the run ends on
+    a button that names them and goes there."""
+    a, b = app.project.videos.values()
+    b.review = ReviewSession({6: [Candidate([2, 2, 12, 12], class_id=1)]})
+    app.open_smart_annotate("auto", "project")
+    candidates, issues = app.project_review_counts()
+    app.smart_dialog.finish(None, predictions=candidates, issues=issues)
+    dpg.render_dearpygui_frame()
+
+    review = app.smart_dialog._t("review")
+    assert dpg.is_item_shown(review)
+    assert "1 candidate" in dpg.get_item_label(review)
+
+    app._project_review_key = None
+    app.smart_dialog._on_review_clicked()
+    dpg.render_dearpygui_frame()
+    assert not app.smart_dialog.visible
+    assert app._video_session is b
+    assert app.current_frame_idx == 6
 
 
 def test_project_review_counts_span_every_video(app):
@@ -415,13 +438,13 @@ def test_copy_and_class_edit_keep_obb_and_history(app):
 
 def test_browser_batch_help_build_with_current_project(app):
     app.show_video_browser()
-    app.open_batch_dialog("sample")
+    app.open_smart_annotate("sample", "project")
     app.show_project_review()
     app.show_onboarding()
     app._show_help()
     for tag in (
         "project_videos",
-        "project_batch",
+        app.smart_dialog.tag,
         "project_review",
         "guided_annotation",
         "help_win",
