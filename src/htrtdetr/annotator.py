@@ -869,7 +869,7 @@ class AnnotationApp(
             width=max(dpg.get_viewport_width() - 120, 700),
             height=max(dpg.get_viewport_height() - 90, 520),
         )
-        self._refresh_capability_gates()
+        self._refresh_model_ui()
         self._refresh_propagation_ui()
         self._refresh_history_ui()
         self._refresh_workspace()
@@ -948,6 +948,7 @@ class AnnotationApp(
                 dpg.add_menu_item(
                     label="Tracking...", callback=lambda: self.open_settings("tracking")
                 )
+                dpg.add_menu_item(label="Model...", callback=lambda: self.open_settings("model"))
                 dpg.add_menu_item(
                     label="Assistance...", callback=lambda: self.open_settings("assist")
                 )
@@ -1038,6 +1039,20 @@ class AnnotationApp(
                 theme.bind_h2(dpg.last_item())
                 dpg.add_text("", tag="top_project", color=theme.TEXT_DIM)
                 widgets.status_pill("top_saved", "No changes", "idle")
+                # Whether a model exists decides what half the project menu can
+                # do, so it is read off the top bar rather than discovered as a
+                # grey checkbox inside a dialog. The chip is the way there too.
+                widgets.status_pill(
+                    "top_model",
+                    "Model: none",
+                    "idle",
+                    callback=lambda *_: self.open_settings("model"),
+                )
+                widgets.attach_tooltip(
+                    "top_model",
+                    "The detector checkpoint this project pre-labels with. "
+                    "Click to choose one (Project > Model...).",
+                )
                 dpg.add_spacer(width=16)
 
                 # No hand-picked widths in this row. dearpygui sizes a button
@@ -3185,6 +3200,8 @@ class AnnotationApp(
             "use_track_ids": self.set_use_track_ids,
             "sticky_draw": self._set_sticky_draw,
             "click_backend": self.set_click_backend,
+            "pick_weights": self._pick_model_checkpoint,
+            "model_changed": self._on_model_changed,
             "reset_trackers": self._reset_all_trackers,
             "reset_selected_tracker": self._reset_selected_tracker,
             "quality_changed": self._on_quality_changed,
@@ -3193,13 +3210,17 @@ class AnnotationApp(
         }
 
     def open_settings(self, tab: str = "") -> None:
+        settings = self._ensure_project().settings
         self.settings.load(
             config=self.quality_config,
             project_dir=self.project_dir,
             auto_track=self._auto_track,
             sticky_draw=self._sticky_draw,
             use_track_ids=self.use_track_ids,
+            weights=settings.get("weights", ""),
+            config_path=settings.get("config", ""),
         )
+        self._refresh_model_ui()
         dpg.set_value(
             "settings_end_behavior",
             (
@@ -3554,6 +3575,51 @@ class AnnotationApp(
     def _capability(self):
         return auto_label.probe(_repo_root())
 
+    # ─── The project's detector checkpoint ───────────────────────────
+
+    def _pick_model_checkpoint(self) -> None:
+        path = _tk_open_file(
+            "Detector checkpoint", [("Checkpoint", "*.pth *.pt"), ("All files", "*.*")]
+        )
+        if path is None:
+            return
+        if dpg.does_item_exist(self.settings._t("weights")):
+            dpg.set_value(self.settings._t("weights"), str(path))
+        self._on_model_changed()
+
+    def _on_model_changed(self) -> None:
+        """The Model tab edited the checkpoint; the project now owns it."""
+        weights, config = self.settings.model_paths()
+        self._ensure_project().settings.update(weights=weights, config=config)
+        self._mark_dirty()
+        self._refresh_model_ui()
+
+    def _refresh_model_ui(self) -> None:
+        """Say the same thing about the model everywhere it is said.
+
+        The top bar chip, the Model tab's status line, Smart Annotate's locked
+        options and the project batch's gate all answer "is there a model?",
+        and they answer it from this one probe so they cannot disagree.
+        """
+        settings = self._ensure_project().settings
+        weights = str(settings.get("weights", "") or "")
+        try:
+            status = auto_label.check_backend(_repo_root(), weights)
+        except Exception:
+            return
+        name = Path(weights).name if weights else ""
+        if dpg.does_item_exist("top_model"):
+            widgets.status_pill(
+                "top_model",
+                f"Model: {name}" if name else "Model: none",
+                "ok" if status.ok else "idle",
+            )
+        self.settings.set_model_status(status.message, status.ok)
+        self._refresh_capability_gates()
+        dialog = getattr(self, "batch_dialog", None)
+        if dialog is not None and dpg.does_item_exist(dialog.tag):
+            dialog.gate()
+
     def _refresh_capability_gates(self) -> None:
         """Lock what this machine cannot do, with the reason (P4)."""
         try:
@@ -3577,7 +3643,7 @@ class AnnotationApp(
                 "Detector pre-labelling needs a trained checkpoint, which step 2 "
                 "produces once the labels are done - so this option turns on "
                 "later, and nothing here waits for it.\n"
-                "Choose one in Project > Auto Annotate Project when you have it.\n"
+                "Choose one in Project > Model... when you have it.\n"
                 "Until then the boxes come from the segmentation helper: press C "
                 "to click an animal, or select a box and press Continue."
             )
@@ -3711,7 +3777,11 @@ class AnnotationApp(
         weights = options.get("weights") or project.settings.get("weights", "")
         detect = bool(options.get("generate_candidates"))
         if detect and not weights:
-            self.smart_dialog.fail("Choose a detector checkpoint in Auto Annotate Project first.")
+            self.smart_dialog.fail(
+                "No detector checkpoint yet. Choose one in Project > Model..., "
+                "or turn off Generate annotation candidates and pick frames to "
+                "label by hand."
+            )
             return
         batch = BatchOptions(
             detect=detect,

@@ -240,6 +240,9 @@ class WorkspaceMixin(WorkspaceOperations):
         # The new project decides whether boxes carry track ids, so the track
         # controls have to follow it rather than the one just closed.
         self._refresh_track_ui()
+        # The checkpoint belongs to the project, so the chip that reports it
+        # has to change with the project rather than with the dialog.
+        self._refresh_model_ui()
         self._refresh_sidebar()
         self._render_canvas()
         self._render_timeline()

@@ -9,12 +9,13 @@ folder, how many animals the experiment has. A setting is decided once and then
 lived with, so it has no business competing with the image for attention on every
 frame.
 
-Five tabs, one window, built hidden at startup:
+Six tabs, one window, built hidden at startup:
 
 =============  ===========================================================
 Project        Folder, expected animal count, autosave state
 Labels         Class and action vocabularies
 Tracking       Auto-track, the OpenCV backend this build actually has
+Model          The detector checkpoint, and whether it can run here
 Assistance     Click to Box backend, drawing behaviour
 Checks         The nine detectors' thresholds, all of them advanced
 =============  ===========================================================
@@ -44,7 +45,7 @@ from . import click_segment, theme, widgets
 
 __all__ = ["SettingsDialog", "TABS", "THRESHOLD_FIELDS"]
 
-TABS: Tuple[str, ...] = ("Project", "Labels", "Tracking", "Assistance", "Checks")
+TABS: Tuple[str, ...] = ("Project", "Labels", "Tracking", "Model", "Assistance", "Checks")
 
 #: The :class:`~htrtdetr.annotation.quality.QualityConfig` fields worth exposing,
 #: with the sentence that says what changing one does. Every other field on that
@@ -182,6 +183,7 @@ class SettingsDialog:
                     self._build_project_tab()
                     self._build_labels_tab()
                     self._build_tracking_tab(tracker_label, tracker_hint)
+                    self._build_model_tab()
                     self._build_assistance_tab(tips)
                     self._build_checks_tab()
 
@@ -409,6 +411,74 @@ class SettingsDialog:
         if not enabled:
             self._set("auto_track_cb", False)
 
+    # -- Model ------------------------------------------------------------
+    def _build_model_tab(self) -> None:
+        """Where the checkpoint lives.
+
+        It used to live inside Auto Annotate Project, which made "no model" a
+        greyed-out checkbox two dialogs deep, and made Smart Annotate tell the
+        user to go and open a different dialog first. A checkpoint is a
+        property of the project, not an argument to one run of one dialog, so
+        it belongs here beside the folder and the label vocabularies.
+        """
+        with dpg.tab(label="Model", tag=self._t("tab_model")):
+            widgets.gap(1)
+            widgets.section_header(
+                "Detector checkpoint",
+                "The only thing in the annotator that needs a trained model.",
+            )
+            dpg.add_text(
+                "Step 2 writes this file to runs/train/stage4/weights/best.pth. "
+                "Until it exists, labelling runs without it: press C to click an "
+                "animal, and the frame sampling below Pick frames to label needs "
+                "no model at all.",
+                color=theme.TEXT_DIM,
+                wrap=self.WIDTH - 60,
+            )
+            widgets.gap(1)
+            dpg.add_input_text(
+                label="Checkpoint",
+                tag=self._t("weights"),
+                width=self.WIDTH - 200,
+                callback=lambda *_: self._call("model_changed"),
+            )
+            widgets.secondary_button(
+                "Browse...",
+                self._cb("pick_weights"),
+                width=200,
+                height=28,
+                tag=self._t("pick_weights"),
+            )
+            dpg.add_input_text(
+                label="Config (optional)",
+                tag=self._t("config"),
+                width=self.WIDTH - 200,
+                callback=lambda *_: self._call("model_changed"),
+            )
+            widgets.gap(2)
+            # Always on screen, whatever it says. "Why is that checkbox grey?"
+            # is a question the user should never have to go looking for the
+            # answer to, so the answer is stated where the setting is.
+            dpg.add_text("Status", color=theme.TEXT)
+            dpg.add_text(
+                "", tag=self._t("model_status"), color=theme.TEXT_DIM, wrap=self.WIDTH - 60
+            )
+
+    def model_paths(self) -> Tuple[str, str]:
+        """``(checkpoint, config)`` as the fields currently read."""
+        return (
+            str(self._get(self._t("weights"), "") or ""),
+            str(self._get(self._t("config"), "") or ""),
+        )
+
+    def set_model_status(self, message: str, ok: bool = False) -> None:
+        """Show what :func:`auto_label.check_backend` said, verbatim."""
+        self._set(self._t("model_status"), message)
+        if dpg.does_item_exist(self._t("model_status")):
+            dpg.configure_item(
+                self._t("model_status"), color=theme.ACCEPTED if ok else theme.TEXT_DIM
+            )
+
     # -- Assistance -------------------------------------------------------
     def _build_assistance_tab(self, tips: Mapping[str, str]) -> None:
         with dpg.tab(label="Assistance", tag=self._t("tab_assist")):
@@ -506,11 +576,15 @@ class SettingsDialog:
         auto_track: bool = False,
         sticky_draw: bool = False,
         use_track_ids: bool = True,
+        weights: str = "",
+        config_path: str = "",
     ) -> None:
         """Fill every control from the annotator's current state."""
         if not self._built:
             return
         self._set("project_dir_text", str(project_dir) if project_dir else "(not set)")
+        self._set(self._t("weights"), str(weights or ""))
+        self._set(self._t("config"), str(config_path or ""))
         self._set("expected_mode", "Fixed" if config.expected_animals is not None else "Variable")
         self._set("expected_count", int(config.expected_animals or 2))
         self._set("auto_track_cb", bool(auto_track) and bool(use_track_ids))

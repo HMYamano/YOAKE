@@ -817,7 +817,7 @@ def set_locked(tag: str, reason: str, *, unlocked_tooltip: str = "") -> None:
 PILL_KINDS: Tuple[str, ...] = ("idle", "running", "ok", "warn", "error", "pending")
 
 
-def status_pill(tag: str, text: str, kind: str = "idle") -> None:
+def status_pill(tag: str, text: str, kind: str = "idle", *, callback=None) -> None:
     """Create or update a small filled status pill.
 
     ``kind`` is ``idle`` | ``running`` | ``ok`` | ``warn`` | ``error`` |
@@ -826,15 +826,20 @@ def status_pill(tag: str, text: str, kind: str = "idle") -> None:
 
     Terminal wording is a fixed triple on the subject noun — "X finished" /
     "X failed" / "X stopped". A stop is never an error.
+
+    ``callback`` makes the pill the way *to* the thing it reports on, which is
+    the only honest answer to a chip that says something is missing.
     """
     if kind not in PILL_KINDS:
         kind = "idle"
     if _exists(tag):
         _configure(tag, label=text)
+        if callback is not None:
+            _configure(tag, callback=callback)
         theme.bind(tag, theme.pill_theme(kind))
         return
     try:
-        dpg.add_button(label=text, tag=tag, enabled=True, height=22)
+        dpg.add_button(label=text, tag=tag, enabled=True, height=22, callback=callback)
     except SystemError:
         return
     theme.bind(tag, theme.pill_theme(kind))

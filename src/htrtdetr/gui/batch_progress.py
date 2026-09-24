@@ -48,6 +48,14 @@ class BatchDialog:
         self.app = app
         self.tag = "project_batch"
         self.running = False
+        #: What "Generate object candidates" starts as, when there is a model
+        #: to generate them with. Auto Annotate opens with it on, Smart Sample
+        #: with it off, and :meth:`gate` has to remember which.
+        self._detect_default = False
+        #: Whether the last :meth:`gate` found no model, so that a model
+        #: arriving mid-dialog restores the entry point's default instead of
+        #: leaving the option off and looking like it did not take.
+        self._was_gated = False
 
     def show(self, mode="auto"):
         if dpg.does_item_exist(self.tag):
@@ -72,27 +80,34 @@ class BatchDialog:
                         "Selected videos" if self.app.project.selected_videos else "Entire project"
                     ),
                 )
-                dpg.add_checkbox(
-                    label="Generate object candidates",
-                    tag="batch_detect",
-                    default_value=mode == "auto",
-                )
-                with dpg.group(horizontal=True):
-                    dpg.add_input_text(
-                        label="Checkpoint",
-                        tag="batch_weights",
-                        width=390,
-                        default_value=settings.get("weights", ""),
-                        callback=self._gate,
+                # The checkpoint is not an argument to this run: it belongs
+                # to the project, Project > Model... owns it and the top bar
+                # says whether there is one. What used to be here was a locked
+                # checkbox, then an empty path field, then the sentence saying
+                # why - the causes after the effect, in a dialog the user had
+                # to be told to open from a different dialog.
+                self._detect_default = mode == "auto"
+                self._was_gated = False
+                with dpg.group(tag="batch_model_group"):
+                    dpg.add_checkbox(
+                        label="Generate object candidates",
+                        tag="batch_detect",
+                        default_value=self._detect_default,
                     )
-                    dpg.add_button(label="Browse...", callback=self._weights)
-                dpg.add_input_text(
-                    label="Config (optional)",
-                    tag="batch_config",
-                    width=390,
-                    default_value=settings.get("config", ""),
-                )
-                dpg.add_text("", tag="batch_reason", color=theme.TEXT_DIM, wrap=610)
+                with dpg.group(tag="batch_nomodel_group", show=False):
+                    dpg.add_text(
+                        "No model yet. You can still pick which frames to label.",
+                        color=theme.TEXT,
+                        wrap=610,
+                    )
+                    widgets.secondary_button(
+                        "Choose a model...",
+                        lambda *_: self.app.open_settings("model"),
+                        width=220,
+                        height=28,
+                        tag="batch_pick_model",
+                    )
+                    dpg.add_text("", tag="batch_reason", color=theme.TEXT_DIM, wrap=610)
                 # A project that does not follow individuals has nothing to
                 # connect detections into, so the option is locked rather than
                 # offered and then quietly ignored.
@@ -194,31 +209,36 @@ class BatchDialog:
             dpg.configure_item("batch_review", show=False)
             dpg.add_text("", tag="batch_followup", color=theme.TEXT_DIM, wrap=610, show=False)
         widgets.place_dialog(self.tag, self.WIDTH, self.HEIGHT)
-        self._gate()
+        self.gate()
 
     def _review(self, *_a):
         """Close, and take the user to the first thing this run produced."""
         dpg.hide_item(self.tag)
         self.app.review_next_project()
 
-    def _weights(self):
-        from .file_dialogs import open_file as _tk_open_file
+    def gate(self):
+        """Offer detection, or say there is no model. Never both, never grey.
 
-        path = _tk_open_file(
-            "Detector checkpoint", [("Checkpoint", "*.pth *.pt"), ("All files", "*.*")]
-        )
-        if path is not None:
-            dpg.set_value("batch_weights", str(path))
-        self._gate()
-
-    def _gate(self):
+        Called again from the annotator whenever the project's checkpoint
+        changes, so choosing one in Project > Model... turns the option on in
+        a dialog that is already open.
+        """
         from .sam_session import repo_root as _repo_root
 
-        status = auto_label.check_backend(_repo_root(), dpg.get_value("batch_weights") or "")
-        dpg.configure_item("batch_detect", enabled=status.ok)
+        if not dpg.does_item_exist("batch_detect"):
+            return
+        status = auto_label.check_backend(_repo_root(), self._model_weights())
+        dpg.configure_item("batch_model_group", show=status.ok)
+        dpg.configure_item("batch_nomodel_group", show=not status.ok)
         if not status.ok:
             dpg.set_value("batch_detect", False)
+        elif self._was_gated:
+            dpg.set_value("batch_detect", self._detect_default)
+        self._was_gated = not status.ok
         dpg.set_value("batch_reason", status.message)
+
+    def _model_weights(self):
+        return str(self.app.project.settings.get("weights", "") or "")
 
     def _run(self):
         target = {
@@ -229,15 +249,15 @@ class BatchDialog:
         strategy = next(
             k for k, v in sampling.STRATEGY_LABELS.items() if v == dpg.get_value("batch_strategy")
         )
+        settings = self.app.project.settings
         options = BatchOptions(
             detect=dpg.get_value("batch_detect"),
-            weights=dpg.get_value("batch_weights"),
-            config=dpg.get_value("batch_config"),
+            weights=str(settings.get("weights", "") or ""),
+            config=str(settings.get("config", "") or ""),
             device=dpg.get_value("batch_device"),
             score_threshold=dpg.get_value("batch_threshold"),
             connect_tracks=(
-                dpg.get_value("batch_track")
-                and self.app.project.settings.get("use_track_ids", True)
+                dpg.get_value("batch_track") and settings.get("use_track_ids", True)
             ),
             sample=dpg.get_value("batch_sample"),
             stride=max(1, dpg.get_value("batch_stride")),
@@ -251,7 +271,6 @@ class BatchDialog:
             ),
             quality=self.app.quality_config,
         )
-        self.app.project.settings.update(weights=options.weights, config=options.config)
         if self.app.start_project_batch(dpg.get_value("batch_scope"), options):
             self.running = True
             dpg.configure_item("batch_run", enabled=False)

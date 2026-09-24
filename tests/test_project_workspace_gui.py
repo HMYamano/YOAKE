@@ -260,6 +260,88 @@ def test_next_review_crosses_videos_and_keeps_ground_truth(app):
     assert not b.annotations
 
 
+def test_the_model_tab_owns_the_checkpoint(app, tmp_path):
+    """One place to put the model, and the top bar reports it.
+
+    It used to be an argument to Auto Annotate Project, which is why Smart
+    Annotate's error told the user to go and open a different dialog first.
+    """
+    checkpoint = tmp_path / "best.pth"
+    checkpoint.write_bytes(b"not a real checkpoint")
+    app.open_settings("model")
+    dpg.set_value(app.settings._t("weights"), str(checkpoint))
+    app._on_model_changed()
+    app.settings.hide()
+
+    assert app.project.settings["weights"] == str(checkpoint)
+    assert dpg.get_item_label("top_model") == "Model: best.pth"
+    assert app.settings._get(app.settings._t("model_status"))
+
+    app.project.settings["weights"] = ""
+    app._refresh_model_ui()
+    assert dpg.get_item_label("top_model") == "Model: none"
+
+
+def test_auto_annotate_without_a_model_offers_one_instead_of_greying_out(app):
+    """A locked checkbox with its reason three widgets further down reads as a
+    broken dialog. Without a model the option is not there at all, and what is
+    there is the way to get one."""
+    app.project.settings["weights"] = ""
+    app.open_batch_dialog("auto")
+    dpg.render_dearpygui_frame()
+    assert not dpg.is_item_shown("batch_model_group")
+    assert dpg.is_item_shown("batch_nomodel_group")
+    assert dpg.does_item_exist("batch_pick_model")
+    assert not dpg.get_value("batch_detect")
+    # The checkpoint fields are gone from this form for good.
+    assert not dpg.does_item_exist("batch_weights")
+    assert not dpg.does_item_exist("batch_config")
+    dpg.hide_item("project_batch")
+
+
+def test_auto_annotate_takes_the_checkpoint_from_the_project(app, tmp_path, monkeypatch):
+    checkpoint = tmp_path / "best.pth"
+    checkpoint.write_bytes(b"not a real checkpoint")
+    app.project.settings.update(weights=str(checkpoint), config="cfg.yml")
+    app.open_batch_dialog("auto")
+    dpg.render_dearpygui_frame()
+
+    started = {}
+    monkeypatch.setattr(
+        app,
+        "start_project_batch",
+        lambda scope, options: started.update(scope=scope, options=options) or False,
+    )
+    app.batch_dialog._run()
+    assert started["options"].weights == str(checkpoint)
+    assert started["options"].config == "cfg.yml"
+    dpg.hide_item("project_batch")
+
+
+def test_choosing_a_model_unlocks_an_open_auto_annotate(app, tmp_path):
+    """The dialog that said "no model" has to notice when one arrives."""
+    app.project.settings["weights"] = ""
+    app.open_batch_dialog("auto")
+    dpg.render_dearpygui_frame()
+    assert dpg.is_item_shown("batch_nomodel_group")
+
+    checkpoint = tmp_path / "best.pth"
+    checkpoint.write_bytes(b"not a real checkpoint")
+    app.open_settings("model")
+    dpg.set_value(app.settings._t("weights"), str(checkpoint))
+    app._on_model_changed()
+    app.settings.hide()
+    dpg.render_dearpygui_frame()
+
+    from htrtdetr.gui import auto_label as auto_label_mod
+    from htrtdetr.gui.sam_session import repo_root
+
+    if auto_label_mod.check_backend(repo_root(), str(checkpoint)).ok:
+        assert dpg.is_item_shown("batch_model_group")
+        assert dpg.get_value("batch_detect")
+    dpg.hide_item("project_batch")
+
+
 def test_project_review_counts_span_every_video(app):
     """The one arithmetic behind both finished states.
 
