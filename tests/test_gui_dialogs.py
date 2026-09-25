@@ -190,6 +190,49 @@ def test_smart_annotate_keeps_its_action_on_screen(app):
     _pump()
 
 
+def test_first_labels_need_no_model_or_sampling_switch(app):
+    dialog = app.smart_dialog
+    dialog.set_capability(predict_reason="No trained detector")
+    dialog.show(video_name="new.mp4", num_frames=300, sample=False, prelabel=True)
+    _pump()
+    assert dialog.options()["sample"]
+    assert not dialog.options()["generate_candidates"]
+    assert not dialog.request().prelabelled
+    assert not dpg.is_item_shown(dialog._t("sample"))
+    assert not dpg.is_item_shown(dialog._t("balanced"))
+    # Loading a checkpoint is optional and sits behind Advanced.
+    assert dpg.get_item_parent(dialog._t("pick_model")) == dialog._t("model_setup")
+    assert not dpg.get_value(dialog._t("advanced"))
+    # The first-session choices must be visible without scrolling at 900x600.
+    for suffix in ("scope", "target", "budget_mode", "samples", "advanced", "estimate_note"):
+        _assert_button_inside(dialog.tag, dialog._t(suffix))
+        assert dpg.is_item_visible(dialog._t(suffix))
+    dialog.hide()
+
+
+def test_completed_sampling_has_one_next_action_and_a_reachable_reset(app):
+    from htrtdetr.annotation import sampling
+
+    dialog = app.smart_dialog
+    dialog.show(video_name="new.mp4", num_frames=300)
+    selection = sampling.Selection(frames=[1, 20])
+    dialog.finish(selection, predictions=3)
+    _pump()
+    assert not dpg.is_item_shown(dialog._t("form"))
+    assert not dpg.is_item_shown(dialog._t("review"))
+    for suffix in ("apply", "again"):
+        button = dialog._t(suffix)
+        _assert_button_inside(dialog.tag, button)
+        bx, _ = dpg.get_item_rect_min(button)
+        bw, _ = dpg.get_item_rect_size(button)
+        wx, _, ww, _ = _assert_on_screen(dialog.tag)
+        assert bx + bw <= wx + ww
+    dialog._on_reset_clicked()
+    assert dpg.is_item_shown(dialog._t("form"))
+    dialog.hide()
+    _pump()
+
+
 def test_smart_annotate_keeps_start_annotating_on_screen(app):
     """The result phase adds four more blocks to an already-long form, and the
     button it produces is the entire point of having run the analysis."""
@@ -202,12 +245,19 @@ def test_smart_annotate_keeps_start_annotating_on_screen(app):
 
 
 def test_the_project_entry_points_open_one_dialog(app):
-    """Pre-label and Pick frames are the same window, and its Run stays on
-    screen in both - there is no second project form to fall off the bottom."""
-    for mode in ("auto", "sample"):
-        app.open_smart_annotate(mode, "project")
+    """Every entry point opens one window, whatever scope it means by it.
+
+    There used to be a ``mode`` argument choosing between two captions for
+    this window, and the second caption named a checkbox the window hides
+    whenever the project has no checkpoint - which is every new project. The
+    scope is the only thing an entry point now decides, and the Run button has
+    to stay on screen for each of them.
+    """
+    for scope in ("", "project"):
+        app.open_smart_annotate(scope)
         _pump()
         _assert_button_inside(app.smart_dialog.tag, app.smart_dialog._t("go"))
+        assert dpg.get_item_label(app.smart_dialog.tag) == "Pick frames to label"
     app.smart_dialog.hide()
     _pump()
 
@@ -219,7 +269,7 @@ def test_a_finished_run_offers_the_review_it_produced(app):
     the next action are the same button - and that button has to be reachable,
     which is what the rest of this file is about.
     """
-    app.open_smart_annotate("auto", "project")
+    app.open_smart_annotate("project")
     app.smart_dialog.finish(None, predictions=412, issues=37)
     _pump()
     review = app.smart_dialog._t("review")
@@ -233,7 +283,7 @@ def test_a_finished_run_offers_the_review_it_produced(app):
 
 def test_a_run_that_found_nothing_offers_no_review_button(app):
     """A button that does nothing when pressed is worse than no button."""
-    app.open_smart_annotate("auto", "project")
+    app.open_smart_annotate("project")
     app.smart_dialog.finish(None, predictions=0, issues=0)
     _pump()
     assert not dpg.is_item_shown(app.smart_dialog._t("review"))
@@ -241,6 +291,117 @@ def test_a_run_that_found_nothing_offers_no_review_button(app):
     assert dpg.get_item_label(app.smart_dialog._t("apply")) == "Close"
     app.smart_dialog.hide()
     _pump()
+
+
+def test_the_train_round_dialog_fits_and_offers_start(app):
+    """The round has no form, so Start is the only thing to reach - and it is
+    the thing that must never be the part below the fold."""
+    app.round_dialog.show(plan="312 labelled frames in 6 videos.")
+    _pump()
+    _assert_on_screen(app.round_dialog.tag)
+    _assert_button_inside(app.round_dialog.tag, app.round_dialog._t("go"))
+    assert not dpg.get_value(app.round_dialog._t("adjust")), "the knobs stay folded"
+    app.round_dialog.hide()
+    _pump()
+
+
+def test_the_finished_round_offers_the_next_step_not_close(app):
+    """A round exists to make the next pass better, so the button says so."""
+    dialog = app.round_dialog
+    dialog.show(plan="x")
+    dialog.finish(title="Round 1 finished.", body="This round's model is now the "
+                  "project's model.", where="Kept in runs/rounds/round-001")
+    _pump()
+    _assert_button_inside(dialog.tag, dialog._t("analyze"))
+    assert dpg.is_item_shown(dialog._t("analyze"))
+    assert not dpg.is_item_shown(dialog._t("adopt")), "nothing to override"
+    assert not dpg.is_item_shown(dialog._t("go"))
+    dialog.hide()
+    _pump()
+
+
+def test_a_round_that_scored_worse_offers_the_override(app):
+    dialog = app.round_dialog
+    dialog.show(plan="x")
+    dialog.finish(title="Round 2 finished.", body="Not better.", offer_adopt=True)
+    _pump()
+    assert dpg.is_item_shown(dialog._t("adopt"))
+    _assert_button_inside(dialog.tag, dialog._t("adopt"))
+    dialog.hide()
+    _pump()
+
+
+def test_stopping_a_round_is_not_an_error_and_stays_fixable(app):
+    """A stop is a stop: the form comes back, with no error styling."""
+    dialog = app.round_dialog
+    started = []
+    dialog.on_start, saved = started.append, dialog.on_start
+    try:
+        dialog.show(plan="x")
+        dialog._on_start_clicked()
+        assert dialog.running and started
+        assert not dpg.is_item_shown(dialog._t("go")), "Start is gone while it runs"
+        assert dpg.is_item_shown(dialog._t("stop"))
+        dialog.stopped("Stopped at pass 3.")
+        _pump()
+        assert not dialog.running
+        assert dpg.is_item_shown(dialog._t("go")), "the form comes back"
+        assert dpg.get_item_label(dialog._t("go")) == "Start again"
+    finally:
+        dialog.on_start = saved
+    dialog.hide()
+    _pump()
+
+
+def test_a_round_without_a_project_folder_refuses_before_it_spawns(app):
+    """Training writes into the project folder, so there has to be one - and
+    the refusal names where to make one rather than only that it is off."""
+    saved, app.project_dir = app.project_dir, None
+    try:
+        assert "Settings > Project" in app.train_round_blocked()
+        app.round_dialog.show(plan="x")
+        app.round_dialog._on_start_clicked()
+        _pump()
+        assert not app.round_dialog.running
+        assert dpg.is_item_shown(app.round_dialog._t("go"))
+    finally:
+        app.project_dir = saved
+    app.round_dialog.hide()
+    _pump()
+
+
+def test_analyze_is_locked_until_a_model_exists(app):
+    """Running a detector needs a detector, and the sentence says the button
+    one to the left makes one - not 'go and find a .pth'."""
+    from htrtdetr.gui import widgets
+
+    app._ensure_project().settings.pop("weights", None)
+    reason = app.analyze_blocked()
+    assert "Train makes one" in reason
+
+    app.refresh_loop_gates()
+    _pump()
+    assert widgets.is_locked("top_analyze"), "dimmed, not dead"
+    assert "Train makes one" in widgets.lock_reason("top_analyze")
+
+    app.open_smart_annotate(preset="analyze")
+    _pump()
+    assert not app.smart_dialog.visible, "no window opens with nothing to run"
+
+
+def test_the_gate_lifts_the_moment_a_model_exists(app, tmp_path):
+    from htrtdetr.gui import widgets
+
+    checkpoint = tmp_path / "best.pth"
+    checkpoint.write_bytes(b"x")
+    app._ensure_project().settings["weights"] = str(checkpoint)
+    app.refresh_loop_gates()
+    _pump()
+    assert not widgets.is_locked("top_analyze")
+    app._ensure_project().settings.pop("weights", None)
+    app.refresh_loop_gates()
+    _pump()
+    assert widgets.is_locked("top_analyze")
 
 
 def test_the_video_browser_fits(app):
@@ -288,3 +449,96 @@ def test_the_unavailable_dialog_fits(app):
     _assert_button_inside("unavailable_win", "unavailable_close")
     dpg.delete_item("unavailable_win")
     widgets.forget_dialog("unavailable_win")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Activity
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_the_activity_window_fits_and_keeps_close_on_screen(app):
+    """The window a user opens *because* something already went wrong.
+
+    It is the last place that may need resizing before it can be read: by the
+    time it is open, the user is already looking for a reason.
+    """
+    app.activity.build()
+    app.show_activity()
+    _pump()
+    _assert_on_screen("activity")
+    _assert_button_inside("activity", "activity_close")
+    app.activity.hide()
+
+
+def test_the_activity_window_shows_what_the_status_line_said(app):
+    app.activity.build()
+    app._status("Could not read that checkpoint: no such file")
+    app.show_activity()
+    _pump()
+    body = dpg.get_value("activity_messages")
+    assert "Could not read that checkpoint" in body
+    assert "! " in body, "an error must be marked, not only coloured"
+    app.activity.hide()
+
+
+def test_the_problems_filter_hides_the_chatter(app):
+    app.activity.build()
+    app.activity.clear()
+    app._status("Frame 12/160  |  Annotated: 0/160 (0%)")
+    app._status("Could not open that video")
+    app.show_activity()
+    _pump()
+    app.activity.set_filter("problems")
+    _pump()
+    body = dpg.get_value("activity_messages")
+    assert "Could not open that video" in body
+    assert "Frame 12/160" not in body
+    app.activity.set_filter("all")
+    app.activity.hide()
+
+
+def test_the_pill_reports_the_error_count(app):
+    app.activity.clear()
+    app._status("Could not do the thing")
+    _pump()
+    assert dpg.does_item_exist("top_activity")
+    assert "1 error" in dpg.get_item_label("top_activity")
+    app.activity.clear()
+    app._refresh_activity_pill()
+    assert dpg.get_item_label("top_activity") == "Activity"
+
+
+def test_the_activity_window_toggles_rather_than_stacking(app):
+    app.activity.build()
+    app.toggle_activity()
+    _pump()
+    assert app.activity.visible
+    app.toggle_activity()
+    _pump()
+    assert not app.activity.visible
+
+
+def test_the_activity_window_shows_a_run_log_off_disk(app, tmp_path):
+    """The traceback that killed a round is in a file, not in this process.
+
+    Training and inference both write to ``stdout=<file>`` rather than a pipe
+    (a pipe nobody drains blocks the child once the OS buffer fills), so the
+    only complete record of a failed run is on disk. This pane is the way to
+    it without a file browser.
+    """
+    folder = tmp_path / "runs" / "rounds" / "round-004" / "stage1"
+    folder.mkdir(parents=True)
+    (folder / "round.log").write_text(
+        "Epoch 1/40\nRuntimeError: CUDA out of memory\n", encoding="utf-8"
+    )
+    previous = app.project_dir
+    app.project_dir = tmp_path
+    try:
+        app.activity.build()
+        app.show_activity()
+        _pump()
+        assert "round-004" in dpg.get_value("activity_logs")
+        assert "CUDA out of memory" in dpg.get_value("activity_runlog")
+    finally:
+        app.activity.hide()
+        app.project_dir = previous

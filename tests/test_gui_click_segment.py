@@ -442,10 +442,14 @@ def app():
     ``AnnotationApp.__init__`` only sets state, so the click path can be driven
     headlessly. Only the three methods that would talk to a window are replaced.
     """
-    pytest.importorskip("dearpygui.dearpygui")
+    dpg = pytest.importorskip("dearpygui.dearpygui")
     from htrtdetr.annotator import AnnotationApp
+    from htrtdetr.gui import theme
 
     a = AnnotationApp()
+    # Most tests exercise the deterministic, dependency-free fitter. Automatic
+    # helper startup is covered separately with a controlled completion below.
+    a._click_backend = "local"
     a.frame_w, a.frame_h = 200, 200
     a.current_frame_idx = 0
     a.status_messages = []
@@ -453,7 +457,16 @@ def app():
     a._render_canvas = lambda: None
     a._refresh_sidebar = lambda: None
     a._refresh_tool_ui = lambda: None
-    return a
+    yield a
+    # ``AnnotationApp.__init__`` calls ``dpg.create_context()``. Seventy of
+    # those in one module and never a ``destroy_context`` is a leak the module
+    # itself survives - it never opens a window - but the next GUI module in
+    # the same pytest process does not: by then dearpygui is deep enough in
+    # stale contexts that a modal window opened with ``show=True`` is closed
+    # again on its first rendered frame, and the failure lands in
+    # ``test_gui_dialogs.py`` with nothing to say it came from here.
+    dpg.destroy_context()
+    theme.reset_cache()
 
 
 @needs_cv2
@@ -520,6 +533,62 @@ def test_annotator_click_with_no_frame_says_so(app):
     app._click_to_box(10, 10)
     assert app.annotations.get(0, []) == []
     assert app.status_messages[-1] == cs.DIAGNOSES[cs.NO_FRAME]
+
+
+@needs_cv2
+def test_automatic_click_starts_once_and_falls_back_without_losing_the_click(app):
+    app._click_backend = "auto"
+    app._current_bgr = _frame_with(_ellipse_mask())
+    starts = []
+    app._start_sam = lambda **kwargs: starts.append(kwargs)
+    app._click_to_box(100, 100)
+    app._click_to_box(100, 100)
+    assert len(starts) == 1
+    assert not starts[0]["report_failure"]
+    assert not app.annotations.get(0)
+    starts[0]["on_done"](False)
+    assert len(app.annotations[0]) == 1
+    app._click_to_box(100, 100)
+    assert len(starts) == 1, "an unavailable helper must not delay every click"
+
+
+@needs_cv2
+def test_automatic_click_resumes_with_the_ready_helper(app):
+    app._click_backend = "auto"
+    app._current_bgr = _frame_with(_ellipse_mask())
+    starts, requests = [], []
+    app._start_sam = lambda **kwargs: starts.append(kwargs)
+    app._request_sam_point = requests.append
+    app._click_to_box(100, 100)
+    app._sam_client = _fake_helper()
+    starts[0]["on_done"](True)
+    assert len(requests) == 1
+    assert (requests[0].x, requests[0].y) == (100, 100)
+    assert not app.annotations.get(0)
+
+
+@pytest.mark.parametrize("change", ["frame", "image", "tool", "class", "backend"])
+@needs_cv2
+def test_automatic_click_does_not_replay_after_the_user_moves_on(app, change):
+    app._click_backend = "auto"
+    app._current_bgr = _frame_with(_ellipse_mask())
+    starts = []
+    app._start_sam = lambda **kwargs: starts.append(kwargs)
+    app._click_to_box(100, 100)
+    if change == "frame":
+        app.current_frame_idx = 1
+    elif change == "image":
+        app._current_bgr = app._current_bgr.copy()
+    elif change == "tool":
+        app.set_tool("draw")
+    elif change == "class":
+        app.active_class_id = 1
+    else:
+        app._click_backend = "local"
+    starts[0]["on_done"](False)
+    assert not app.annotations
+    assert not app._click_start_pending
+    assert "cancelled" in app.status_messages[-1]
 
 
 @needs_cv2
@@ -971,6 +1040,16 @@ def test_a_failed_start_reports_one_line_and_releases_the_waiting_press(app, mon
     assert app._sam_client is None
     assert app._sam_starting is False
     assert app.status_messages[-1] == "No Python has PyTorch."
+
+
+def test_automatic_start_failure_does_not_interrupt_labelling_with_a_dialog(app, monkeypatch):
+    spawned, dialogs, answered = [], [], []
+    monkeypatch.setattr(app, "_sam_start_worker", spawned.append)
+    monkeypatch.setattr(app, "_show_unavailable", lambda *args: dialogs.append(args))
+    app._start_sam(on_done=answered.append, report_failure=False)
+    app._finish_sam_start(spawned[0], _cap(usable=False, reason="No helper"), None, "")
+    assert answered == [False]
+    assert not dialogs
 
 
 def test_stopping_while_starting_discards_the_helper_that_lands_later(app, monkeypatch):

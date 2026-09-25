@@ -193,7 +193,10 @@ class VideoControllerMixin:
         self._render_canvas()
         if not light:
             self._refresh_sidebar()
-        self._render_timeline()
+        # Moving the playhead is the only thing a frame change does to the
+        # timeline, so it is the only thing that gets redone. Every edit goes
+        # through the full rebuild on its own path.
+        self._render_timeline(playhead_only=True)
 
         # SAM を使っているなら、この新しいフレームを先に encode させておく。
         # ユーザが個体を探している間に終わらせるのが狙い。

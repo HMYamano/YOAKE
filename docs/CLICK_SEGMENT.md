@@ -486,7 +486,7 @@ capability 判定を先、フレーム読み込みを後にしてあります �
 ## §7 バックエンド C — `model`
 
 Auto-Annotate が既に `predictions.json` から `Candidate` を作れます。`model` バックエンドは
-**推論を走らせません**。`File > Load Predictions for Click to Box...` で読んだ検出のうち、
+**推論を走らせません**。`File > Load Predictions > As boxes for Click animal...` で読んだ検出のうち、
 クリック点に当たるものを 1 つ採用して返すだけです (`click_segment.pick_candidate`)。
 学習済みモデルはハエ専用に訓練されているので、**学習が回ったあとはこれが最も正確**です。
 SAM はあくまで「学習データが無い立ち上げ期」の道具です。

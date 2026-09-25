@@ -92,16 +92,28 @@ class ReviewInbox:
         on_start_review: Optional[Callable[[], None]] = None,
         on_accept_kind: Optional[Callable[[str], None]] = None,
         on_reanalyze: Optional[Callable[[], None]] = None,
+        on_next_chosen: Optional[Callable[[], None]] = None,
+        on_train: Optional[Callable[[], None]] = None,
+        on_next_final: Optional[Callable[[], None]] = None,
+        on_final_checked: Optional[Callable[[], None]] = None,
+        on_sign_off: Optional[Callable[[], None]] = None,
     ) -> None:
         self.tag = tag
         self.on_select = on_select
         self.on_start_review = on_start_review
         self.on_accept_kind = on_accept_kind
         self.on_reanalyze = on_reanalyze
+        self.on_next_chosen = on_next_chosen
+        self.on_train = on_train
+        self.on_next_final = on_next_final
+        self.on_final_checked = on_final_checked
+        self.on_sign_off = on_sign_off
         self.queue = review_queue.ReviewQueue()
         self.fps = 25.0
         self._built = False
         self._page = 0
+        self._round_done = False
+        self._final_ready = False
 
     # ── plumbing ─────────────────────────────────────────────────────────
     def _t(self, suffix: str) -> str:
@@ -139,12 +151,57 @@ class ReviewInbox:
             dpg.add_separator()
             widgets.gap(1)
 
+            # ── this round's work list ──────────────────────────────────
+            # The queue below is *questions about* the labelling; this block
+            # is the labelling. They are different jobs and the round one
+            # comes first, because an inbox that says "94 items" while the
+            # round it belongs to is 12 frames into 100 answers the smaller
+            # question loudly and the larger one not at all.
+            with dpg.group(tag=self._t("round"), show=False):
+                dpg.add_text("This round", color=theme.TEXT)
+                theme.bind_h2(dpg.last_item())
+                dpg.add_text("", tag=self._t("round_count"), color=theme.TEXT_DIM,
+                             wrap=self.WIDTH - 20)
+                dpg.add_text("", tag=self._t("round_note"), color=theme.TEXT_FAINT,
+                             wrap=self.WIDTH - 20)
+                widgets.primary_button(
+                    "Go to the next one", lambda *_: self._on_round_action(),
+                    height=30, tag=self._t("round_go"))
+                widgets.gap(1)
+                dpg.add_separator()
+                widgets.gap(1)
+
+            # ── the final pass ──────────────────────────────────────────
+            # Shown only once this video has been looked at end to end, which
+            # is once in the life of a project. It replaces the round block
+            # rather than sitting beside it: they are two different jobs and
+            # the user is only ever doing one of them.
+            with dpg.group(tag=self._t("final"), show=False):
+                dpg.add_text("Final pass", color=theme.TEXT)
+                theme.bind_h2(dpg.last_item())
+                dpg.add_text("", tag=self._t("final_count"), color=theme.TEXT_DIM,
+                             wrap=self.WIDTH - 20)
+                widgets.primary_button(
+                    "Go to the next place", lambda *_: self._on_final_action(),
+                    height=30, tag=self._t("final_go"))
+                widgets.secondary_button(
+                    "This stretch is fine", lambda *_: self._call(self.on_final_checked),
+                    height=28, width=-1, tag=self._t("final_ok"))
+                widgets.attach_tooltip(
+                    self._t("final_ok"),
+                    "Record that you looked at the stretch around this frame "
+                    "and the boxes in it are right. Nothing is written to your "
+                    "labels; it moves this video closer to being signed off.")
+                widgets.gap(1)
+                dpg.add_separator()
+                widgets.gap(1)
+
             with dpg.group(tag=self._t("empty"), show=True):
                 widgets.empty_state(
                     "Nothing to review yet.\n\n"
-                    "Run Smart Annotate, or load predictions, and the places "
-                    "worth a second look will appear here.",
-                    "Smart Annotate...",
+                    "Pick the frames to label, box the animals, and whatever "
+                    "is worth a second look collects here.",
+                    "Pick frames to label...",
                     lambda *_: self._call(self.on_reanalyze),
                     wrap=self.WIDTH - 24, tag=self._t("empty_state"))
 
@@ -196,6 +253,81 @@ class ReviewInbox:
     def _call(fn: Optional[Callable], *args: Any) -> None:
         if fn is not None:
             fn(*args)
+
+    # ── this round's work list ───────────────────────────────────────────
+    def set_round(
+        self,
+        here: Any = None,
+        *,
+        project: Any = None,
+        note: str = "",
+        round_number: int = 0,
+    ) -> None:
+        """Show how far through this round's frames the user is.
+
+        ``here`` and ``project`` are
+        :class:`~htrtdetr.annotation.sampling.SelectionProgress` for this video
+        and for the whole project; either may be ``None``. The block hides
+        itself when there is no selection, which is the state a project is in
+        before its first round and after a dense pass.
+
+        The button has two jobs and one position, because they are the same
+        job at two moments: while frames are left it goes to the next one, and
+        when none are it trains on what they produced. A second button that is
+        dead for the first ninety-nine frames of every round teaches the user
+        to ignore that corner of the panel.
+        """
+        chosen = getattr(here, "chosen", 0) if here is not None else 0
+        self._show(self._t("round"), bool(chosen))
+        if not chosen:
+            self._round_done = False
+            return
+        checked = getattr(here, "checked", 0)
+        line = f"{checked} of {chosen} frames checked here"
+        total = getattr(project, "chosen", 0) if project is not None else 0
+        if total and total != chosen:
+            line += f", {getattr(project, 'checked', 0)} of {total} across the project"
+        prefix = f"Round {round_number}. " if round_number else ""
+        self._set(self._t("round_count"), f"{prefix}{line}.")
+        self._round_done = checked >= chosen
+        self._set(
+            self._t("round_note"),
+            note or ("Every frame this round chose has been checked."
+                     if self._round_done else ""),
+        )
+        if dpg.does_item_exist(self._t("round_go")):
+            dpg.configure_item(
+                self._t("round_go"),
+                label="Train on these labels" if self._round_done else "Go to the next one",
+            )
+
+    def _on_round_action(self) -> None:
+        self._call(self.on_train if self._round_done else self.on_next_chosen)
+
+    def set_final(self, sentence: str = "", *, ready: bool = False) -> None:
+        """Show how far through the final pass this video is.
+
+        ``sentence`` empty hides the block, which is the state of every project
+        until the day someone runs the pass. ``ready`` flips the button from
+        walking to signing off, for the same reason the round block's does:
+        they are the same job at two moments, and a sign-off button that is
+        dead for the first hundred and thirty stops is one the eye stops
+        seeing before it matters.
+        """
+        self._show(self._t("final"), bool(sentence))
+        self._final_ready = bool(ready)
+        if not sentence:
+            return
+        self._set(self._t("final_count"), sentence)
+        if dpg.does_item_exist(self._t("final_go")):
+            dpg.configure_item(
+                self._t("final_go"),
+                label="Sign off this video" if ready else "Go to the next place",
+            )
+        self._show(self._t("final_ok"), not ready)
+
+    def _on_final_action(self) -> None:
+        self._call(self.on_sign_off if self._final_ready else self.on_next_final)
 
     # ── data ─────────────────────────────────────────────────────────────
     def set_queue(self, queue: review_queue.ReviewQueue, *, fps: float = 25.0) -> None:

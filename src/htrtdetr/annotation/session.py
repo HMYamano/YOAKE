@@ -45,6 +45,12 @@ class VideoSession:
     visited: set = field(default_factory=set)
     ui: dict = field(default_factory=dict)
     transient: dict = field(default_factory=dict)
+    #: The final pass over every frame of this video, as
+    #: :mod:`htrtdetr.annotation.finalpass` shapes it. ``{}`` until the pass
+    #: has run. The boxes themselves are **not** here - they are in the
+    #: ledger on disk - because this dict is serialised into the project
+    #: manifest on every autosave and an hour of video is 216,000 boxes.
+    final_pass: dict = field(default_factory=dict)
 
     @property
     def missing(self) -> bool:

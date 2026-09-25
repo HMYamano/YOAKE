@@ -225,6 +225,66 @@ class ProjectLayout:
     def summary(self) -> Path:
         return self.datasets / "summary"
 
+    # ── active-learning rounds ───────────────────────────────────────────
+    # Separate from the production locations above, and deliberately so.
+    #
+    # ``runs/rounds`` rather than ``runs/train``: the CLI finds the checkpoint
+    # to initialise a stage>1 run by globbing ``runs/train/*/stage{N}`` and
+    # taking the newest by modification time. A round trained on this
+    # morning's forty frames, written under that glob, would silently become
+    # what a production ``train stage=2`` warm-starts from.
+    #
+    # ``datasets/rounds`` holds one shared ``images/`` tree with the per-round
+    # annotation files **beside** it, because the trainer resolves every
+    # image path against the directory holding the annotation file. Split
+    # files in a folder of their own resolve their images into a folder that
+    # does not exist - and a missing image is not an error, it is a black
+    # frame and a plausible-looking run.
+    @property
+    def rounds(self) -> Path:
+        return self.datasets / "rounds"
+
+    @property
+    def round_images(self) -> Path:
+        return self.rounds / "images"
+
+    def round_data(self, number: int, part: str = "") -> Path:
+        stem = f"round-{int(number):03d}"
+        return self.rounds / (f"{stem}.{part}.json" if part else f"{stem}.json")
+
+    def round_run(self, number: int) -> Path:
+        return self.runs / "rounds" / f"round-{int(number):03d}" / "stage1"
+
+    # ── the final pass ───────────────────────────────────────────────────
+    # The model's boxes for every frame of every video, and the dataset built
+    # from the ones a human signed off. Under ``datasets/`` and not under the
+    # cache: the cache is pruned, and this is the deliverable's source.
+    @property
+    def final(self) -> Path:
+        return self.datasets / "final"
+
+    def final_ledger(self, video_id: str) -> Path:
+        """One JSON-lines file per video: what the model found in every frame.
+
+        Not ``annotations.json`` and not ``video.review``. An hour of video at
+        30 fps with two animals in it is 216,000 boxes; the project manifest is
+        rewritten whole on every autosave and the review session is deep-copied
+        on every undo, so routing the final pass through either turns a
+        keystroke into a second of work and a save into a minute of it. This
+        file is appended to once, read in windows, and never held whole.
+        """
+        return self.final / f"{_safe_name(video_id)}.jsonl"
+
+    @property
+    def release(self) -> Path:
+        """The exported dataset: what the study is for."""
+        return self.datasets / "release"
+
+    @property
+    def rounds_log(self) -> Path:
+        """What each round cost and bought, beside the sampling log."""
+        return self.root / "rounds.json"
+
     # ── operations ───────────────────────────────────────────────────────
     def create(self) -> ProjectLayout:
         """Make the folder skeleton. Idempotent, and never touches content."""
@@ -404,6 +464,18 @@ def find_project(start: Path | str) -> Path | None:
         if manifest.is_file():
             return manifest
     return None
+
+
+def _safe_name(video_id: str) -> str:
+    """A filename from a video id, which is a path stem and may be anything.
+
+    The same character class :func:`project_folder_name` rejects, plus a
+    length cap: a video id is derived from a filename a user chose, and on
+    Windows a 255-character component is a hard error rather than a truncation.
+    """
+    cleaned = "".join("_" if c in '<>:"/' + chr(92) + '|?*' else c for c in str(video_id))
+    cleaned = cleaned.strip(" .")
+    return (cleaned or "video")[:120]
 
 
 def project_folder_name(name: str) -> str:

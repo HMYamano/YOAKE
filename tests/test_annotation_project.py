@@ -27,7 +27,7 @@ from htrtdetr.annotation.objects import AnnObject
 from htrtdetr.annotation.project import ProjectSession, scan_folder
 from htrtdetr.annotation.quality import ReviewItem
 from htrtdetr.annotation.review_queue import ReviewQueue
-from htrtdetr.annotation.session import video_scoped
+from htrtdetr.annotation.session import VideoSession, video_scoped
 from htrtdetr.data.annotation import load_annotation
 from htrtdetr.gui.auto_label import Candidate, ReviewSession
 
@@ -424,3 +424,144 @@ def test_snapshot_retention_is_bounded(project, tmp_path):
     for _ in range(5):
         project.save(tmp_path / "project.yoake.json")
     assert len(list((tmp_path / ".yoake" / "snapshots").glob("*.json"))) == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The snapshot's cost, which is a freeze the user sees
+# ══════════════════════════════════════════════════════════════════════════
+#
+# ``snapshot`` runs on the **main thread** on purpose: the worker that writes
+# the file must never read structures the user is still editing. That makes
+# the detach itself a frozen window, and after a detector run it is a long
+# one — 28,800 candidates a video, twenty videos in this study, every four
+# seconds. So the detach is cheap (``Candidate.to_dict``,
+# ``ReviewSession.saved_rows``) and is not repeated for videos nobody touched.
+#
+# The cache is the risky half: a stale row is lost work. These tests pin the
+# three rules that make it safe.
+
+
+def _rows(state):
+    return {row["video_id"]: row for row in state["videos"]}
+
+
+def test_a_cached_row_is_identical_to_a_fresh_one(project, tmp_path):
+    video = project.videos["b"]
+    video.review = ReviewSession({0: [Candidate([1, 1, 10, 10], class_id=1)]})
+    video.review.reject(0, 0)
+    video.predictions = {0: [Candidate([2, 2, 20, 20])]}
+    video.visited.add(7)
+
+    fresh = _rows(project.snapshot(tmp_path, always=tuple(project.videos))[1])
+    cached = _rows(project.snapshot(tmp_path)[1])
+    assert json.dumps(cached, sort_keys=True) == json.dumps(fresh, sort_keys=True)
+
+
+def test_touching_a_video_invalidates_its_row(project, tmp_path):
+    project.snapshot(tmp_path, always=tuple(project.videos))
+    project.videos["a"].status = "done"
+    project.videos["a"].touch()
+    assert _rows(project.snapshot(tmp_path)[1])["a"]["status"] == "done"
+
+
+def test_an_untouched_video_is_not_re_detached(project, tmp_path):
+    """The whole point: nineteen videos nobody edited cost nothing."""
+    project.snapshot(tmp_path, always=tuple(project.videos))
+    calls = []
+    real = type(project)._video_row
+    type(project)._video_row = lambda self, v, b: (calls.append(v.video_id), real(self, v, b))[1]
+    try:
+        project.snapshot(tmp_path, always=("a",))
+    finally:
+        type(project)._video_row = real
+    assert calls == ["a"], f"re-detached {calls}, expected only the open video"
+
+
+def test_always_forces_a_rebuild_even_without_a_touch(project, tmp_path):
+    """``visited`` and the playhead move without marking a video dirty.
+
+    A frame step must not make the save chip say "Unsaved", so ``_visit_frame``
+    does not call ``touch()``. The autosave therefore names the open video in
+    ``always``, and this is what makes that enough.
+    """
+    project.snapshot(tmp_path, always=tuple(project.videos))
+    project.videos["a"].visited.add(42)
+    assert 42 not in _rows(project.snapshot(tmp_path)[1])["a"]["visited"]
+    assert 42 in _rows(project.snapshot(tmp_path, always=("a",))[1])["a"]["visited"]
+
+
+def test_a_deliberate_save_never_uses_the_cache(project, tmp_path):
+    """Ctrl+S is the user asking for certainty, so it rebuilds everything."""
+    project.snapshot(tmp_path, always=tuple(project.videos))
+    project.videos["a"].visited.add(99)  # changed without a touch
+    project.save(tmp_path / "project.yoake.json")
+    reopened = ProjectSession.open(tmp_path / "project.yoake.json")
+    assert 99 in reopened.videos["a"].visited
+
+
+def test_a_different_destination_is_not_a_cache_hit(project, tmp_path):
+    """Paths in a row are relative to the base, so the base is part of the key."""
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    here = _rows(project.snapshot(tmp_path)[1])["a"]["path"]
+    there = _rows(project.snapshot(other)[1])["a"]["path"]
+    assert here != there, "the export reused rows written for another folder"
+
+
+def test_to_dict_matches_asdict_exactly(project):
+    """The fast detach must be the same answer, not a similar one."""
+    from dataclasses import asdict as _asdict
+
+    candidate = Candidate(
+        [1, 2, 3, 4], obb=[1.0, 2.0, 3.0, 4.0, 0.5], score=0.75, track_id=3,
+        action_id=2, class_id=1, source="track", provenance={"model": "best.pth"},
+    )
+    assert candidate.to_dict() == _asdict(candidate)
+    assert Candidate([0, 0, 1, 1]).to_dict() == _asdict(Candidate([0, 0, 1, 1]))
+
+
+def test_saved_rows_matches_the_public_accessors():
+    session = ReviewSession({
+        5: [Candidate([1, 1, 2, 2]), Candidate([3, 3, 4, 4])],
+        1: [Candidate([5, 5, 6, 6])],
+    })
+    session.reject(5, 0)
+    session.edit(1, 0, class_id=1)
+    from dataclasses import asdict as _asdict
+
+    expected = [
+        {
+            "frame": frame,
+            "candidates": [
+                {"candidate": _asdict(c), "state": session.state(frame, i),
+                 "edited": session.is_edited(frame, i)}
+                for i, c in enumerate(session.candidates(frame))
+            ],
+        }
+        for frame in session.frames
+    ]
+    assert session.saved_rows() == expected
+
+
+def test_a_replaced_session_under_the_same_id_is_not_a_cache_hit(project, tmp_path):
+    """A fresh ``VideoSession`` restarts ``revision`` at 0.
+
+    Remove and re-add a video, or let ``_sync_project`` swap the open session
+    in under the same id, and the revision counter says "unchanged" about a
+    completely different object. The cache therefore checks identity, not only
+    the number.
+    """
+    project.snapshot(tmp_path, always=tuple(project.videos))
+    replacement = VideoSession(
+        video_id="a", path=project.videos["a"].path, num_frames=100, status="done"
+    )
+    project.videos["a"] = replacement
+    assert _rows(project.snapshot(tmp_path)[1])["a"]["status"] == "done"
+
+
+def test_a_removed_video_does_not_linger_in_the_cache(project, tmp_path):
+    project.snapshot(tmp_path, always=tuple(project.videos))
+    assert "b" in project._row_cache
+    del project.videos["b"]
+    project.snapshot(tmp_path)
+    assert "b" not in project._row_cache, "a removed video kept its candidates alive"

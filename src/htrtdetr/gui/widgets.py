@@ -777,6 +777,12 @@ def locked(tag: str, reason: str) -> None:
         return
     _configure(tag, enabled=False)
     theme.bind(tag, theme.disabled_theme())
+    # The control's own tooltip goes first. A button built with help_text
+    # already carries one under ``<tag>__tip``, and leaving it attached means
+    # the dimmed control hovers with two explanations - the promise it can no
+    # longer keep, and the reason it cannot. Which of the two the user sees is
+    # up to dearpygui's ordering, which is not a coin a UI gets to flip.
+    _drop(f"{tag}__tip")
     attach_tooltip(tag, reason, wrap=420, tooltip_tag=f"{tag}__lock_tip")
 
 
@@ -789,7 +795,10 @@ def unlock(tag: str, tooltip_text: str = "") -> None:
     _drop(f"{tag}__lock_tip")
     theme.bind(tag, theme.ghost_theme())
     if tooltip_text:
-        attach_tooltip(tag, tooltip_text, wrap=320, tooltip_tag=f"{tag}__lock_tip")
+        # Back under the control's own tooltip tag, because that is the one
+        # ``locked`` removes next time. Restoring it under the lock tag would
+        # leave it behind on the second lock.
+        attach_tooltip(tag, tooltip_text, wrap=320)
 
 
 def is_locked(tag: str) -> bool:

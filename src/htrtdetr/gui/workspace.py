@@ -276,7 +276,16 @@ class WorkspaceMixin(WorkspaceOperations):
         if thread is not None and thread.is_alive():
             return
         path = self.project_dir / PROJECT_FILE
-        data, state = project.snapshot(path.parent)
+        # The open video is always re-detached: ``visited``, ``last_frame`` and
+        # ``ui`` change as the user merely looks around, and deliberately do
+        # not mark the video dirty. Every other video's row comes from the
+        # cache unless something called ``touch()`` on it. Without this, a
+        # twenty-video study with a detector run in it spent three seconds of
+        # frozen window every four seconds re-serialising candidates nobody
+        # had touched.
+        data, state = project.snapshot(
+            path.parent, always=(self._video_session.video_id,)
+        )
         revisions = {v.video_id: v.revision for v in project.videos.values()}
         position_revision = self._workspace_revision
         self._save_due = None
@@ -445,7 +454,10 @@ class WorkspaceMixin(WorkspaceOperations):
         # study one level down and leave the real folder behind.
         if self.project_dir is not None:
             self._save_workspace(ProjectLayout(self.project_dir).annotations)
-        data, state = project.snapshot(out)
+        # A deliberate export, like Ctrl+S, is never anything but a full
+        # detach. (The differing ``base`` would miss the row cache anyway;
+        # saying so beats relying on it.)
+        data, state = project.snapshot(out, always=tuple(project.videos))
         save_snapshot(out / PROJECT_FILE, data, state)
         self._status(f"Exporting frames to {out}")
         videos = [(v.video_id, v.path, sorted(v.annotations)) for v in project.videos.values()]

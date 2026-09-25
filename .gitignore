@@ -189,3 +189,32 @@ cython_debug/
 
 # Data files
 annotations_train.json
+
+# Local annotation projects (videos, extracted frames, checkpoints, caches).
+# A YOAKE project folder is a working directory, not source: `copulation_tryal`
+# alone is ~5 GB of it.
+copulation_tryal/
+.yoake/
+.yoake_cache/
+
+# Heavy artefacts, wherever they land. The few small fixtures under
+# .tmpbuild/workspace-preview/ were committed before these rules and stay
+# tracked; ignore rules do not apply to files git already follows.
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4v
+*.wmv
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.safetensors
+
+# Training / inference outputs
+runs/
+datasets/

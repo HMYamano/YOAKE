@@ -68,7 +68,7 @@ DEFAULT_WINDOW = 100
 #: package, what is unavailable, and what still works — never a bare ImportError.
 UNAVAILABLE_MESSAGE = (
     "SAM 2 is not installed.\n\n"
-    "Video propagation is unavailable. Click to Box, tracking and everything "
+    "Video propagation is unavailable. Click animal, tracking and everything "
     "else still work.\n\n"
     "To enable it, install it into the Python that runs the segmentation "
     "helper:  pip install sam2 huggingface_hub\n\n"

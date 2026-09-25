@@ -492,12 +492,20 @@ Display toggle set (nine keys; `DEFAULT_TOGGLES` in `canvas.py`):
 
 | Region | Contents |
 |---|---|
-| Menubar | File / Edit / Labels / Help |
-| **Toolbar** (new, 40 px) | Tool group · `Keep drawing` · view group · review group · right-aligned status chip |
+| Menubar | File / Edit / Project / Review / Help — `gui/menubar.py` |
+| **Top bar** (68 px, two rows) | Row 1, *where am I*: Videos / Previous Video / Next Video · save chip · model chip · identity text. Row 2, *the loop*: `Pick frames to label` → `Review` → `Train` → `Analyze` · Undo / Redo / Save · Settings · tool chip. Both in `gui/chrome.py`. |
+| **Tool rail** (108 px, left) | Three captioned groups — **Tools** (the six of §0.3.2), **Assist** (`Continue`, `Keep tool`), **View** (`Fit`, `Panels`, zoom readout). `gui/chrome.py`. |
 | Canvas | `canvas_win` child window containing the `canvas` drawlist. Two draw layers: `layer_image`, `layer_overlay`. |
-| Sidebar (280 px) | Eleven panels, §0.3.7 |
-| Navbar | First / Prev / frame input / Next / Last / Propagate |
-| Status | Progress bar plus one status line |
+| Right column (280 px) | Inspector **or** Review Inbox, one at a time. The eleven-panel sidebar is gone; `annotator._LEGACY_TAGS` records where each panel went. |
+| Navbar | First / Prev / frame input / Next / Last / Copy from prev, over the multi-lane timeline |
+| Status | One status line |
+
+`Train` and `Analyze` are the third and fourth arrow of §0.2.7 and they close
+**inside this window**. Only `Project > Open the workflow window (full
+training)...` spawns `python -m htrtdetr.gui --page workflow --project <dir>`
+(`gui/commands.workflow_command`, parsed by `hub.parse_argv`), for the
+production run. Those two buttons used to spawn it too, which made the loop a
+thing you left the labelling window to continue — and therefore did not.
 
 Canvas height is `max(vh - 152, 300)` in **both** `_build_canvas_panel` and
 `_on_viewport_resize` (it was `vh - 110`; the toolbar takes 42 px). Changing only one of the two
@@ -511,7 +519,11 @@ clips the canvas and fails `--selftest` case 1 immediately.
             +- T .......... track one box forward, review the amber candidates, Y / N
             +- Ctrl+R ..... (torch present) auto-annotate a range, review, Ctrl+Right Y
             +- Ctrl+S ..... save annotations.json into the project folder
- step 2  Train ............ convert -> split -> train stage 1 -> evaluate
+            +- Train ...... one round: export the labelled frames, train
+                            stage 1 on them, adopt the checkpoint (§0.4.9)
+            +- Analyze .... run that checkpoint back over the videos, rank by
+                            uncertainty, review the candidates -> round again
+ step 2  Train ............ the PRODUCTION run, once: stages 1-4, full controls
  step 3  Analyze .......... predict over the whole video, scrub the timeline,
                             find the moments the model got wrong
             +- Send Predictions to Annotator --> back to step 1 on those frames
@@ -519,6 +531,30 @@ clips the canvas and fails `--selftest` case 1 immediately.
 
 The loop is the product. A single pass through steps 1→2→3 is not the goal; the goal is that the
 third arrow (Analyze → Label) is cheap enough that people actually take it.
+
+**The loop is a series, and it ends.** Ten turns of `Pick → correct → Train` is the shape the
+study is built around, so three things that were invisible now have to be said out loud
+(§0.4.10):
+
+* **which turn this is.** `Round 7.` opens the Train dialog's plan paragraph, and the Review
+  dock's *This round* block carries the same number.
+* **how much of this turn is left.** `12 of 100 frames checked here, 31 of 200 across the
+  project.` Counted from the selection against `annotations`, never stored.
+* **whether the turns have stopped teaching.** Agreement — the share of the model's proposals
+  a human kept — across the last three rounds. Not the holdout score: the holdout grows with
+  the label count, so no two rounds of this shape are scored on the same frames, which is the
+  comparison `adoption()` already refuses to make.
+
+And then it ends: `Project > Check every frame (final pass)...` runs the model over every frame
+of every video, the human checks the places worth checking, signs off video by video, and
+`File > Export the verified dataset...` writes what they signed off (§0.4.11).
+
+**Every arrow has to exist inside the window the user is in — and the loop's arrows have to
+close there too.** The Label→Train and Train→Analyze arrows were drawn in this document and
+nowhere in the product. Making them spawn the other window was not enough: an arrow that opens a
+second application is one the user takes once, and the loop is only worth anything taken twenty
+times. Train and Analyze are therefore *operations of the annotator* (§0.4.9), and steps 2 and 3
+keep the job that genuinely is done once — the production run over finished labels.
 
 ---
 
@@ -566,36 +602,45 @@ asynchronous (sam) backends, so the behaviour cannot differ by backend. The opt-
 existing `Keep drawing after each box` (`_sticky_draw`) that `W` and `E` already use — no new
 setting was added for it.
 
-### §0.3.3 The toolbar, left to right
+### §0.3.3 The tool rail, top to bottom, and the top bar
 
-Rendered in a `SURFACE_RAISE` strip with a 1 px `BORDER_SUBTLE` bottom edge.
+The horizontal `tb_*` toolbar this section used to specify no longer exists. The tools moved into
+a 108 px vertical rail beside the canvas (`toolrail`, built by `gui/chrome.toolrail`) and the
+commands moved into the top bar's second row (`gui/chrome.topbar`). Every `tb_*` tag below is
+gone; the rail's tags are `rail_*` and the top bar's are `top_*`.
 
-**Tool group** — the five buttons above, then `Keep drawing after each box` (`tb_sticky_draw`),
-moved out of the sidebar so it sits adjacent to what it modifies and kept in sync with the
-sidebar mirror through `_on_sticky_draw_toggle`.
+**The rail is three captioned groups, and the captions are load-bearing.** It was eleven
+identical buttons in one column, two of which — `Continue` and `Keep tool` — are not tools at
+all: pressing them does not change what the next click does. A first-time user reading top to
+bottom had no way to tell those apart from `Delete Box`, which does.
 
-**Separator. View group:**
+| Caption | Rows | Tags |
+|---|---|---|
+| `Tools` | the six of §0.3.2, each labelled `word + key` | `rail_select` … `rail_delete` |
+| `Assist` | `Continue` (never locked — §`_refresh_propagation_ui`), `Keep tool` (`_sticky_draw`) | `rail_propagate`, `rail_sticky` |
+| `View` | `Fit F`, `Panels`, live zoom readout | `rail_view_fit`, `rail_panels`, `rail_zoom` |
+
+**Zoom in / Zoom out are not buttons.** The wheel zooms over the canvas, `+` and `-` zoom from
+the keyboard, and `rail_zoom` reads out the result: three channels for one thing did not need a
+fourth that also cost two of the rail's eleven rows. The readout's tooltip names the wheel and
+both keys, so the removal does not take the discovery with it.
+
+**The top bar's second row is the loop** (§0.2.7), left to right, and nothing else:
 
 | Label | Tag | Key | Behaviour |
 |---|---|---|---|
-| `Fit` | `tb_fit` | `F` | `_zoom = 1.0`, `_pan = (0, 0)`, re-render |
-| `–` | `tb_zoom_out` | `-` | `_zoom *= 0.8`, clamped |
-| `Zoom 100%` | `tb_zoom_label` | — | Live readout in `TEXT_DIM`. Not a button. |
-| `+` | `tb_zoom_in` | `+` | `_zoom *= 1.25`, clamped |
+| `Pick frames to label` | `top_smart` | `Ctrl+R` | The one sampling/pre-labelling window (§0.4.2). Current video, or the project when none is open. |
+| `Review` | `top_review` | — | Toggle the Review Inbox for this video. |
+| `Train` | `top_train` | — | Run one active-learning round **here** (§0.4.9) and adopt the checkpoint it produces. |
+| `Analyze` | `top_analyze` | — | The `Pick frames to label` window on its analysis preset: detect on, strategy `uncertainty`. Locked, with the reason, until a checkpoint exists. |
+| `Undo` / `Redo` / `Save` | `top_undo` / `top_redo` / `top_save` | `Ctrl+Z` / `Ctrl+Y` / `Ctrl+S` | 50-deep per-frame stack; silent write to `project_dir` when set. |
+| `Settings` | `top_settings` | — | The six-tab dialog. It is the only door: the Project menu has one `Settings...` row, not one row per tab. |
+| *(chip)* tool sentence | `tool_mode_text` | — | One live sentence (§0.3.4). |
 
-**Separator. Review group:**
-
-| Label | Tag | Key | Behaviour |
-|---|---|---|---|
-| `Auto-Annotate…` | `tb_autolabel` | `Ctrl+R` | Opens the Auto-Annotate dialog (§0.4.2). **Locked** with the §0.4.6 reason when `cap.torch` is false. |
-| `Track forward (T)` | `tb_track` | `T` | Propagate the selected box forward N frames with OpenCV. **Always available.** |
-| `Accept all (Y)` | `tb_accept_all` | `Y` | Accept every candidate in this frame. Disabled at 0 pending. |
-| `Discard all (N)` | `tb_discard_all` | `N` | Delete every candidate in this frame. Accepted boxes untouched. Disabled at 0 pending. |
-| *(pill)* `12 candidates` | `tb_cand_pill` | — | `PENDING` amber; reads `No candidates` in `TEXT_FAINT` at zero. |
-| `Undo` | `tb_undo` | `Ctrl+Z` | 50-deep per-frame snapshot stack. |
-| `Save` | `tb_save` | `Ctrl+S` | Silent write to `project_dir` when set, dialog otherwise. |
-
-**Right-aligned status chip:** `tb_tool_chip`, one live sentence (§0.3.4).
+`Accept all` / `Discard all` and the candidate count are **not** here. They belong to a frame that
+has candidates, so they live in the Inspector's no-selection context and appear only when the
+count is above zero — an Accept All that is always present and usually disabled teaches the user
+to ignore it.
 
 Every label that has a key gets it appended by `shortcuts.with_key()`, and every button gets a
 tooltip generated as `f"{binding.help} ({binding.label})"`. A shortcut can therefore never drift
@@ -1078,8 +1123,186 @@ Loss message: `Tracking lost for track {n} at frame {f} - {k} of {m} tracks are 
 | Export | `Ctrl+S` writes `<project_dir>/annotations.json` with **only accepted objects**; frames that become empty are pruned. `Save and Export Frames…` additionally writes `images/<video_id>/<idx:06d}.jpg` (q95) matching the `image_path` the JSON records. |
 | Warn | Saving with candidates present warns **once**: `{n} candidates are not saved. Press Y to accept them first, or N to discard them.` |
 | Hand off | `Saved {a} boxes across {f} frames. {p} candidates are still pending and were not saved as labels.` |
-| Retrain | Step 2: `Convert Annotations` (if needed) → `Create Splits` → `Start Training` → `Run Evaluation`. |
-| Close the loop | Step 3: `Run Inference` → scrub the timeline → `Send Predictions to Annotator` on the frames the model got wrong. |
+| Retrain | **Inside the annotator**, `Train` (§0.4.9). Step 2's page is the production run over finished labels, not the loop. |
+| Close the loop | **Inside the annotator**, `Analyze`. Step 3's page is the workstation for reviewing a finished model, reached through `Send Predictions to Annotator`. |
+| End the loop | `Project > Check every frame (final pass)...`, then `File > Export the verified dataset...` (§0.4.11). A different artefact from the `Export` row above: that one writes the frames the human labelled, this one writes every frame of every video they signed off. |
+
+### §0.4.9 The round — training inside the labelling window
+
+A *round* is the loop's second half: train a detector on the labels that exist
+right now, run it back over the videos, and let what it was unsure about decide
+what to label next. It runs in the annotator because a loop whose third step
+opens a second application is a loop taken once.
+
+**The dialog has no form.** `gui/train_round.py` shows a plan paragraph, a
+four-phase list and `Start`; `Adjust this round...` is collapsed and holds two
+answers a biologist actually has — how long they will wait, and whether to use
+the GPU. Everything else is derived in `annotation/round.py`, which is pure and
+tested, because each derivation is a trap whose failure mode is **silent**:
+
+| Derived | Why it cannot be left to the default |
+|---|---|
+| `model.detector.head.num_classes` | Defaults to 1. The loss uses `num_classes` as the **background** index, so class 1 trains as "no object" — no error, no warning, a checkpoint at the end. Nothing else in the GUI sets it. |
+| `data.batch_size`, clamped to `n_train` | The train loader is `drop_last=True`: a batch bigger than the training set is **zero** optimizer steps, `train_loss` 0.0, and a checkpoint anyway. |
+| `epochs`, from a **step** budget | 400 steps cold, 150 warm, times the effort multiplier. Not a minute budget: the steps a minute buys depend on the label count, so one "12 minutes" meant 400 steps on a small project and 3,600 on a grown one. Steps make a round cost the same as the study grows — measured 4.3 min cold, 1.7 min warm. |
+| `data.num_workers = 0` | Measured: 2 and 4 workers were no faster at this dataset size, and on Windows `terminate()` does not reap them. |
+| `train.val_interval = epochs // 4` | Measured: `last.pth` is 348 MB and `best.pth` 249 MB, written every epoch — ~35 GB per 100-epoch round. The epoch count is rounded to a multiple of the interval so the **last epoch always validates**, because `best.pth` is only written on a validating epoch that improved. |
+| `init_weights` on a warm round | Rounds 2+ carry on from the last checkpoint (measured: warm starts at val_loss 13.56 against 14.86 cold). **Not** `train.resume`, which also restores the optimizer and scheduler — so the learning rate resumes at its decayed floor — and the previous run's `best_metric`. Forced cold when the class count changed (the head changes shape) and every 5th round. |
+
+**`SEC_PER_STEP` is measured, not guessed.** It was 0.20 s/step against a measured
+0.6–0.8, so a round advertised as 12 minutes took closer to 45. The quote is derived
+from the step budget at the measured rate, so the number on screen and the work that
+runs are one decision read two ways.
+
+**Phases and where they run:** *Saving your labels* (main thread) → *Collecting
+the frames* (worker; `gui/round_export.py`) → *Training the detector* (child
+process, log to a **file** not a pipe, `stdin=DEVNULL`) → *Checking what it
+learned* (main thread). Progress is read from `results.csv` by
+`tick_train_round()` on the render loop, never by `monitor.TrainingMonitor`,
+which calls back from a daemon thread.
+
+**Three rules the round cannot break.**
+
+1. *It never writes the user's label file.* `export_project` repoints every
+   `image_path` on the live session and saves that into the project's own
+   `annotations.json`; the round builds its dataset dict separately and leaves
+   the project as it found it.
+2. *It verifies its own images before spawning.* The training dataset opens
+   `<root>/<image_path>` with `strict=False` and substitutes a **black frame**
+   on failure, so a wrong root produces a complete run with a falling loss and
+   a checkpoint trained on nothing. `round_export.missing_images` is the only
+   thing that will ever report it. The split files therefore live **beside**
+   `images/`, because the root is the annotation file's own directory.
+3. *It refuses to adopt a checkpoint that does not exist or scored worse.*
+   `weights/best.pth` is only written when validation improves, so exit 0 with
+   no checkpoint is a real state. Adopting a worse detector makes the next
+   pass worse than having none, because the frames it picks are the ones it
+   was unsure about. The holdout is frozen in `rounds.json` and grown, never
+   re-rolled, so "better than last round" compares one ruler.
+
+Rounds write to `datasets/rounds/` and `runs/rounds/`. Never `runs/train/`:
+`cli.find_checkpoint` globs `runs/train/*/stage{N}/weights/best.pth` newest
+first and uses it to initialise any stage>1 run, so a round would silently
+become what a production stage-2 warm-starts from.
+
+### §0.4.10a The round is a work list, not an analysis
+
+Three changes, and the loop is only usable ten times over with all three.
+
+**A round brings back the frames it chose, and nothing else.** The sampler
+spends its budget project-wide, so no video's picks are known until every video
+has been scanned — which is why `BatchRunner.run` emits a full scan's worth of
+candidates on the `video` event and the trimmed set on `finished`, and why the
+annotator merges on `finished`. Without `batch.keep_chosen` a 100-frame round
+over twenty hour-long videos merges roughly 72,000 candidates into a Review
+Inbox that was asked for a hundred frames: the timeline fills end to end, the
+round's own progress cannot be read off anything, and nothing ever removes a
+candidate once merged. **On cancel, nothing is merged** — a stopped run never
+reached `sample_project`, so nothing was trimmed. What it keeps is the cached
+scan, and the stopped message says so.
+
+**The scan stride follows the size of the scope.** `sampling.scan_stride` is
+derived from the scope's frame count and deliberately *not* from the budget:
+frame features are cached under the stride that produced them, so a stride that
+moved when the user changed 100 samples to 200 would re-walk every video for an
+identical selection. A pool of `SCAN_POOL = 20,000` places is already a hundred
+candidates per pick; at the old fixed 15 a 20x1h project scanned 144,000
+positions to choose 100, and paid for it again on every round. Floored at 15 so
+a single video behaves exactly as before, and capped at two seconds of video —
+past about stride 60 the grab-forward reader loses to a seek, so a coarser scan
+costs the same wall clock and returns a worse pool.
+
+**A chosen frame can be checked and empty.** `K` writes `annotations[frame] =
+[]`, and the round's counter asks whether a chosen frame is *present* in
+`annotations`, not whether it has boxes. Without it the counter stalls below its
+target on exactly the frames the sampler works hardest to find, and the user
+cannot tell a finished round from a stalled one. It is also a training sample:
+a detector never shown an empty arena learns there is always a fly in one.
+
+### §0.4.11 The final pass — every frame, and the dataset that comes out
+
+The loop's end. The rounds produced a detector; this produces the deliverable.
+
+**The scan.** `Project > Check every frame (final pass)...` runs `yoake predict`
+over every frame of every video — dense, `detect_only`, batch 16, ~2 hours for
+twenty hour-long videos at the measured 300 fps end to end. Dense is right here
+and nowhere else in the annotator: a round scans one frame in sixty because the
+sampler can only pick a scanned frame, and here every frame is the product. At
+stride 1 no JPEGs are written at all — `predict_video` hands the video path
+straight to the child — so the 86 GB image tree the strided path needs does not
+exist.
+
+**Resumable at video granularity, and not finer.** A video is scanned or it is
+not; re-running skips the ones that are, by checkpoint fingerprint. Not per
+chunk: `connect_detections` assigns track ids by linking a video's detections to
+each other, so a video scanned in twelve pieces would restart its ids twelve
+times and an animal would change identity every five minutes of the exported
+dataset.
+
+**The ledger, and what it is not.** Boxes go to `datasets/final/<video>.jsonl`,
+one JSON line per frame that has any, with a `.idx` every 1,000 frames so a
+window is a seek rather than a scan. They do **not** go to `annotations.json`
+and they do **not** go to `video.review`. An hour of video with two animals is
+216,000 boxes; the manifest is rewritten whole on every autosave and the review
+session is deep-copied on every undo, so either route turns a keystroke into a
+second of work and a save into a minute of it.
+
+**What the human actually checks.** Not 2.16M frames — that is 600 hours at a
+second each, and the absence of that number is what made the first version of
+this design wrong. They are taken to every span the checks flagged **plus forty
+evenly-spaced spot checks inside the spans that looked clean**. The spot checks
+are not optional: a model that is stably and confidently wrong — an animal it
+never detects — produces no flagged span at all, so without them the pass
+verifies only the places the model already doubted itself. ~134 stops per video,
+~25 minutes a video, ~8 hours for twenty.
+
+**Sign-off is per video, and it ships the video whole.** `finalpass.can_sign_off`
+refuses until every stop has been visited. Signing off is a statement about the
+recording, so the export contains all of it — and the difference between "a
+human looked at this stretch" and "a human vouched for the video this is in"
+survives as `provenance.human_review`: `drawn`, `accepted`, `signed_off` (inside
+a checked span) and `sampled` (inside a signed-off video, outside the spans).
+Flattening those four into "ground truth" would make the file unauditable.
+
+**The export.** `File > Export the verified dataset...` writes
+`datasets/release/annotations.json` in this repo's own format — labels and a
+`video_path` per video, no images. A video that is not signed off is excluded
+**and named**, in the dialog and in `summary_sentence`, because an export
+covering 17 of 20 videos is indistinguishable on disk from one covering 20, and
+the difference is three hours of recordings missing from the paper.
+
+### §0.4.10 Sparse detection — the other half of the cost
+
+`BatchOptions.detect_stride` runs the detector on every Nth frame. It is set to
+the scan stride **exactly when the detections are for choosing frames**, and
+left at 1 for a pre-label-only pass, where the user means to review the whole
+video. The sampler can only ever pick a scanned frame, so detections on the
+fourteen frames between two scan positions were computed, cached and never
+read: measured at 121 frames/s, twenty one-hour videos cost **4.1 hours dense
+and 17 minutes at stride 15**.
+
+Three things move together, and the feature is wrong without all three:
+
+1. **The frames are exported and the indices are mapped back.** `predict`
+   re-indexes an image directory from 0 and has no start-frame option, so
+   `write_scan_frames` writes `%06d.jpg` locally and
+   `auto_label.remap_frame_indices` puts the candidates back on real frame
+   numbers. An empty map is the identity, so the dense path pays nothing.
+2. **Track linking is off.** `connect_detections` means "these two are the same
+   animal a frame apart"; fifteen frames apart it invents identities.
+3. **The checks are told which frames were examined.** `quality.analyze` has an
+   opinion about every frame it is given, so the whole video's range after a
+   strided pass declares fourteen frames in fifteen to be places the detector
+   found nothing.
+
+The export walks the video with sequential `grab()` and reads the target with
+`read()`. Never `grab()` through the target and then `retrieve()`: retrieve
+returns the frame the *last* grab consumed, so every exported frame is one
+early — and it agrees at frame 0, where anyone would look first. The first
+version of `write_scan_frames` had that bug and the index test did not catch
+it, because the frame numbers came from the index map and were right; only the
+pixels were wrong. `tests/test_sparse_detection.py` encodes each frame's index
+in its own pixels for that reason.
 
 ---
 
@@ -1533,6 +1756,68 @@ from a miss.
 | A raw texture in `mvFormat_Float_rgba` costs three full-frame allocations per frame | `np.dstack` + `astype(np.float32)/255` + `.flatten()` on a 1920×1080 frame is ~33 MB of churn per displayed frame. A `uint8` dynamic texture with a preallocated buffer avoids it. |
 | Blocking tkinter dialogs freeze the render loop | `dialogs._dialog` creates a fresh `Tk()` per call on the render thread; the viewport stops painting and Windows may show "Not Responding". Hoist one long-lived hidden root, pass `initialdir`, and own the dialog to the viewport HWND. |
 | A dpg `handler_registry` tag cannot be re-created | `_build_main_window` re-creates `key_handlers` / `mouse_handlers` on "New Project…", which is an alias collision in dpg 2.x. |
+
+### §5.5 Measured — what got slow after a detector run, and the three fixes
+
+Symptom: the annotator is fine until *Analyze* has run over a video, and then it is treacle.
+Measured on this study's own scale — one hour at 30 fps (108,000 frames), detections every
+15th frame, four animals, so **7,200 candidate frames and 28,800 boxes** — with
+`YOAKE_PYTHON` and real dearpygui:
+
+| Path | What it did | Cost | After |
+|---|---|---|---|
+| **Autosave, every ~4 s** | `ProjectSession.snapshot()` — `asdict` over every candidate of every video, on the main thread | **0.85 s per video**; ~**17 s** for a twenty-video study, with the window frozen for all of it | **0.07 s**, whatever the project's size |
+| **Every accept / reject** | `rebuild_copilot()` — 9 quality detectors over every candidate, plus the tracklet index and the interval merge | **0.79 s** (`quality.analyze` 0.65 + `build_tracklets` 0.13) **per candidate** | scheduled; one rebuild per burst |
+| **Every frame change** | `_render_timeline()` — reassemble the model and rebuild all four lanes | **6 ms** build + **15 ms** draw = 21 ms, on a 16 ms budget | **0.012 ms** (playhead layer only) |
+| **Behavior lane** | one `draw_rectangle` per interval, unbucketed | 28,800 nodes, **0.15 s** per redraw, re-submitted every rendered frame | bucketed by pixel column, <4,000 draws |
+
+The autosave one is the largest and the least obvious, because nothing about
+it is drawing. `_autosave_workspace` re-arms on every frame step, so the
+symptom is a multi-second freeze every four seconds while the user is simply
+looking around. Two changes, and the order matters:
+
+* **The detach got cheap.** `dataclasses.asdict` is a recursive walk with a
+  per-field `deepcopy`; `Candidate.to_dict` writes the eight fields out and is
+  3x faster, and `ReviewSession.saved_rows` reads the three parallel lists
+  directly instead of paying a `sorted()` and a copied list per frame. Together
+  0.41 s -> 0.028 s for one video's candidates, byte-identical output.
+* **It stopped re-detaching what nobody touched.** `snapshot` caches each
+  video's row against `VideoSession.revision`. The autosave names the open
+  video in `always=`, because `visited`, `last_frame` and `ui` change as the
+  user merely looks around and deliberately do **not** mark a video dirty — a
+  frame step must not make the save chip say "Unsaved". Every other write goes
+  through `touch()`. `save()` and the frame export pass every id, so a
+  deliberate Ctrl+S is never anything but a full, current detach.
+
+The cache is the one risky thing in this release — a stale row is lost work —
+so it is pinned by seven tests in `tests/test_annotation_project.py`, including
+`to_dict` against `asdict` and `saved_rows` against the public accessors.
+
+The three drawing/analysis fixes, in the order they matter:
+
+1. **Accepting schedules the re-analysis; it does not run it.** `schedule_copilot_rebuild()` sets
+   a flag and `_tick_copilot()` runs it from the render loop once 0.35 s have passed with no
+   further change. Holding `Y` through fifty frames was fifty full re-analyses of the same
+   video — forty seconds of frozen window for a result only the last one produced. What the
+   user is looking at (the boxes, the canvas, the undo entry) stays synchronous; only the
+   analysis behind the Review Inbox waits. The wait is visible: `running_jobs()` reports
+   *Re-checking the candidates*, so the deferral cannot read as an ignored click.
+
+2. **The playhead is its own `draw_layer`.** This is §5.4's rule applied to the timeline:
+   stepping a frame changes one integer on the model and not one thing the four lanes draw, so
+   `render_playhead()` clears a layer holding three items instead of rebuilding fifteen
+   hundred. `_render_timeline(playhead_only=True)` is the frame-change path; every mutation
+   still takes the full rebuild, which is what keeps the reused model honest.
+
+3. **The behavior lane buckets like the other three.** It was the one lane that broke this
+   module's own stated "O(width), not O(frames)" rule. `merge_to_intervals` can only join
+   frames within `max_gap` (2) of each other, so a stride-15 run merges nothing and the
+   "intervals" are one per box. Sub-pixel intervals now collapse to one rectangle per
+   (column, action), confirmed winning inside a column; intervals wide enough to read are
+   still drawn whole.
+
+Guarded by `tests/test_gui_timeline.py` (draw-call counts through a stubbed dpg, no viewport)
+and `tests/test_workflows.py` (one rebuild per burst, and the accept itself still immediate).
 
 ---
 

@@ -132,6 +132,13 @@ class InspectorContext:
     expected_animals: Optional[int] = None
     verified_frames: int = 0
     pending_here: int = 0
+    #: Is this frame one of the ones the current round asked for?
+    chosen_frame: bool = False
+    #: Has a human already decided about this frame - boxes drawn, or an
+    #: explicit "nothing here"? Separate from ``animals`` because the two
+    #: differ exactly in the case this flag exists for: an empty frame that
+    #: has been signed off looks identical to one nobody has opened.
+    checked: bool = False
 
     # -- box / candidate --
     track_id: int = -1
@@ -309,15 +316,40 @@ class Inspector:
             dpg.add_combo(
                 [],
                 tag=self._t("n_class"),
-                label="New class",
+                label="Class",
                 width=140,
                 callback=lambda s, a: self._call("set_class", a),
             )
-            dpg.add_text("Find animals", color=theme.TEXT_DIM)
-            widgets.primary_button("Click an animal (C)", self._cb("click_animal"), height=28)
-            widgets.secondary_button("Draw a box (W)", self._cb("draw_animal"), height=28)
-            widgets.secondary_button(
-                "Pre-label with the model...", self._cb("auto_annotate"), height=28
+            # The rail owns tool selection. Explain the first action here
+            # without adding a second button for the same click tool.
+            dpg.add_text("Add a box", color=theme.TEXT_DIM)
+            dpg.add_text(
+                f"Press {self._key('tool.click_box')}, then click the centre of an animal. "
+                f"Drag the handles to adjust the box. "
+                f"Use {self._key('tool.draw_box')} to draw by hand.",
+                wrap=self.WIDTH - 20,
+            )
+            # Labelled with the class the combo above is set to, because the
+            # question it asks is "find every *what*". It used to be a blank
+            # text box captioned "Find all in frame", which made the user type
+            # a word the app already knew.
+            with dpg.collapsing_header(label="Find all at once (optional)", default_open=False):
+                dpg.add_text(
+                    "Uses an installed AI helper. Check each dashed box before accepting it.",
+                    color=theme.TEXT_DIM, wrap=self.WIDTH - 30,
+                )
+                widgets.secondary_button(
+                    "Find all: animal",
+                    self._cb("find_all_clicked"),
+                    width=-1,
+                    height=28,
+                    tag="find_all_btn",
+                )
+            widgets.attach_tooltip(
+                "find_all_btn",
+                "Ask the segmentation helper for every animal in this frame "
+                "at once, by name. The boxes arrive as candidates: dashed, "
+                "unsaved, and yours to accept or discard.",
             )
             dpg.add_text("", tag=self._t("n_frame"), color=theme.TEXT)
             dpg.add_text("", tag=self._t("n_time"), color=theme.TEXT_DIM)
@@ -405,28 +437,26 @@ class Inspector:
                     f"({self._key('edit.new_track')}).",
                 )
 
-            # ── ask the helper for every animal here ─────────────────
-            widgets.gap(2)
-            with dpg.group(tag=self._t("n_find_group")):
-                dpg.add_input_text(
-                    tag="concept_text",
-                    hint="fly",
-                    width=-1,
-                    on_enter=True,
-                    callback=self._cb_passthrough("find_all"),
-                )
+            # ── this frame is one of the round's, and it is empty ──────
+            # Only on a chosen frame with nothing on it, which is the only
+            # state where "there is nothing here" is a decision rather than a
+            # description. Everywhere else the frame's own boxes already say
+            # it has been looked at.
+            with dpg.group(tag=self._t("n_empty_group"), show=False):
+                widgets.gap(1)
                 widgets.secondary_button(
-                    "Find all in frame",
-                    self._cb("find_all_clicked"),
+                    f"Nothing here - checked ({self._key('review.mark_checked')})",
+                    self._cb("mark_checked"),
                     width=-1,
-                    height=26,
-                    tag="find_all_btn",
+                    height=28,
+                    tag=self._t("n_empty"),
                 )
                 widgets.attach_tooltip(
-                    "find_all_btn",
-                    "Ask the segmentation helper for every animal in this "
-                    "frame at once. The boxes arrive as candidates: dashed, "
-                    "unsaved, and yours to accept or discard.",
+                    self._t("n_empty"),
+                    "Record that you looked at this frame and there is nothing "
+                    "to box. It counts as done for this round, and it trains "
+                    "as an empty frame - which is a sample the model needs, "
+                    "not a gap in the data.",
                 )
 
             widgets.gap(2)
@@ -832,6 +862,10 @@ class Inspector:
         # An Accept All that is permanently present and usually disabled is a
         # control the eye learns to skip.
         self._show(self._t("n_cand_group"), bool(ctx.pending_here))
+        self._show(
+            self._t("n_empty_group"),
+            bool(ctx.chosen_frame) and not ctx.animals and not ctx.pending_here and not ctx.checked,
+        )
 
         self._set(
             self._t("n_status"),
@@ -844,10 +878,7 @@ class Inspector:
             ),
         )
 
-        # Find-all only exists when a helper that understands descriptions is
-        # running. Locked rather than hidden would need a reason string the
-        # inspector does not have; the annotator gates it through
-        # :meth:`set_find_all_available`.
+        # Find-all is optional; its availability is resolved on first use.
         self._set(self._t("n_hint"), self._next_action_hint(ctx))
         if dpg.does_item_exist(self._t("n_class")):
             dpg.configure_item(self._t("n_class"), items=list(ctx.class_names))
@@ -856,6 +887,22 @@ class Inspector:
                     self._t("n_class"),
                     ctx.class_names[min(ctx.active_class_id, len(ctx.class_names) - 1)],
                 )
+        # The find-all button names the class it will search for, so the user
+        # reads the question instead of typing the answer.
+        self._label("find_all_btn", f"Find all: {self.find_all_word(ctx)}")
+
+    @staticmethod
+    def find_all_word(ctx: InspectorContext) -> str:
+        """The noun *Find every ... in this frame* searches for.
+
+        The active class, not ``class_names[0]``: a two-class project switches
+        the combo to say which animal the next box is, and the button has to
+        follow it or the two controls disagree on the same screen.
+        """
+        names = list(ctx.class_names)
+        if not names:
+            return "animal"
+        return str(names[min(max(ctx.active_class_id, 0), len(names) - 1)])
 
     def set_find_all_available(self, available: bool, reason: str = "") -> None:
         """Show or lock the concept prompt, from the annotator's capability probe.
@@ -872,7 +919,9 @@ class Inspector:
                 "find_all_btn",
                 reason
                 or "No segmentation helper can run on this machine. Install "
-                "one with:  pip install sam2 huggingface_hub",
+                "one with:  pip install sam2 huggingface_hub\n"
+                "You can keep labelling without it: press C and click an "
+                "animal, or W and draw a box.",
             )
 
     def _next_action_hint(self, ctx: InspectorContext) -> str:
@@ -890,9 +939,8 @@ class Inspector:
             )
         if ctx.animals == 0:
             return (
-                f"Nothing here yet. Press {self._key('tool.draw_box')} to "
-                f"draw a box, or {self._key('tool.click_box')} to click an "
-                f"animal and have one fitted to it."
+                f"No boxes yet. No trained detector is needed: "
+                f"press {self._key('tool.click_box')} and click an animal to start."
             )
         return (
             f"{self._key('nav.next')} and {self._key('nav.prev')} move "
@@ -929,7 +977,7 @@ class Inspector:
             "human": "You drew this box.",
             "auto": "The detector proposed this box.",
             "track": "A tracker placed this box.",
-            "wand": "Click to Box fitted this box.",
+            "wand": "Click animal fitted this box.",
         }.get(ctx.source, f"Source: {ctx.source}")
         if ctx.score is not None:
             origin += f" Confidence {ctx.score:.2f}."
@@ -1066,7 +1114,7 @@ class Inspector:
                 self._t("cl_seed"),
                 "Nothing yet. A propagation can only follow animals it was "
                 "prompted with, so draw a box (W), click an animal (C), or use "
-                "Find all in frame on one frame of this clip first.",
+                "Find every animal in this frame, on one frame of this clip first.",
             )
         else:
             count = int(ctx.clip_animals)

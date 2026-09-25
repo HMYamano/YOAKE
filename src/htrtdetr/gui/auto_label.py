@@ -269,8 +269,10 @@ def check_backend(repo_root: Path, checkpoint: str = "") -> BackendStatus:
             True,
             True,
             False,
-            "Select a detector checkpoint first. It is the .pth file written to "
-            "runs/train/stage4/weights/best.pth by step 2.",
+            "Select a detector checkpoint first. Press Train in the labelling "
+            "window to make one from the labels you already have; it is then "
+            "set for you. A production run writes one to "
+            "runs/train/stage{N}/weights/best.pth.",
             cap,
         )
     if not ckpt_ok:
@@ -338,6 +340,54 @@ def ensure_child_env(repo_root: Path) -> Dict[str, str]:
     return dict(os.environ)
 
 
+def cuda_device_count() -> int:
+    """How many CUDA devices this machine has, **without importing torch**.
+
+    Loads the driver library directly and asks it. ~40 ms, against several
+    seconds and a pile of DLLs for ``import torch`` - and the GUI process is
+    not allowed to pay that just to decide whether to offer a checkbox.
+
+    ``0`` covers every negative answer: no driver, a driver that will not
+    initialise, or a driver with no device. The caller only ever needs to know
+    whether the GPU path exists.
+
+    This is the same probe the workflow window's environment report uses; the
+    answer must not differ between the two windows.
+    """
+    import ctypes
+
+    names = ("nvcuda.dll",) if os.name == "nt" else ("libcuda.so.1", "libcuda.so")
+    lib = None
+    for name in names:
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        return 0
+    try:
+        if int(lib.cuInit(0)) != 0:
+            return 0
+        count = ctypes.c_int(0)
+        lib.cuDeviceGetCount(ctypes.byref(count))
+        return max(0, int(count.value))
+    except Exception:  # noqa: BLE001 - a probe never raises at its caller
+        return 0
+
+
+def has_gpu() -> bool:
+    """True when training would actually run on a GPU.
+
+    ``Capability.torch`` answers "can this Python train at all", which is a
+    different question: torch installs and imports perfectly well on a machine
+    with no NVIDIA device and then runs on the processor, about ten times
+    slower. Quoting a GPU duration off ``cap.torch`` is how a forty-minute
+    round gets advertised as four.
+    """
+    return cuda_device_count() > 0
+
+
 def device_env(device: str, base: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
     """Environment overlay that pins the compute device.
 
@@ -355,7 +405,13 @@ def device_env(device: str, base: Optional[Mapping[str, str]] = None) -> Dict[st
     if dev in ("", "auto"):
         return env
     if dev == "cpu":
-        env["CUDA_VISIBLE_DEVICES"] = ""
+        # "-1", not "". Measured on this machine: with an empty value
+        # ``torch.cuda.is_available()`` still answers **True** while
+        # ``device_count()`` is 0, so every runner in this repo - each of which
+        # picks ``cuda if torch.cuda.is_available() else cpu`` - selects a GPU
+        # that is not there. "Use the GPU" unticked was therefore not a CPU
+        # run; it was a crash waiting for a device index.
+        env["CUDA_VISIBLE_DEVICES"] = "-1"
     elif dev == "cuda":
         env.pop("CUDA_VISIBLE_DEVICES", None)
     elif dev.startswith("cuda:"):
@@ -396,6 +452,21 @@ class PredictRequest:
     max_frames: Optional[int] = None
     config: str = ""  # only when the checkpoint has no embedded config
     nms_threshold: Optional[float] = None
+    #: Boxes only, several frames at a time. See
+    #: :mod:`htrtdetr.inference.detect_only`. The annotation loop wants
+    #: detections and nothing else - a round trains ``stage=1``, so the
+    #: identity, temporal and behavior heads are still random - and dropping
+    #: them lets the detector be batched, which is measured 4.8x faster on the
+    #: same GPU with the same weights.
+    #:
+    #: ``track_ids`` come back as ``-1``. That is the honest answer for a
+    #: strided pass (detections 15 frames apart are not neighbours) and the
+    #: input :func:`htrtdetr.annotation.batch.connect_detections` is written
+    #: for on a dense one.
+    detect_only: bool = False
+    #: Frames per forward pass when ``detect_only``. 0 means the runner's own
+    #: default (16).
+    batch_size: int = 0
 
 
 def predict_argv(req: PredictRequest) -> List[str]:
@@ -423,6 +494,10 @@ def predict_argv(req: PredictRequest) -> List[str]:
         f"score_threshold={_fmt_num(req.score_threshold)}",
         f"window_size={int(req.window_size)}",
     ]
+    if req.detect_only:
+        argv.append("detect_only=true")
+        if req.batch_size:
+            argv.append(f"batch_size={int(req.batch_size)}")
     if req.nms_threshold is not None:
         argv.append(f"model.detector.nms_threshold={_fmt_num(req.nms_threshold)}")
     if req.max_frames is not None:
@@ -733,6 +808,33 @@ class Candidate:
             source=str(self.source),
             provenance=dict(self.provenance),
         )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """The saved form, detached from this object. ``asdict`` but 3x faster.
+
+        The autosave serialises every candidate in the project on the **main
+        thread**, deliberately: the worker that writes the file must not read
+        structures the user is still editing. That made the detach itself the
+        cost - ``dataclasses.asdict`` is a recursive walk with a per-field
+        ``deepcopy``, and at 28,800 candidates a video it came to 0.41 s for
+        one video and eight seconds for a twenty-video study, every four
+        seconds, with the window frozen for all of it.
+
+        The fields are eight scalars and two containers and they are not going
+        to surprise anyone, so they are written out. Same copying depth as
+        :meth:`copy`: the lists are new, ``provenance`` is shallow, which is
+        what it has always been here.
+        """
+        return {
+            "bbox": list(self.bbox),
+            "obb": list(self.obb) if self.obb is not None else None,
+            "score": self.score,
+            "track_id": self.track_id,
+            "action_id": self.action_id,
+            "class_id": self.class_id,
+            "source": self.source,
+            "provenance": dict(self.provenance),
+        }
 
 
 def _pad(value, n: int, default, cast):
@@ -1404,6 +1506,33 @@ class ReviewSession:
 
     def pending_frames(self) -> List[int]:
         return [fi for fi in self.frames if any(s == PENDING for s in self._states.get(fi, []))]
+
+    def saved_rows(self) -> List[Dict[str, Any]]:
+        """Every candidate and its verdict, in the shape the project file holds.
+
+        Here rather than in :meth:`ProjectSession.snapshot` because it is the
+        one caller that has to walk **all** of it, and doing that through the
+        public accessors means a fresh ``sorted()`` of the keys plus a copied
+        list per frame - 7,200 list allocations for an hour of video whose
+        only purpose is to be thrown away a line later. Reading the three
+        parallel lists directly is the same answer at a fifteenth of the cost,
+        and the copying that matters (the candidate itself) still happens, in
+        :meth:`Candidate.to_dict`.
+        """
+        return [
+            {
+                "frame": frame,
+                "candidates": [
+                    {"candidate": cand.to_dict(), "state": state, "edited": bool(edited)}
+                    for cand, state, edited in zip(
+                        self._frames[frame],
+                        self._states.get(frame, ()),
+                        self._edited.get(frame, ()),
+                    )
+                ],
+            }
+            for frame in sorted(self._frames)
+        ]
 
     def next_pending_frame(self, after: int) -> Optional[int]:
         """The next frame that still holds candidates, or ``None``."""

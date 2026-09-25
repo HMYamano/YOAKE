@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, List, Mapping, Optional,
+from typing import (Any, Callable, Collection, Dict, List, Mapping, Optional,
                     Sequence, Tuple)
 
 from .features import FrameFeature, distance, farthest_point_order
@@ -58,8 +58,9 @@ __all__ = [
     "RANDOM", "UNIFORM", "DIVERSITY", "UNCERTAINTY", "DIVERSITY_UNCERTAINTY",
     "INTERACTION", "STRATEGIES", "STRATEGY_LABELS", "STRATEGY_HELP",
     "ScoreWeights", "WorkloadModel", "Budget", "SamplingRequest",
-    "Clip", "Selection", "SamplingContext",
-    "plan", "select_frames", "select_clips",
+    "Clip", "Selection", "SelectionProgress", "SamplingContext",
+    "SCAN_POOL", "SCAN_STRIDE_FLOOR", "SCAN_STRIDE_SECONDS", "scan_stride",
+    "plan", "progress", "select_frames", "select_clips",
     "rank_normalize", "rarity_scores", "component_scores",
 ]
 
@@ -284,6 +285,60 @@ class SamplingRequest:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Scanning
+# ══════════════════════════════════════════════════════════════════════════
+
+#: Roughly how many scanned frames one round should have to choose between,
+#: across the whole scope.
+#:
+#: The sampler can only ever pick a frame that was scanned, so the scan is a
+#: pool and the budget is a draw from it. 20,000 places for a 200-frame draw
+#: is a hundred candidates per pick, which is already far past the point where
+#: another candidate changes the answer - and every place in that pool is a
+#: frame the detector runs on, **again, every round**.
+#:
+#: The number that made this necessary: at the fixed stride of 15 a 20x1h
+#: project scans 144,000 positions to choose 100 frames. That is a pool 1,440
+#: times larger than the draw, and it is paid for ten times over ten rounds.
+SCAN_POOL = 20_000
+
+#: Never scan more finely than this. 15 is what the fixed default was, so a
+#: project small enough for the floor to win behaves exactly as it did before
+#: this function existed - including its cached frame features.
+SCAN_STRIDE_FLOOR = 15
+
+#: Never scan more coarsely than two seconds of video.
+#:
+#: Two reasons, and the second is the one that binds. A clip anchor eight
+#: seconds from its neighbour cannot describe a courtship bout; and
+#: :func:`features.scan` walks the video with ``grab()`` rather than seeking,
+#: a trade measured to win five-fold at stride 15 and to break even at about
+#: 60 - past which a coarser scan costs the same wall clock and returns a
+#: worse pool.
+SCAN_STRIDE_SECONDS = 2.0
+
+
+def scan_stride(total_frames: int, *, fps: float = 30.0) -> int:
+    """How often to look at a frame, for a scope of ``total_frames``.
+
+    Derived from the size of the scope and **not** from the budget, which is
+    the whole point: the frame features of a scan are cached under the stride
+    that produced them, so a stride that moved when the user changed the
+    budget from 100 to 200 would throw that cache away and re-walk every video
+    on the round after. The budget decides how many of the scanned frames come
+    back; it does not decide which ones were available.
+
+    >>> scan_stride(108_000)          # one hour at 30 fps
+    15
+    >>> scan_stride(2_160_000)        # twenty of them
+    60
+    """
+    ceiling = max(SCAN_STRIDE_FLOOR, int(round(max(1.0, fps) * SCAN_STRIDE_SECONDS)))
+    raw = int(max(0, total_frames) // max(1, SCAN_POOL))
+    return int(max(SCAN_STRIDE_FLOOR, min(ceiling, raw)))
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Results
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -373,6 +428,54 @@ class Selection:
                         else f"~{minutes / 60.0:.1f} hours")
             lines.append(f"Estimated review workload: {estimate}")
         return "\n".join(lines)
+
+    def frame_set(self) -> set:
+        """Every frame this selection asks a human to look at.
+
+        The chosen frames **and** every frame inside a chosen clip. A clip is
+        not an anchor with context around it; it is a span whose boxes are all
+        part of the job, which is why a round's work is counted and trimmed
+        against this set rather than against ``frames``.
+        """
+        out = set(self.frames)
+        for clip in self.clips:
+            out.update(range(clip.start, clip.end + 1))
+        return out
+
+
+@dataclass(frozen=True)
+class SelectionProgress:
+    """How much of one round's work list is done, in one video."""
+
+    chosen: int = 0
+    checked: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.chosen - self.checked)
+
+    @property
+    def complete(self) -> bool:
+        return self.chosen > 0 and self.checked >= self.chosen
+
+
+def progress(selection: Optional[Selection], annotated: Collection[int]) -> SelectionProgress:
+    """``(chosen, checked)`` for one video's current selection.
+
+    **A frame counts as checked when it is present in ``annotated``, including
+    with no boxes at all.** That is not a technicality; it is the difference
+    between a counter that reaches 100 and one that stalls at 94 forever. A
+    round hands the user a hundred frames the model found hardest, and some of
+    them are hard because there is nothing there. A human who looks at such a
+    frame and correctly draws nothing has done the work, and an empty frame is
+    a training sample the set wants - so the annotator has to be able to say
+    "nothing here" and have it count.
+    """
+    if selection is None:
+        return SelectionProgress()
+    wanted = selection.frame_set()
+    done = sum(1 for frame in wanted if frame in annotated)
+    return SelectionProgress(chosen=len(wanted), checked=done)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -584,10 +687,33 @@ def _strategy_diversity(ctx: SamplingContext, k: int) -> List[int]:
     return sorted(farthest_point_order(ctx.vectors, k, first=first, seeds=ctx.known))
 
 
+def _is_flat(scores: Sequence[float], tol: float = 1e-9) -> bool:
+    """``True`` when a score column says the same thing about every frame.
+
+    Which is exactly what happens before a model exists: ``FrameFeature``
+    leaves ``mean_score`` and the pairwise distances at their defaults, so
+    ``uncertainty`` and ``interaction`` are constant over the whole scan.
+
+    A constant column is not a weak signal, it is no signal — and every
+    strategy here breaks ties by index, so ranking one silently returns the
+    opening seconds of the video and nothing else. Measured on a one-hour
+    video with no detections: *Uncertainty* returned frames 0 to 960, the
+    first thirty-two seconds. It looked like a choice. It was ``range(k)``.
+    """
+    if len(scores) < 2:
+        return True
+    first = scores[0]
+    return all(abs(value - first) <= tol for value in scores)
+
+
 def _strategy_uncertainty(ctx: SamplingContext, k: int) -> List[int]:
     if ctx.size == 0 or k <= 0:
         return []
     scores = ctx.components().get("uncertainty") or [0.0] * ctx.size
+    if _is_flat(scores):
+        # Nothing was detected, so "where was the model unsure" has no answer.
+        # Appearance still does, and diversity is the strategy that reads it.
+        return _strategy_diversity(ctx, k)
     order = sorted(range(ctx.size), key=lambda i: (-scores[i], i))
     return sorted(order[:min(k, ctx.size)])
 
@@ -619,11 +745,20 @@ def _spread_over_top(ctx: SamplingContext, k: int, scores: Sequence[float],
 
 
 def _strategy_diversity_uncertainty(ctx: SamplingContext, k: int) -> List[int]:
-    return _spread_over_top(ctx, k, ctx.combined())
+    combined = ctx.combined()
+    if _is_flat(combined):
+        return _strategy_diversity(ctx, k)
+    return _spread_over_top(ctx, k, combined)
 
 
 def _strategy_interaction(ctx: SamplingContext, k: int) -> List[int]:
     scores = ctx.components().get("interaction") or [0.0] * ctx.size
+    if _is_flat(scores):
+        # No boxes, so no pairwise distance, so no interaction. Courtship
+        # assays are the case this strategy exists for and also the case that
+        # arrives with zero labels, so this fallback is the common path on
+        # day one rather than an edge case.
+        return _strategy_diversity(ctx, k)
     return _spread_over_top(ctx, k, scores)
 
 
@@ -672,6 +807,18 @@ def select_clips(
     n = ctx.size
     if n == 0 or k <= 0 or clip_frames <= 0:
         return []
+
+    if strategy in (INTERACTION, UNCERTAINTY) and _is_flat(
+        ctx.components().get(
+            "interaction" if strategy == INTERACTION else "uncertainty"
+        )
+        or [0.0] * n
+    ):
+        # Same cold-start hole as :func:`select_frames`: with no detections
+        # these two columns are constant, the window means are all equal, and
+        # the ``(-score, i)`` sort hands back the opening clips of the video.
+        # Appearance is the only signal there is, so use it.
+        strategy = DIVERSITY
 
     if strategy == INTERACTION:
         scores = ctx.components().get("interaction") or [0.0] * n

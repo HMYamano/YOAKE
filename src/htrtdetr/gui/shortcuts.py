@@ -279,8 +279,8 @@ class Binding:
         Coarser bucket for grouping across scopes, one of :data:`CONTEXTS`.
         Defaults to the group's context; set explicitly where a binding lives
         in one section but belongs to another loop (the ``Ctrl+Arrow``
-        candidate jumps sit under *Navigation* but belong to *Auto-label
-        review*).
+        candidate jumps sit under *Navigation* but belong to *Review and
+        sampling*).
     label:
         Human-readable accelerator. Filled in automatically and
         platform-correctly; pass a value only to override it.
@@ -367,7 +367,7 @@ GROUP_ORDER: tuple[str, ...] = (
 CONTEXTS: tuple[str, ...] = (
     "Annotator canvas",
     "Playback",
-    "Auto-label review",
+    "Review and sampling",
     "Global",
 )
 
@@ -376,11 +376,11 @@ GROUP_CONTEXT: dict[str, str] = {
     "Tools": "Annotator canvas",
     "View": "Annotator canvas",
     "Navigation": "Playback",
-    "Review": "Auto-label review",
+    "Review": "Review and sampling",
     "Edit": "Annotator canvas",
     "File": "Global",
     "Hub": "Global",
-    "Review mode": "Auto-label review",
+    "Review mode": "Review and sampling",
 }
 
 
@@ -405,7 +405,7 @@ BINDINGS: tuple[Binding, ...] = (
     _b("tool.draw_rotated", "R", (), "Tools",
        "Draw Rotated Box tool: same as E, kept because R already meant rotated"),
     _b("tool.click_box", "C", (), "Tools",
-       "Click to Box tool: click an animal and a rotated box is fitted to it. "
+       "Click animal tool: click an animal and a rotated box is fitted to it. "
        "One box per press, then back to Select so the handles are ready"),
     _b("tool.pan", "H", (), "Tools",
        "Pan tool: drag to move the image"),
@@ -421,6 +421,12 @@ BINDINGS: tuple[Binding, ...] = (
        "Zoom in"),
     _b("view.zoom_out", "Minus", (), "View",
        "Zoom out"),
+    # L for log. Ctrl, because the unmodified letters are all one keystroke
+    # from changing an annotation and this window is the one thing in the app
+    # that a user reaches for *because* something already went wrong - the
+    # worst possible moment to fat-finger Delete Box.
+    _b("view.activity", "L", ("Ctrl",), "View",
+       "Show what is running, and the log of this session"),
 
     # ── Annotator / Navigation ──
     _b("nav.prev", "A", (), "Navigation",
@@ -436,11 +442,11 @@ BINDINGS: tuple[Binding, ...] = (
     _b("nav.last", "End", (), "Navigation",
        "Last frame"),
     _b("review.next_pending_frame", "Right", ("Ctrl",), "Navigation",
-       "Jump to the next frame that still has candidates",
-       context="Auto-label review"),
+       "Jump to the next frame with candidates, or the next chosen frame",
+       context="Review and sampling"),
     _b("review.prev_pending_frame", "Left", ("Ctrl",), "Navigation",
-       "Jump to the previous frame that still has candidates",
-       context="Auto-label review"),
+       "Jump to the previous frame with candidates, or the previous chosen one",
+       context="Review and sampling"),
 
     # ── Annotator / Review ──
     _b("review.cycle", "Q", (), "Review",
@@ -449,6 +455,9 @@ BINDINGS: tuple[Binding, ...] = (
        "Accept every candidate in this frame"),
     _b("review.discard_all", "N", (), "Review",
        "Discard every candidate in this frame"),
+    _b("review.mark_checked", "K", (), "Review",
+       "Mark this frame checked with nothing to box",
+       context="Review and sampling"),
     _b("auto.track_forward", "T", (), "Review",
        "Track the selected box forward from this frame"),
     _b("auto.annotate", "R", ("Ctrl",), "Review",

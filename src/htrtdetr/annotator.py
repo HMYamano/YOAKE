@@ -26,6 +26,7 @@ import math
 import queue
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -53,6 +54,14 @@ try:  # GUI 補助モジュール (相対 import で失敗したら絶対 import
     from .gui.sam_session import SamSessionMixin
     from .gui.auto_label import TRACKER_LABELS, make_tracker
 
+    from .gui import activity as activity_mod
+    from .gui import chrome
+    from .gui.final_operations import FinalPassMixin
+    from .gui.round_work import RoundWorkMixin
+    from .gui.train_operations import TrainRoundMixin
+
+    if dpg is not None:
+        from .gui import menubar
     if dpg is not None:
         from .gui import inspector as inspector_mod
     if dpg is not None:
@@ -64,6 +73,12 @@ try:  # GUI 補助モジュール (相対 import で失敗したら絶対 import
     if dpg is not None:
         from .gui import smart_annotate as smart_annotate_mod
     if dpg is not None:
+        from .gui import final_pass as final_pass_mod
+    if dpg is not None:
+        from .gui import release_export as release_export_mod
+    if dpg is not None:
+        from .gui import train_round as train_round_mod
+    if dpg is not None:
         from .gui import theme
     if dpg is not None:
         from .gui import timeline as timeline_mod
@@ -73,6 +88,7 @@ try:  # GUI 補助モジュール (相対 import で失敗したら絶対 import
     from .annotation import propagation as propagation_mod
     from .annotation import quality as quality_mod
     from .annotation import review_queue as review_queue_mod
+    from .annotation import round as round_mod
     from .annotation import sampling as sampling_mod
     from .annotation import tracklet as tracklet_mod
 except ImportError:  # スクリプト直接実行時のフォールバック
@@ -87,6 +103,14 @@ except ImportError:  # スクリプト直接実行時のフォールバック
     from htrtdetr.gui.sam_session import SamSessionMixin
     from htrtdetr.gui.auto_label import TRACKER_LABELS, make_tracker
 
+    from htrtdetr.gui import activity as activity_mod
+    from htrtdetr.gui import chrome
+    from htrtdetr.gui.final_operations import FinalPassMixin
+    from htrtdetr.gui.round_work import RoundWorkMixin
+    from htrtdetr.gui.train_operations import TrainRoundMixin
+
+    if dpg is not None:
+        from htrtdetr.gui import menubar
     if dpg is not None:
         from htrtdetr.gui import inspector as inspector_mod
     if dpg is not None:
@@ -98,6 +122,12 @@ except ImportError:  # スクリプト直接実行時のフォールバック
     if dpg is not None:
         from htrtdetr.gui import smart_annotate as smart_annotate_mod
     if dpg is not None:
+        from htrtdetr.gui import final_pass as final_pass_mod
+    if dpg is not None:
+        from htrtdetr.gui import release_export as release_export_mod
+    if dpg is not None:
+        from htrtdetr.gui import train_round as train_round_mod
+    if dpg is not None:
         from htrtdetr.gui import theme
     if dpg is not None:
         from htrtdetr.gui import timeline as timeline_mod
@@ -107,6 +137,7 @@ except ImportError:  # スクリプト直接実行時のフォールバック
     from htrtdetr.annotation import propagation as propagation_mod
     from htrtdetr.annotation import quality as quality_mod
     from htrtdetr.annotation import review_queue as review_queue_mod
+    from htrtdetr.annotation import round as round_mod
     from htrtdetr.annotation import sampling as sampling_mod
     from htrtdetr.annotation import tracklet as tracklet_mod
 
@@ -164,7 +195,7 @@ _BACKEND_TIPS = {
         "inference is run. A click takes the detection under it.\n"
         "Once a model has been trained on this species this is the most "
         "accurate fit, because it was trained for exactly this.\n"
-        "Load a file with File > Load Predictions for Click to Box..."
+        "Load a file with File > Load Predictions > As boxes for Click animal..."
     ),
 }
 
@@ -181,20 +212,12 @@ _TIMELINE_H = 26  # シークバー (drawlist) の高さ
 _TIMELINE_PAD = 10  # シークバー左右の余白 (px)
 _BOTTOM_H = 160  # キャンバス下に確保する高さ (シークバー + ナビ + status)
 
-#: Left tool rail width.
-#:
-#: Wide enough for the label the rail actually draws. It was 60, giving 44 px
-#: buttons; the theme sets ``FramePadding.x = 10``, so ImGui clipped every
-#: label to 24 px and the 49 px ``"[k] (V)"`` rendered as ``"[k]"`` with the
-#: key silently cut off. The rail advertised its shortcuts and showed none of
-#: them, and the ASCII icon left behind said nothing on its own. This leaves
-#: room for the widest label (``"Select V"``) plus the vertical scrollbar the
-#: rail grows at the minimum window size, which is what turns the rail into
-#: something a first-time user can read.
-_RAIL_W = 108
-#: Rail button width: the rail minus its window padding and minus the width of
-#: a scrollbar, so a button is never half-covered by one when it appears.
-_RAIL_BTN_W = _RAIL_W - 26
+#: Rail width and button width. They describe the rail, so they live with it
+#: in :mod:`gui.chrome`; these names are kept because ``_canvas_size`` and the
+#: layout tests read them from here.
+_RAIL_W = chrome.RAIL_W
+_RAIL_BTN_W = chrome.RAIL_BTN_W
+
 #: Right column width. 280 rather than 320: the Inspector shows one context at
 #: a time now, so it needs room for a label and a control and nothing else, and
 #: every pixel it gives back goes to the image.
@@ -234,21 +257,10 @@ _ZOOM_MIN, _ZOOM_MAX = canvas_view.ZOOM_MIN, canvas_view.ZOOM_MAX
 _PAN_KEEP = canvas_view.PAN_KEEP
 
 #: The six tools, in rail order: ``(tool, full name, rail word, action)``.
-#:
-#: The rail word is a word and no longer an ASCII glyph. ``[k]``, ``[ ]``,
-#: ``[/]`` and ``(+)`` meant select, box, rotated box and click-an-animal to
-#: whoever chose them and nothing to anyone else, and the tooltip that
-#: explained them only appears once the cursor is already on the right button.
-#: The full name stays in the tooltip; the rail carries the word plus its key,
-#: which is what makes the keymap learnable without opening Help.
-_TOOLS: Tuple[Tuple[str, str, str, str], ...] = (
-    ("select", "Select", "Select", "tool.select"),
-    ("draw", "Draw Box", "Box", "tool.draw_box"),
-    ("obb", "Draw Rotated Box", "Rotate", "tool.draw_rotated"),
-    ("click", "Click animal", "Click", "tool.click_box"),
-    ("pan", "Pan", "Pan", "tool.pan"),
-    ("delete", "Delete Box", "Delete", "tool.delete"),
-)
+#: Defined in :mod:`gui.chrome`, which builds the rail out of it, and
+#: re-exported here because ``_refresh_tool_ui`` and the layout tests have
+#: always read ``annotator._TOOLS``.
+_TOOLS: Tuple[Tuple[str, str, str, str], ...] = chrome.TOOLS
 
 #: One sentence per tool, shown in the canvas chip. Always names the *next*
 #: action, never just the state (docs/GUI_DESIGN.md §0.3.4).
@@ -334,10 +346,14 @@ from htrtdetr.gui.workspace import WorkspaceMixin
 
 @video_scoped
 class AnnotationApp(
+    activity_mod.ActivityMixin,
     CanvasViewMixin,
     EditHistoryMixin,
+    FinalPassMixin,
     ReviewModeMixin,
+    RoundWorkMixin,
     SamSessionMixin,
+    TrainRoundMixin,
     VideoControllerMixin,
     WorkspaceMixin,
 ):
@@ -397,6 +413,8 @@ class AnnotationApp(
         # Click to Box (docs/CLICK_SEGMENT.md)。"local" は追加依存ゼロで常に
         # 使えるので、ツール自体が使えなくなることはない。
         self._click_backend: str = "auto"
+        self._click_auto_attempted = False
+        self._click_start_pending = False
         self._click_radius_hint: Optional[float] = None
         # SAM サイドカー。使うと宣言されるまで probe も起動もしない。
         self._sam_client = None  # sidecar.SidecarClient
@@ -407,6 +425,7 @@ class AnnotationApp(
         self._sam_waiting: bool = False
         # 起動は非同期。押した操作は「用意ができたら」ここに積んで replay する。
         self._sam_starting: bool = False
+        self._sam_report_failure = True
         self._sam_on_ready: List[Callable[[bool], None]] = []
         # _stop_sam が飛んだ後に古い起動が着地して勝手にヘルパーを据えるのを防ぐ。
         self._sam_start_token: int = 0
@@ -486,6 +505,27 @@ class AnnotationApp(
         #: long annotation session spends most of its time looking at pixels.
         self._panels_hidden = False
         self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        #: Set when the pending set changed and the copilot has not caught up.
+        #: See the note above :meth:`rebuild_copilot`.
+        self._copilot_dirty = False
+        self._copilot_due = 0.0
+        self._activity_polled = 0.0
+        #: Which video the timeline's current model was assembled for. ``None``
+        #: means "no model yet", which forces the full path. See
+        #: :meth:`_render_timeline`.
+        self._timeline_model_video = None
+
+        #: Everything the app has said, kept so it can be read back (§ the
+        #: Activity window). Built before any other view, because the views
+        #: below are allowed to record into it while they are being made and
+        #: a failure during construction is exactly the one worth keeping.
+        self.activity_log = activity_mod.ActivityLog()
+        self.activity = activity_mod.ActivityWindow(
+            self.activity_log,
+            running=self.running_jobs,
+            project_root=lambda: self.project_dir,
+            on_open_folder=self._open_folder,
+        )
 
         self.inspector = inspector_mod.Inspector("insp", callbacks=self._inspector_callbacks())
         self.timeline = timeline_mod.Timeline(
@@ -493,12 +533,18 @@ class AnnotationApp(
             on_seek=lambda f: self.goto_frame(f, light=True),
             on_issue=self._on_timeline_marker,
             on_clip=self._on_timeline_clip,
+            on_sample=self._goto_sample,
         )
         self.inbox = review_mod.ReviewInbox(
             on_select=self.jump_to_issue,
             on_start_review=self.open_review_mode,
             on_accept_kind=self.accept_issue_kind,
             on_reanalyze=self.open_smart_annotate,
+            on_next_chosen=self.goto_next_chosen_frame,
+            on_train=lambda: self.open_train_round(),
+            on_next_final=self.goto_next_final_stop,
+            on_final_checked=self.mark_final_stop_checked,
+            on_sign_off=self.sign_off_video,
         )
         self.review_mode = review_mod.ReviewMode(
             on_seek=lambda f: self.goto_frame(f, light=True),
@@ -508,6 +554,20 @@ class AnnotationApp(
             on_exit=self._on_review_exit,
         )
         self.settings = settings_mod.SettingsDialog(callbacks=self._settings_callbacks())
+        #: The running active-learning round, or ``None``. One attribute for
+        #: the whole feature: the plan, the worker, the child and the clock all
+        #: hang off it, so "is a round going" has one answer.
+        self._round = None
+        self._round_pending_weights = ""
+        self._round_pending_project = None
+        self.round_dialog = train_round_mod.TrainRoundDialog(
+            on_start=self.start_train_round,
+            on_stop=self.stop_train_round,
+            on_analyze=lambda: self.open_smart_annotate(preset="analyze"),
+            on_adopt=self.adopt_pending_round_model,
+            on_options=self.round_plan_sentence,
+        )
+        self.build_final_dialogs(final_pass_mod, release_export_mod)
         self.smart_dialog = smart_annotate_mod.SmartAnnotateDialog(
             on_analyze=self.start_analysis,
             on_cancel=self.stop_analysis,
@@ -588,13 +648,23 @@ class AnnotationApp(
                 )
                 dpg.add_spacer(height=8)
 
-                dpg.add_text("Action labels (comma-separated, in display order)")
-                dpg.add_input_text(
-                    tag="setup_actions",
-                    default_value=", ".join(_DEFAULT_ACTIONS),
-                    width=-1,
-                    multiline=False,
-                )
+                # Behaviors are optional and they are the answer most likely to
+                # change once the user has watched an hour of their own video,
+                # so the field is folded away with a working default rather
+                # than presented as a decision to make before frame 0. Classes
+                # stay open: the class list is what every box is labelled with.
+                with dpg.collapsing_header(
+                    label="Behaviors (optional - defaults are fine for now)",
+                    tag="setup_actions_fold",
+                    default_open=False,
+                ):
+                    dpg.add_text("Comma-separated, in display order")
+                    dpg.add_input_text(
+                        tag="setup_actions",
+                        default_value=", ".join(_DEFAULT_ACTIONS),
+                        width=-1,
+                        multiline=False,
+                    )
                 dpg.add_spacer(height=8)
 
                 # ── does this experiment follow individuals? ──────────
@@ -636,11 +706,12 @@ class AnnotationApp(
                     tag="setup_copy_media",
                     default_value=False,
                 )
+                # One line, not four. Leaving it off is safe and reversible -
+                # Project > Copy Videos into Project Folder does it later - so
+                # this does not need the paragraph a one-way door would.
                 dpg.add_text(
-                    "On: the folder is self-contained and can be moved to another "
-                    "machine on its own. Off: videos stay where they are and the "
-                    "project remembers both their relative and absolute location, "
-                    "so moving the folder alone still works.",
+                    "Off is fine: the project finds them where they are. You "
+                    "can copy them in later from the Project menu.",
                     color=theme.TEXT_DIM,
                     wrap=w - 60,
                 )
@@ -655,12 +726,6 @@ class AnnotationApp(
                     dpg.add_button(label="Add Folder...", callback=lambda: self._setup_add_folder())
                     dpg.add_checkbox(label="Include subfolders", tag="setup_recursive")
                 dpg.add_text("0 videos selected", tag="setup_video_count")
-                dpg.add_combo(
-                    ["Stay on last frame", "Open next unfinished video"],
-                    tag="setup_end",
-                    default_value="Stay on last frame",
-                    width=-1,
-                )
 
             widgets.dialog_footer()
             # The primary action of the first screen anyone ever sees, and it
@@ -780,9 +845,14 @@ class AnnotationApp(
         if not self.action_names:
             self.action_names = list(_DEFAULT_ACTIONS)
         self.project_dir = Path(raw_dir).expanduser() if raw_dir else None
+        # "At video end" is not asked on this screen any more: it is a question
+        # about finishing video 1 put to someone who has not opened it, and it
+        # is in Settings > Project where it can be answered by someone who has.
+        # The default stays what it was.
         self.project.settings["end_of_video"] = (
             "next_unfinished"
-            if dpg.get_value("setup_end") == "Open next unfinished video"
+            if dpg.does_item_exist("setup_end")
+            and dpg.get_value("setup_end") == "Open next unfinished video"
             else "stay"
         )
         self.project.settings["use_track_ids"] = bool(dpg.get_value("setup_use_tracks"))
@@ -866,6 +936,12 @@ class AnnotationApp(
         self._refresh_backend_ui()
         self._refresh_labels_display()
         self.smart_dialog.build()
+        self.round_dialog.build()
+        # Built hidden, with the rest of the dialogs, rather than on first
+        # press: the point of the pill is that the log is one click away, and
+        # a window that has to be constructed first is one click and a stutter.
+        self.activity.build()
+        self._refresh_activity_pill()
         self.review_mode.build(
             width=max(dpg.get_viewport_width() - 120, 700),
             height=max(dpg.get_viewport_height() - 90, 520),
@@ -885,102 +961,8 @@ class AnnotationApp(
     # ─── Menu bar ────────────────────────────────────────────────────
 
     def _build_menubar(self) -> None:
-        with dpg.menu_bar():
-            with dpg.menu(label="File"):
-                dpg.add_menu_item(label="Open Project...", callback=self._load_annotation_dialog)
-                dpg.add_menu_item(label="Add Video Files...", callback=self.add_video_files)
-                dpg.add_menu_item(label="Add Video Folder...", callback=self.add_video_folder)
-                dpg.add_menu_item(label="Open Video...  Ctrl+O", callback=self._open_video_dialog)
-                dpg.add_menu_item(label="Load Annotation...", callback=self._load_annotation_dialog)
-                dpg.add_menu_item(
-                    label="Load Predictions as Candidates...",
-                    callback=self._import_predictions_dialog,
-                )
-                dpg.add_menu_item(
-                    label="Load Predictions for Click to Box...",
-                    callback=self._load_predictions_dialog,
-                )
-                dpg.add_separator()
-                dpg.add_menu_item(
-                    label="Set Project Folder...", callback=self._set_project_dir_dialog
-                )
-                dpg.add_menu_item(
-                    label="Open Project Folder", callback=self._open_project_folder
-                )
-                dpg.add_menu_item(label="Save  Ctrl+S", callback=self.save_annotation)
-                dpg.add_menu_item(label="Save As...", callback=self._save_as_dialog)
-                dpg.add_menu_item(
-                    label="Save and Export Frames...", callback=self._save_and_export_dialog
-                )
-                dpg.add_separator()
-                dpg.add_menu_item(label="New Project...", callback=self._show_setup_screen)
-
-            with dpg.menu(label="Edit"):
-                dpg.add_menu_item(label=shortcuts.with_key("Undo", "edit.undo"), callback=self.undo)
-                dpg.add_menu_item(label=shortcuts.with_key("Redo", "edit.redo"), callback=self.redo)
-                dpg.add_menu_item(label="Delete Selected  Del", callback=self.delete_selected)
-                dpg.add_menu_item(
-                    label="Propagate from Prev  Space", callback=self.propagate_from_prev
-                )
-
-            with dpg.menu(label="Project"):
-                dpg.add_menu_item(label="Project Videos...", callback=self.show_video_browser)
-                dpg.add_menu_item(
-                    label="Copy Videos into Project Folder", callback=self.collect_videos
-                )
-                dpg.add_menu_item(
-                    label="Pre-label videos with the model...",
-                    callback=lambda: self.open_smart_annotate("auto", "project"),
-                )
-                dpg.add_menu_item(
-                    label=shortcuts.with_key("Pick frames to label...", "auto.annotate"),
-                    callback=lambda: self.open_smart_annotate("sample", "project"),
-                )
-                dpg.add_menu_item(
-                    label="Check Project Quality",
-                    callback=lambda: self.run_project_quality("Entire project"),
-                )
-                dpg.add_menu_item(
-                    label="Review Next across videos", callback=self.review_next_project
-                )
-                dpg.add_menu_item(label="Settings...", callback=lambda: self.open_settings())
-                dpg.add_separator()
-                dpg.add_menu_item(label="Labels...", callback=lambda: self.open_settings("labels"))
-                dpg.add_menu_item(
-                    label="Tracking...", callback=lambda: self.open_settings("tracking")
-                )
-                dpg.add_menu_item(label="Model...", callback=lambda: self.open_settings("model"))
-                dpg.add_menu_item(
-                    label="Assistance...", callback=lambda: self.open_settings("assist")
-                )
-                dpg.add_menu_item(label="Checks...", callback=lambda: self.open_settings("checks"))
-
-            with dpg.menu(label="Review"):
-                dpg.add_menu_item(label="Project Review Inbox", callback=self.show_project_review)
-                dpg.add_menu_item(label="Review Inbox", callback=self.toggle_inbox)
-                dpg.add_menu_item(label="Review issues one by one", callback=self.open_review_mode)
-                dpg.add_separator()
-                # Clip propagation sits under Review, beside Smart Annotate,
-                # because a clip is what Smart Annotate proposed and the boxes
-                # it produces go straight into the Review Inbox.
-                dpg.add_menu_item(
-                    label="Follow animals across this clip",
-                    callback=self.propagate_clip_here,
-                )
-                dpg.add_menu_item(
-                    label="Follow animals across every sampled clip",
-                    callback=self.propagate_sampled_clips,
-                )
-                dpg.add_separator()
-                dpg.add_menu_item(label="Re-check everything", callback=self.rebuild_copilot)
-                dpg.add_menu_item(
-                    label="Expected number of animals...",
-                    callback=lambda: self.open_settings("project"),
-                )
-
-            with dpg.menu(label="Help"):
-                dpg.add_menu_item(label="Guided Annotation", callback=self.show_onboarding)
-                dpg.add_menu_item(label="Quick Start and Shortcuts", callback=self._show_help)
+        """The five menus. Built in :mod:`gui.menubar`, which owns the list."""
+        menubar.build(self)
 
     # ─── Canvas panel ────────────────────────────────────────────────
 
@@ -1016,189 +998,15 @@ class AnnotationApp(
         ):
             dpg.add_drawlist(tag="canvas", width=cw, height=ch)
 
-    # ─── Top bar ─────────────────────────────────────────────────────
+    # ─── Top bar and tool rail ───────────────────────────────────────
 
     def _build_topbar(self) -> None:
-        """Project, save state, and the two entry points to the copilot.
-
-        Save state is a chip rather than a dialog because it must be true at a
-        glance and never require an action to read (§38).
-        """
-        with dpg.child_window(tag="topbar", height=68, border=False, no_scrollbar=True):
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Videos", callback=self.show_video_browser)
-                dpg.add_button(label="Previous Video", callback=lambda: self.adjacent_video(-1))
-                dpg.add_button(label="Next Video", callback=lambda: self.adjacent_video(1))
-                dpg.add_text("Project: untitled | No video open", tag="workspace_identity")
-                dpg.add_button(label="Review Next", callback=self.review_next_project)
-            with dpg.group(horizontal=True):
-                dpg.add_text("YOAKE", color=theme.ACCENT)
-                theme.bind_h2(dpg.last_item())
-                dpg.add_text("", tag="top_project", color=theme.TEXT_DIM)
-                widgets.status_pill("top_saved", "No changes", "idle")
-                # Whether a model exists decides what half the project menu can
-                # do, so it is read off the top bar rather than discovered as a
-                # grey checkbox inside a dialog. The chip is the way there too.
-                widgets.status_pill(
-                    "top_model",
-                    "Model: none",
-                    "idle",
-                    callback=lambda *_: self.open_settings("model"),
-                )
-                widgets.attach_tooltip(
-                    "top_model",
-                    "The detector checkpoint this project pre-labels with. "
-                    "Click to choose one (Project > Model...).",
-                )
-                dpg.add_spacer(width=16)
-
-                # No hand-picked widths in this row. dearpygui sizes a button
-                # with width=0 to its own label, and the row has to survive the
-                # 900 px minimum viewport: with fixed widths, Panels and
-                # Settings were pushed past the right edge and could not be
-                # reached at all until the window was made wider.
-                widgets.toolbar_button(
-                    "Pick frames to label",
-                    lambda *_: self.open_smart_annotate("sample"),
-                    tag="top_smart",
-                    height=26,
-                    shortcut=shortcuts.label_for("auto.annotate"),
-                    help_text="Analyze this video and choose the frames and "
-                    "clips worth your time, instead of scrolling "
-                    "for somewhere to start.",
-                )
-                widgets.toolbar_button(
-                    "Review",
-                    self.toggle_inbox,
-                    tag="top_review",
-                    height=26,
-                    help_text="Show the places the checks say are worth a " "second look.",
-                )
-                dpg.add_spacer(width=10)
-                widgets.toolbar_button(
-                    "Undo",
-                    self.undo,
-                    tag="top_undo",
-                    height=26,
-                    shortcut=shortcuts.label_for("edit.undo"),
-                    help_text=shortcuts.help_for("edit.undo"),
-                )
-                widgets.toolbar_button(
-                    "Redo",
-                    self.redo,
-                    tag="top_redo",
-                    height=26,
-                    shortcut=shortcuts.label_for("edit.redo"),
-                    help_text=shortcuts.help_for("edit.redo"),
-                )
-                widgets.toolbar_button(
-                    "Save",
-                    self.save_annotation,
-                    tag="top_save",
-                    height=26,
-                    shortcut=shortcuts.label_for("file.save"),
-                    help_text=shortcuts.help_for("file.save"),
-                )
-                widgets.toolbar_button(
-                    "Panels",
-                    lambda *_: self.toggle_panels(),
-                    tag="top_panels",
-                    height=26,
-                    active=True,
-                    help_text="Hide the right-hand panels and give the whole "
-                    "width to the image.",
-                )
-                widgets.toolbar_button(
-                    "Settings",
-                    lambda *_: self.open_settings(),
-                    tag="top_settings",
-                    height=26,
-                    help_text="Project folder, labels, tracking, and what the "
-                    "checks flag for review.",
-                )
-                dpg.add_spacer(width=12)
-                # The active-tool sentence, which used to sit in the sidebar
-                # 600 px from where the user is looking. The canvas draws it
-                # too; this is the version that survives a full-screen image.
-                dpg.add_text("", tag="tool_mode_text", color=theme.TEXT_DIM)
-
-    # ─── Tool rail ───────────────────────────────────────────────────
+        """Two rows: where am I, and the loop. Built in :mod:`gui.chrome`."""
+        chrome.topbar(self)
 
     def _build_toolrail(self) -> None:
-        """The five tools plus zoom, as a narrow left rail.
-
-        A rail rather than a toolbar row because the tool is the thing the user
-        switches most and the canvas is the thing they look at: a vertical rail
-        beside the image is one saccade away, a horizontal strip above it is
-        two.
-        """
-        _cw, ch = self._canvas_size()
-        button_w = _RAIL_BTN_W
-
-        def rail_label(word: str, action: str) -> str:
-            """``"Select V"``. The key on the button, never only in a tooltip."""
-            key = shortcuts.label_for(action)
-            return f"{word} {key}" if key else word
-
-        # Scrollable, because the rail is taller than the canvas at the
-        # minimum window size (900x600) and it used to be clipped there with no
-        # scrollbar: Zoom, Fit and the zoom readout simply did not exist until
-        # the user made the window bigger, and nothing said so.
-        with dpg.child_window(
-            tag="toolrail", width=_RAIL_W, height=ch, border=False, no_scrollbar=False
-        ):
-            for tool, label, word, action in _TOOLS:
-                tag = f"rail_{tool}"
-                widgets.toolbar_button(
-                    rail_label(word, action),
-                    (lambda t=tool: (lambda *_: self.set_tool(t)))(),
-                    tag=tag,
-                    width=button_w,
-                    height=32,
-                    active=(self._tool == tool),
-                    # hint_for, not help_for: it lists *every* key bound to the
-                    # action, so the E / R pair on Draw Rotated Box is
-                    # discoverable from the button that owns it.
-                    help_text=f"{label}. {shortcuts.hint_for(action) or shortcuts.help_for(action)}",
-                )
-            widgets.toolbar_button(
-                "Continue",
-                lambda *_: self.continue_animal(),
-                tag="rail_propagate",
-                width=button_w,
-                height=32,
-                help_text="Continue this animal into the following frames: "
-                "tracking, accurate propagation, or a copy to the next frame, "
-                "whichever this machine can do. Select a box first.",
-            )
-            widgets.toolbar_button(
-                "Keep on",
-                lambda *_: self.toggle_sticky_draw(),
-                tag="rail_sticky",
-                width=button_w,
-                height=26,
-                active=self._sticky_draw,
-                help_text="Keep the tool active after each box. Off means "
-                "Draw, Draw Rotated and Click animal each return to Select "
-                "once a box is made, which is what LabelImg does and what "
-                "leaves the new box selected and ready to adjust.",
-            )
-            dpg.add_separator()
-            widgets.gap(1)
-            for word, callback, action, tip in (
-                ("Zoom", lambda *_: self.zoom_by(1.25), "view.zoom_in", "Zoom in"),
-                ("Zoom", lambda *_: self.zoom_by(0.8), "view.zoom_out", "Zoom out"),
-                ("Fit", lambda *_: self.fit_view(), "view.fit", "Fit the frame to the window"),
-            ):
-                widgets.toolbar_button(
-                    rail_label(word, action),
-                    callback,
-                    tag=f"rail_{action.replace('.', '_')}",
-                    width=button_w,
-                    height=26,
-                    help_text=tip,
-                )
-            dpg.add_text("100%", tag="rail_zoom", color=theme.TEXT_FAINT)
+        """Tools, assistance, view. Built in :mod:`gui.chrome`."""
+        chrome.toolrail(self)
 
     # ─── Right column ────────────────────────────────────────────────
 
@@ -1250,7 +1058,9 @@ class AnnotationApp(
         "candidate_count": "inspector: nothing",
         "accept_all_btn": "inspector: nothing",
         "discard_all_btn": "inspector: nothing",
-        "concept_text": "inspector: nothing",
+        # ``concept_text`` was here until the find-all button started naming
+        # the class itself. The widget is gone, so the promise is too: this
+        # map records moves, and a tag that leads nowhere is not a move.
         "find_all_btn": "inspector: nothing",
         "action_buttons_group": "inspector: box",
         "auto_track_cb": "settings: tracking",
@@ -1347,8 +1157,12 @@ class AnnotationApp(
                 callback=lambda: self.goto_frame(self.num_frames - 1),
             )
             dpg.add_spacer(width=10)
+            # "Copy from prev", not "Propagate": the rail's Continue button
+            # and the Review menu's clip entries are the other two ways to
+            # carry a box forward, and between them this one concept had six
+            # names. The word that survives says what the press does.
             widgets.secondary_button(
-                shortcuts.with_key("Propagate", "edit.propagate"),
+                shortcuts.with_key("Copy from prev", "edit.propagate"),
                 lambda *_: self.propagate_from_prev(),
                 width=150,
                 height=26,
@@ -1397,16 +1211,37 @@ class AnnotationApp(
         mx, _my = dpg.get_mouse_pos(local=False)
         return float(mx)
 
-    def _render_timeline(self) -> None:
+    def _render_timeline(self, *, playhead_only: bool = False) -> None:
         """Rebuild the timeline model from live state and redraw it.
 
         Called after every mutation and every frame change. Assembling the
         model here rather than inside the renderer keeps the renderer a pure
         function of data, which is what lets it be unit-tested with no
         viewport.
+
+        ``playhead_only`` is the frame-change path. Stepping a frame changes
+        exactly one field of the model - where the playhead is - and nothing
+        else it draws: not the annotations, not the pending set, not the
+        review queue, not the samples. Reassembling all of it cost 6 ms on an
+        hour of video with a detector run in it, on a budget of 16 ms, for a
+        result identical but for one integer. So the frame-change path moves
+        the integer and redraws; every mutation still goes through the full
+        rebuild, which is what keeps the cached model honest.
+
+        The reuse is keyed on **which video the model was built for**, not on
+        its length. This study is twenty recordings of one hour each: a frame
+        count is not an identity here, and "same number of frames" would have
+        let a freshly opened video be drawn with the previous one's
+        annotations until something else happened to force a rebuild.
         """
         if not self.timeline.alive():
             return
+        here = getattr(self._video_session, "video_id", None)
+        if playhead_only and self._timeline_model_video == here:
+            self.timeline.model.current = int(self.current_frame_idx)
+            self.timeline.render_playhead()
+            return
+        self._timeline_model_video = here
         self.timeline.set_model(
             timeline_mod.build_model(
                 num_frames=self.num_frames,
@@ -1515,6 +1350,7 @@ class AnnotationApp(
             "view.fit": self.fit_view,
             "view.zoom_in": lambda: self.zoom_by(1.25),
             "view.zoom_out": lambda: self.zoom_by(0.8),
+            "view.activity": self.toggle_activity,
             # navigation
             "nav.prev": lambda: self.goto_frame(self.current_frame_idx - 1),
             "nav.next": lambda: self.goto_frame(self.current_frame_idx + 1),
@@ -1525,9 +1361,10 @@ class AnnotationApp(
             # review
             "review.cycle": self._cycle_selection,
             "review.accept_all": self._accept_all_here,
+            "review.mark_checked": self.mark_frame_checked,
             "review.discard_all": self._discard_all_here,
             "auto.track_forward": self._track_forward_selected,
-            "auto.annotate": lambda: self.open_smart_annotate("sample"),
+            "auto.annotate": lambda: self.open_smart_annotate(),
             "auto.toggle_autotrack": self._toggle_auto_track_key,
             # edit
             "edit.delete": self.delete_selected,
@@ -1693,28 +1530,35 @@ class AnnotationApp(
     def _draw_empty_state(self, cw: int, ch: int) -> None:
         """Say what to do, not just that there is nothing here (§23).
 
-        A blank canvas is indistinguishable from a broken one. Three lines and
-        the keys that start the two things a user can do from nothing.
+        A blank canvas is indistinguishable from a broken one. This is the
+        first screen of a new project, so it carries the whole no-model recipe
+        in three numbered lines rather than a list of keys: the one question a
+        first-time user has here is "where do I start", and the honest answer
+        is not "frame 0" - it is "let it choose the frames".
+
+        The wording matches the buttons exactly. It used to say *Project
+        Videos*, and the button has read *Videos* since the top bar was built.
         """
         lines = [
             ("Open a video to start.", theme.TEXT, 18),
             ("", theme.TEXT, 8),
             (
-                shortcuts.with_key("Project Videos > Add Files / Add Folder", "file.open_video"),
+                shortcuts.with_key("1.  Videos > Add Files / Add Folder", "file.open_video"),
                 theme.TEXT_DIM,
                 14,
             ),
             (
-                f"{shortcuts.label_for('tool.draw_box')} draws a box   "
-                f"{shortcuts.label_for('tool.click_box')} fits one to an animal "
-                f"you click",
-                theme.TEXT_FAINT,
-                13,
+                shortcuts.with_key(
+                    "2.  Pick frames to label - no trained model needed", "auto.annotate"
+                ),
+                theme.TEXT_DIM,
+                14,
             ),
             (
-                shortcuts.with_key("Pick frames to label chooses them for you", "auto.annotate"),
-                theme.TEXT_FAINT,
-                13,
+                f"3.  {shortcuts.label_for('tool.click_box')} clicks an animal into a box, "
+                f"{shortcuts.label_for('tool.draw_box')} draws one by hand",
+                theme.TEXT_DIM,
+                14,
             ),
         ]
         y = ch // 2 - 48
@@ -2522,6 +2366,8 @@ class AnnotationApp(
 
         backend = self._click_backend
         if backend == "auto":
+            if self._prepare_auto_click(ix, iy):
+                return
             backend = (
                 "sam"
                 if self._sam_ready()
@@ -2543,7 +2389,7 @@ class AnnotationApp(
             else:
                 res = click_segment.segment(self._current_bgr, req, backend=backend)
         except Exception as exc:  # noqa: BLE001 — マウスハンドラを落とさない
-            self._status(f"Click to Box failed: {exc}")
+            self._status(f"Click animal failed: {exc}")
             return
         self._apply_click_result(res)
 
@@ -2613,7 +2459,7 @@ class AnnotationApp(
         self._predictions_path = Path(path)
         self._status(
             f"Loaded {total} detections on {len(frames)} frames from "
-            f"{Path(path).name}. Click to Box can now use Model predictions."
+            f"{Path(path).name}. Click animal can now use Model predictions."
         )
         self._refresh_backend_ui()
         return True
@@ -2778,7 +2624,7 @@ class AnnotationApp(
 
     def _load_predictions_dialog(self) -> None:
         path = _tk_open_file(
-            "Load predictions.json for Click to Box", [("JSON", "*.json"), ("All files", "*.*")]
+            "Load predictions.json for Click animal", [("JSON", "*.json"), ("All files", "*.*")]
         )
         if path and self.load_predictions_for_clicks(path):
             self.set_click_backend("model")
@@ -3434,26 +3280,40 @@ class AnnotationApp(
         self._refresh_workspace()
         self._status(f"Project folder set to {p}")
 
-    def _open_project_folder(self) -> None:
-        """Show the project folder in the system file browser."""
-        if self.project_dir is None:
-            self._status("No project folder yet. Use File > Set Project Folder.")
-            return
+    def _open_folder(self, folder) -> None:
+        """Show ``folder`` in the system file browser.
+
+        Split out of :meth:`_open_project_folder` because the Activity window
+        needs the same three platform branches to reach a run folder, and two
+        copies of "which command opens a directory here" is two places to fix
+        the day one of them is wrong.
+        """
         import os
         import subprocess
         import sys
 
         try:
             if sys.platform.startswith("win"):
-                os.startfile(str(self.project_dir))  # noqa: S606 - a folder the user owns
+                os.startfile(str(folder))  # noqa: S606 - a folder the user owns
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(self.project_dir)])
+                subprocess.Popen(["open", str(folder)])
             else:
-                subprocess.Popen(["xdg-open", str(self.project_dir)])
+                subprocess.Popen(["xdg-open", str(folder)])
         except OSError as exc:
-            self._status(f"Could not open {self.project_dir}: {exc}")
+            self._status(f"Could not open {folder}: {exc}")
+
+    def _open_project_folder(self) -> None:
+        """Show the project folder in the system file browser."""
+        if self.project_dir is None:
+            self._status("No project folder yet. Use File > Set Project Folder.")
+            return
+        self._open_folder(self.project_dir)
 
     def _refresh_project_dir_display(self) -> None:
+        # Setting the folder is what unblocks Train, so the gate is re-read
+        # here. Without it the button stayed dimmed, still tooltipped "this
+        # project has no folder yet", after the user had just given it one.
+        self.refresh_loop_gates()
         if dpg.does_item_exist("project_dir_text"):
             dpg.set_value(
                 "project_dir_text",
@@ -3492,8 +3352,31 @@ class AnnotationApp(
         self.open_project(Path(path))
 
     def _status(self, msg: str) -> None:
+        """Say one sentence, and keep it.
+
+        The status line holds exactly one message and forgets it the moment
+        the next one arrives, which is right for the line and wrong for the
+        session: the sentence that explains why a twenty-minute round failed
+        used to survive until the next mouse move. Every message now also
+        lands in the Activity log, classified by what it reads like, so it can
+        be found again.
+        """
         if dpg.does_item_exist("status_text"):
             dpg.set_value("status_text", msg)
+        log = getattr(self, "activity_log", None)
+        if log is None:
+            return
+        kind = activity_mod.classify(msg)
+        log.record(msg, kind)
+        # Only a problem redraws the chip here. ``_status`` is called on every
+        # frame change ("Frame 812/108000 | Annotated: ..."), and re-labelling
+        # and re-theming a button sixty times a second to say the same word is
+        # the kind of cost this release exists to remove. Everything else the
+        # chip reports moves on the order of seconds and is picked up by
+        # :meth:`_tick_activity`; an error is the one thing that must not wait
+        # even half of one.
+        if kind in (activity_mod.WARN, activity_mod.ERROR):
+            self._refresh_activity_pill()
 
     def _ctrl_s_handler(self) -> None:
         if dpg.is_key_down(_KEY_CTRL):
@@ -3638,13 +3521,15 @@ class AnnotationApp(
             # wording says so, and names what proposes boxes in the meantime,
             # so an empty checkbox does not read as a blocked workflow.
             predict_reason = (
-                "Detector pre-labelling needs a trained checkpoint, which step 2 "
-                "produces once the labels are done - so this option turns on "
-                "later, and nothing here waits for it.\n"
-                "Choose one in Project > Model... when you have it.\n"
+                "Detector pre-labelling needs a trained checkpoint, and this "
+                "project has none yet - so this option turns on later and "
+                "nothing here waits for it.\n"
+                "Train, in the top bar, makes one from the labels you already "
+                "have, and sets it for you.\n"
                 "Until then the boxes come from the segmentation helper: press C "
                 "to click an animal, or select a box and press Continue."
             )
+        self.refresh_loop_gates()
         self.smart_dialog.set_capability(
             gpu_reason=(
                 ""
@@ -3662,8 +3547,22 @@ class AnnotationApp(
         self._on_list_select(None, value)
 
     def _find_all_clicked(self) -> None:
-        text = dpg.get_value("concept_text") if dpg.does_item_exist("concept_text") else ""
-        self.find_all_in_frame(text or "")
+        """*Find every ``<class>`` in this frame*, from the Inspector.
+
+        The word comes from the class the Inspector is set to, which is the
+        word printed on the button. There used to be a text box above it whose
+        placeholder was the same word; typing it and leaving it blank produced
+        the same search, so it was a field that could only be answered wrong.
+        """
+        self.find_all_in_frame(self.active_class_name())
+
+    def active_class_name(self) -> str:
+        """The class new boxes get, as a word. ``"animal"`` if none is set."""
+        names = self.class_names
+        if not names:
+            return "animal"
+        index = min(max(getattr(self, "active_class_id", 0), 0), len(names) - 1)
+        return str(names[index])
 
     # ─── Auto pre-label: importing an existing model's output (§9) ───
 
@@ -3757,16 +3656,28 @@ class AnnotationApp(
 
     # ─── Smart Annotate ──────────────────────────────────────────────
 
-    #: What the two menu entries mean, as ``(window title, pre-label on)``.
-    #: They are the same form: the only thing that ever differed between Auto
-    #: Annotate Project and Smart Sample Project was this checkbox.
-    SMART_MODES = {
-        "auto": ("Pre-label videos with the model", True),
-        "sample": ("Pick frames to label", False),
+    #: The two ways into the one engine window, as
+    #: ``(caption, pre-label, strategy)``. They are **presets**, not modes: the
+    #: window, the engine and the progress display are the same, and a preset
+    #: only decides where the form starts.
+    #:
+    #: A caption naming a control the window is about to hide would be a lie,
+    #: which is what retired the old *Pre-label videos with the model* entry.
+    #: ``analyze`` cannot tell that lie because it is locked until a checkpoint
+    #: exists - and once one does, every control it names is on screen.
+    SMART_PRESETS: Dict[str, Tuple[str, bool, str]] = {
+        "sample": ("Pick frames to label", False, ""),
+        # Diversity + uncertainty, not uncertainty alone. A detector that has
+        # seen two hundred frames of one species is not calibrated enough for
+        # its confidence to rank a million frames on its own: pure uncertainty
+        # piles the picks onto one hard-looking situation. The combined
+        # strategy spreads them over the frames it found hardest, which is what
+        # ``_spread_over_top`` was written for.
+        "analyze": ("Find animals with the model", True, sampling_mod.DIVERSITY_UNCERTAINTY),
     }
 
-    def open_smart_annotate(self, mode: str = "sample", scope: str = "") -> None:
-        """The one dialog, opened the way the entry point means it.
+    def open_smart_annotate(self, scope: str = "", preset: str = "sample") -> None:
+        """The one dialog, opened on the scope and preset the entry point means.
 
         No video needs to be open: this runs over a scope, and the project
         entries are reached from Project Videos without opening anything.
@@ -3776,8 +3687,13 @@ class AnnotationApp(
             scope = "Selected videos" if project.selected_videos else "Entire project"
         elif not scope:
             scope = "Current video"
-        title, prelabel = self.SMART_MODES.get(mode, self.SMART_MODES["sample"])
         self._refresh_capability_gates()
+        caption, prelabel, strategy = self.SMART_PRESETS.get(
+            preset, self.SMART_PRESETS["sample"]
+        )
+        if prelabel and not project.settings.get("weights"):
+            self._status(self.analyze_blocked())
+            return
         name, frames, fps, videos = self.scope_summary(scope)
         if not videos:
             self._status("No videos in this scope. Add or select videos in Project Videos.")
@@ -3788,10 +3704,31 @@ class AnnotationApp(
             fps=fps,
             videos=videos,
             scope=scope,
-            prelabel=prelabel,
             sample=True,
-            title=title,
+            prelabel=prelabel or None,
+            strategy=strategy,
+            title=caption,
         )
+
+    def analyze_blocked(self) -> str:
+        """Why *Find animals with the model* is off. ``""`` when it is not.
+
+        Running a detector needs a detector, and in this window the way to get
+        one is one button to the left - so the sentence says that rather than
+        sending the user to a file browser for a checkpoint they do not have.
+        """
+        if not self._ensure_project().settings.get("weights"):
+            return (
+                "No model yet, so there is nothing to find animals with. "
+                "Train makes one from the labels you already have."
+            )
+        try:
+            cap = self._capability()
+        except Exception:  # noqa: BLE001
+            return ""
+        if not cap.torch:
+            return cap.torch_reason
+        return ""
 
     def start_analysis(self, request, options: Dict[str, Any]) -> None:
         from .annotation.batch import BatchOptions
@@ -3801,11 +3738,21 @@ class AnnotationApp(
         detect = bool(options.get("generate_candidates"))
         if detect and not weights:
             self.smart_dialog.fail(
-                "No detector checkpoint yet. Choose one in Project > Model..., "
-                "or turn off Generate annotation candidates and pick frames to "
-                "label by hand."
+                "No detector checkpoint yet. Train makes one from the labels "
+                "you already have, or turn off Generate annotation candidates "
+                "and pick frames to label by hand."
             )
             return
+        stride = max(1, int(options.get("stride", 15)))
+        sampling_on = bool(options.get("sample", True))
+        # Detect sparsely exactly when the detections are for *choosing*
+        # frames. The sampler can only ever pick a scanned frame, so running
+        # the detector on the fourteen frames between two scan positions is
+        # work whose result is cached and never read: measured at 121 frames/s,
+        # 20 one-hour videos cost 4.1 hours dense against 17 minutes at stride
+        # 15. A pre-label-only run is the other intent - the user means to
+        # review the whole video - so that stays dense.
+        detect_stride = stride if sampling_on else 1
         batch = BatchOptions(
             detect=detect,
             weights=weights,
@@ -3817,8 +3764,9 @@ class AnnotationApp(
             # not has nothing to connect them into - so the checkbox that used
             # to ask was a question with one right answer either way.
             connect_tracks=bool(project.settings.get("use_track_ids", True)),
-            sample=bool(options.get("sample", True)),
-            stride=max(1, int(options.get("stride", 15))),
+            sample=sampling_on,
+            stride=stride,
+            detect_stride=detect_stride,
             request=request,
             balanced=options.get("balanced", True),
             quality=self.quality_config,
@@ -3846,20 +3794,66 @@ class AnnotationApp(
             self.goto_frame(int(selection.frames[0]))
         elif selection.clips:
             self.goto_frame(int(selection.clips[0].start))
+        # Say how to reach the other ninety-eight. "They are marked on the
+        # timeline" was true and useless: at an hour a video the samples lane
+        # is a row of dots eighty-six frames wide apiece.
+        key = shortcuts.label_for("review.next_pending_frame")
         self._status(
-            f"{len(selection.frames):,} frames and {len(selection.clips):,} clips "
-            f"selected. They are marked on the timeline."
+            f"Sample 1 of {len(selection.frames):,}"
+            + (f" and {len(selection.clips):,} clips" if selection.clips else "")
+            + f". {key} for the next one, or click a mark on the timeline."
         )
 
     # ─── Building the copilot views ──────────────────────────────────
+    #
+    # The rebuild is a **whole-video** computation: nine detectors over every
+    # pending candidate, plus the tracklet index and the interval merge.
+    # Measured on this project's own scale - one hour at 30 fps, detections
+    # every 15th frame, four animals, so 7,200 frames and 28,800 boxes - it
+    # costs about 0.8 s, and it was being run once per accepted candidate.
+    # Holding Y down through fifty frames therefore bought fifty full
+    # re-analyses of the same video: forty seconds of frozen window for a
+    # result that only the last one of them produced.
+    #
+    # So accepting schedules instead of rebuilding. The canvas, the saved
+    # annotations and the undo entry are all updated synchronously - those are
+    # microseconds and they are what the user is looking at - and the analysis
+    # that feeds the Review Inbox and the timeline catches up once the burst
+    # of clicks has stopped. One rebuild per burst, not one per click.
+
+    #: How long to wait after the last change before re-analysing. Long
+    #: enough that a run of accepts coalesces into one rebuild, short enough
+    #: that a single accept feels like it landed before the user has finished
+    #: looking at the result.
+    COPILOT_QUIET = 0.35
+
+    def schedule_copilot_rebuild(self, delay: Optional[float] = None) -> None:
+        """Mark the copilot stale. :meth:`_tick_copilot` does the work."""
+        self._copilot_dirty = True
+        self._copilot_due = time.monotonic() + (
+            self.COPILOT_QUIET if delay is None else float(delay)
+        )
+
+    def _tick_copilot(self) -> None:
+        """Run a scheduled rebuild once the user has stopped changing things."""
+        if not getattr(self, "_copilot_dirty", False):
+            return
+        if time.monotonic() < getattr(self, "_copilot_due", 0.0):
+            return
+        self.rebuild_copilot()
 
     def rebuild_copilot(self) -> None:
         """Recompute tracklets, the review queue and behavior intervals.
 
-        Called after any change to the pending set. Decisions already made are
-        carried across by content key, so "correct a few, re-analyse, carry on"
-        does not reset the review (§13).
+        The immediate form, and still the right one for anything that changes
+        the pending set wholesale - importing predictions, undo, *Re-check
+        everything*. The per-candidate paths call
+        :meth:`schedule_copilot_rebuild` instead.
+
+        Decisions already made are carried across by content key, so "correct
+        a few, re-analyse, carry on" does not reset the review (§13).
         """
+        self._copilot_dirty = False
         candidates = self._candidate_map()
         cfg = self.quality_config
 
@@ -3867,7 +3861,7 @@ class AnnotationApp(
         items = quality_mod.analyze(
             candidates,
             config=cfg,
-            frames=list(range(self.num_frames)) if self.num_frames else None,
+            frames=self._examined_frames(),
             enabled=quality_mod.detector_keys(use_track_ids=self.use_track_ids),
             tracklets=parts,
             num_frames=self.num_frames,
@@ -3934,7 +3928,7 @@ class AnnotationApp(
         """Give the whole width to the image, or take it back."""
         self._panels_hidden = not self._panels_hidden
         self._show_item("right_col", not self._panels_hidden)
-        widgets.set_toolbar_active("top_panels", not self._panels_hidden)
+        widgets.set_toolbar_active("rail_panels", not self._panels_hidden)
         self._on_viewport_resize()
         self._status(
             "Panels hidden. Press Panels again to bring them back."
@@ -4035,7 +4029,8 @@ class AnnotationApp(
 
         if accepted:
             self._mark_dirty()
-            self.rebuild_copilot()
+            # Scheduled, not immediate: a burst of accepts is one analysis.
+            self.schedule_copilot_rebuild()
             self._refresh_sidebar()
             self._render_canvas()
         return accepted
@@ -4079,7 +4074,7 @@ class AnnotationApp(
             if session.state(frame, index) == auto_label.PENDING:
                 session.reject(frame, index)
                 n += 1
-        self.rebuild_copilot()
+        self.schedule_copilot_rebuild()
         self._render_canvas()
         self._status(f"Discarded {n} candidate{'s' if n != 1 else ''}.")
         self._mark_dirty()
@@ -4171,7 +4166,7 @@ class AnnotationApp(
                 session.reject(frame, index)
                 n += 1
         if n:
-            self.rebuild_copilot()
+            self.schedule_copilot_rebuild()
             self._render_canvas()
         return n
 
@@ -4500,7 +4495,6 @@ class AnnotationApp(
             "continue_animal": self.continue_animal,
             "click_animal": lambda: self.set_tool("click"),
             "draw_animal": lambda: self.set_tool("draw"),
-            "auto_annotate": lambda: self.open_smart_annotate("auto"),
             "guided_help": self.show_onboarding,
             "set_class": self._insp_set_class,
             "set_track": self._insp_set_track,
@@ -4541,10 +4535,12 @@ class AnnotationApp(
             "new_track": self.new_track,
             "find_all": lambda text: self.find_all_in_frame(text),
             "find_all_clicked": self._find_all_clicked,
+            "mark_checked": self.mark_frame_checked,
         }
 
     def _refresh_inspector(self) -> None:
         """Show whatever is selected. The one place the context is decided."""
+        self._refresh_round_block()
         if not dpg.does_item_exist(self.inspector.tag):
             return
         common = dict(
@@ -4558,6 +4554,9 @@ class AnnotationApp(
             verified_frames=len(self.annotations),
             pending_here=len(self.candidates_here()),
             use_track_ids=self.use_track_ids,
+            chosen_frame=self.current_frame_idx in (self._selection.frame_set()
+                                                    if self._selection is not None else ()),
+            checked=self.current_frame_idx in self.annotations,
         )
 
         if self._sel_issue is not None:
@@ -4858,24 +4857,65 @@ class AnnotationApp(
 
     # ─── Keyboard actions that needed a home ─────────────────────────
 
+    def sample_frames(self) -> List[int]:
+        """The frames *Pick frames to label* chose for this video, in order."""
+        frames = getattr(self._selection, "frames", None) or ()
+        return sorted({int(f) for f in frames})
+
+    def _goto_sample(self, frame: int) -> None:
+        """Seek to a chosen frame and say which of them it is."""
+        frames = self.sample_frames()
+        self.goto_frame(int(frame))
+        if frame in frames:
+            self._status(
+                f"Sample {frames.index(frame) + 1} of {len(frames)}. "
+                f"{shortcuts.label_for('review.next_pending_frame')} for the next one."
+            )
+
     def _jump_next_pending(self) -> None:
+        """Ctrl+Right: the next thing worth looking at, candidates first.
+
+        Candidates first, then the frames the sampler chose. The fallback is
+        the whole point on day one: *Pick frames to label* runs without a
+        checkpoint and is the recommended first action, but it produces no
+        candidates - so until this key also stepped through its samples, it
+        answered "No candidates are loaded." and the ninety-nine frames it had
+        just chosen could only be reached by scrubbing a timeline on which one
+        pixel is eighty-six frames.
+        """
         session = self._review
-        if session is None:
-            self._status("No candidates are loaded.")
+        frame = None
+        if session is not None:
+            frame = session.next_pending_frame(self.current_frame_idx)
+        if frame is not None:
+            self.goto_frame(frame)
             return
-        frame = session.next_pending_frame(self.current_frame_idx)
-        if frame is None:
+        nxt = next((f for f in self.sample_frames() if f > self.current_frame_idx), None)
+        if nxt is not None:
+            self._goto_sample(nxt)
+            return
+        if session is not None:
             self._status("No candidates after this frame.")
-            return
-        self.goto_frame(frame)
+        elif self.sample_frames():
+            self._status("That was the last chosen frame in this video.")
+        else:
+            self._status(
+                "Nothing to step through yet. "
+                f"{shortcuts.label_for('auto.annotate')} chooses the frames "
+                f"worth labelling."
+            )
 
     def _jump_prev_pending(self) -> None:
         session = self._review
-        if session is None:
-            return
-        frame = session.prev_pending_frame(self.current_frame_idx)
+        frame = None
+        if session is not None:
+            frame = session.prev_pending_frame(self.current_frame_idx)
         if frame is not None:
             self.goto_frame(frame)
+            return
+        previous = [f for f in self.sample_frames() if f < self.current_frame_idx]
+        if previous:
+            self._goto_sample(previous[-1])
 
     def _cycle_selection(self) -> None:
         """Q: step through this frame's boxes, candidates first."""
@@ -4893,7 +4933,7 @@ class AnnotationApp(
 
     def _discard_all_here(self) -> None:
         n = self.discard_all_candidates()
-        self.rebuild_copilot()
+        self.schedule_copilot_rebuild()
         self._status(f"Discarded {n} candidate{'s' if n != 1 else ''}.")
 
     def _track_forward_selected(self) -> None:
@@ -4978,13 +5018,18 @@ class AnnotationApp(
 
         try:
             # The render loop is explicit rather than dpg.start_dearpygui() so
-            # the frame can carry the three things that must happen between
-            # frames: draining the analysis thread's queue (never from the
-            # thread itself), the debounced autosave, and toast expiry.
+            # the frame can carry the things that must happen between frames:
+            # draining the analysis thread's queue (never from the thread
+            # itself), watching the training child, the coalesced copilot
+            # rebuild, the debounced autosave, the Activity readout and toast
+            # expiry.
             while dpg.is_dearpygui_running():
                 self._pump_ui()
                 self._tick_review()
+                self.tick_train_round()
+                self._tick_copilot()
                 self._tick_autosave()
+                self._tick_activity()
                 widgets.tick_toasts()
                 dpg.render_dearpygui_frame()
         finally:
@@ -4992,6 +5037,7 @@ class AnnotationApp(
             # Windows で取り残されたプロセスが GPU/メモリを掴んだままになるのを
             # 防ぐため、ここは必ず通す。
             self._shutdown_workspace()
+            self._shutdown_round()
             self._stop_sam()
             if self.cap is not None:
                 self.cap.release()

@@ -13,10 +13,7 @@ much time do you have* — and answers the rest:
 
     Annotate       ( ) Individuals   ( ) Behavior   (o) Individuals + behavior
     Budget         ( ) 50   (o) 100   ( ) 200 samples      [ by time ]
-    Options        [x] Generate annotation candidates
-                   [x] Choose which frames to label
-                   [x] Choose the informative samples automatically
-                   [x] Use the GPU
+    Start without a trained model: pick frames, then click each animal.
     > Advanced     strategy, seed, clip length, scan stride, score threshold
 
     [ Run ]
@@ -244,7 +241,7 @@ class SmartAnnotateDialog:
 
         with dpg.window(
             tag=self.tag,
-            label="Smart Annotate",
+            label="Pick frames to label",
             show=False,
             modal=True,
             no_collapse=True,
@@ -257,15 +254,11 @@ class SmartAnnotateDialog:
             # more blocks under it, so "Analyze video" and "Start annotating"
             # both used to end up off the bottom exactly when they were the
             # thing to press.
-            with widgets.dialog_body(self._t("body")):
+            with widgets.dialog_body(self._t("body"), footer=64):
                 dpg.add_text("", tag=self._t("video"), color=theme.TEXT)
                 dpg.add_text("", tag=self._t("video_note"), color=theme.TEXT_DIM)
-                widgets.gap(2)
-
                 self._build_form()
-                widgets.gap(1)
                 self._build_estimate()
-                widgets.gap(2)
 
                 self._build_progress()
                 self._build_result()
@@ -281,7 +274,7 @@ class SmartAnnotateDialog:
         """The pinned button row. One phase's buttons are shown at a time."""
         with dpg.group(horizontal=True, tag=self._t("actions")):
             widgets.primary_button(
-                "Analyze video", self._on_analyze_clicked, height=34, width=200,
+                "Pick frames", self._on_analyze_clicked, height=34, width=200,
                 tag=self._t("go"),
             )
             widgets.secondary_button(
@@ -300,20 +293,21 @@ class SmartAnnotateDialog:
                 tag=self._t("review"),
             )
             widgets.secondary_button(
-                "Change the settings and run again",
+                "Change options",
                 self._on_reset_clicked,
                 height=32,
-                width=260,
+                width=150,
                 tag=self._t("again"),
             )
 
     def _set_phase(self, phase: str, *, go_label: str = "") -> None:
         """Show the one phase the dialog is in, body and buttons together.
 
-        The form itself is never hidden: the settings that produced a result
-        are the settings the next run starts from.
+        Keep the settings in memory while showing just the current task.
         """
         self._phase = phase
+        self._show(self._t("form"), phase in (_FORM, _STOPPED))
+        self._show(self._t("estimate_card"), phase in (_FORM, _STOPPED))
         self._show(self._t("progress_group"), phase in (_RUNNING, _STOPPED))
         self._show(self._t("result_group"), phase == _DONE)
         self._show(self._t("go"), phase != _DONE)
@@ -326,7 +320,7 @@ class SmartAnnotateDialog:
                 self._t("go"),
                 enabled=phase != _RUNNING,
                 label=go_label
-                or ("Analyzing..." if phase == _RUNNING else "Analyze video"),
+                or ("Working..." if phase == _RUNNING else "Pick frames"),
             )
 
     # -- the form ---------------------------------------------------------
@@ -334,6 +328,12 @@ class SmartAnnotateDialog:
         with dpg.group(tag=self._t("form")):
             from ..annotation.project import SCOPES
 
+            with dpg.group(tag=self._t("nomodel_group"), show=False):
+                dpg.add_text(
+                    "No trained model needed. Pick frames, then press C and click "
+                    "each animal to fit a box. W draws a box by hand.",
+                    color=theme.TEXT, wrap=self.WIDTH - 80,
+                )
             dpg.add_combo(
                 list(SCOPES),
                 tag=self._t("scope"),
@@ -345,79 +345,44 @@ class SmartAnnotateDialog:
             dpg.add_checkbox(
                 label="Balance samples across videos", tag=self._t("balanced"), default_value=True
             )
-            widgets.section_header("What are you annotating?")
+            dpg.add_combo(
+                [label for _, label in _TARGETS],
+                tag=self._t("target"), default_value=_TARGETS[2][1],
+                label="Annotate", width=300,
+                callback=lambda *_: self._refresh_estimate(),
+            )
+            dpg.add_text("Labeling budget", color=theme.TEXT_DIM)
             with dpg.group(horizontal=True):
-                dpg.add_radio_button(
-                    [label for _, label in _TARGETS],
-                    tag=self._t("target"),
-                    default_value=_TARGETS[2][1],
-                    horizontal=False,
-                    callback=lambda *_: self._refresh_estimate(),
+                dpg.add_combo(
+                    ["By sample count", "By time"],
+                    tag=self._t("budget_mode"), default_value="By sample count",
+                    width=180, callback=lambda *_: self._on_budget_mode(),
                 )
-            widgets.gap(1)
+                with dpg.group(tag=self._t("budget_samples")):
+                    dpg.add_combo(
+                        [f"{n} samples" for n in _SAMPLE_CHOICES],
+                        tag=self._t("samples"), default_value="100 samples", width=150,
+                        callback=lambda *_: self._refresh_estimate(),
+                    )
+                with dpg.group(tag=self._t("budget_minutes"), show=False):
+                    dpg.add_combo(
+                        [f"{n} minutes" for n in _MINUTE_CHOICES],
+                        tag=self._t("minutes"), default_value="15 minutes", width=150,
+                        callback=lambda *_: self._refresh_estimate(),
+                    )
 
-            widgets.section_header(
-                "How much time do you have?",
-                "The count is exact. The duration is an estimate, and it says so.",
-            )
-            dpg.add_radio_button(
-                ["By sample count", "By time"],
-                tag=self._t("budget_mode"),
-                default_value="By sample count",
-                horizontal=True,
-                callback=lambda *_: self._on_budget_mode(),
-            )
-            with dpg.group(tag=self._t("budget_samples")):
-                dpg.add_radio_button(
-                    [f"{n} samples" for n in _SAMPLE_CHOICES],
-                    tag=self._t("samples"),
-                    default_value="100 samples",
-                    horizontal=True,
-                    callback=lambda *_: self._refresh_estimate(),
-                )
-            with dpg.group(tag=self._t("budget_minutes"), show=False):
-                dpg.add_radio_button(
-                    [f"{n} minutes" for n in _MINUTE_CHOICES],
-                    tag=self._t("minutes"),
-                    default_value="15 minutes",
-                    horizontal=True,
-                    callback=lambda *_: self._refresh_estimate(),
-                )
-            widgets.gap(1)
-
-            widgets.section_header("Options")
             with dpg.group(tag=self._t("prelabel_group")):
                 dpg.add_checkbox(
                     label="Generate annotation candidates",
                     tag=self._t("prelabel"),
                     default_value=True,
-                    callback=lambda *_: self._refresh_estimate(),
+                    callback=lambda *_: self._on_sample_toggle(),
                 )
                 widgets.attach_tooltip(
                     self._t("prelabel"),
                     "Run the configured detector on videos in scope so you review boxes "
                     "instead of drawing them. This is what makes a 15-minute "
                     "budget buy four times as many frames.",
-                )
-            # No model is not a deficiency of this dialog, and a dimmed
-            # checkbox with its reason somewhere below it says it is. The
-            # sentence says what still works, and the button is the fix.
-            with dpg.group(tag=self._t("nomodel_group"), show=False):
-                dpg.add_text(
-                    "No model yet. You can still pick which frames to label.",
-                    color=theme.TEXT,
-                    wrap=self.WIDTH - 60,
-                )
-                widgets.secondary_button(
-                    "Choose a model...",
-                    self._on_pick_model_clicked,
-                    width=220,
-                    height=28,
-                    tag=self._t("pick_model"),
-                )
-                dpg.add_text(
-                    "", tag=self._t("nomodel_reason"), color=theme.TEXT_DIM,
-                    wrap=self.WIDTH - 60,
                 )
             # Not the same switch as the one below it. This one decides
             # whether frames are chosen at all; that one decides whether the
@@ -435,28 +400,38 @@ class SmartAnnotateDialog:
                 "marks them on the timeline. Off only pre-labels, which skips "
                 "the frame scan and is much faster.",
             )
-            dpg.add_checkbox(
-                label="Choose the informative samples automatically",
-                tag=self._t("smart"),
-                default_value=True,
-                callback=lambda *_: self._on_smart_toggle(),
-            )
-            widgets.attach_tooltip(
-                self._t("smart"),
-                "Off means evenly spaced frames. On means frames chosen to "
-                "cover what the video actually contains.",
-            )
-            dpg.add_checkbox(label="Use the GPU", tag=self._t("gpu"), default_value=True)
-            widgets.attach_tooltip(
-                self._t("gpu"),
-                "Runs the detector and the encoder on the GPU when one is "
-                "available. Everything here also runs on the CPU, more slowly.",
-            )
+            # Lives inside the pre-label group because that is the only thing
+            # it affects: ``BatchOptions.device`` is read in two places and
+            # both sit under ``if options.detect:``. With no checkpoint it was
+            # a tickable switch that changed nothing, next to a message
+            # explaining that there is no model - and its old tooltip claimed
+            # it moved the encoder too, which the segmentation helper decides
+            # for itself in its own process.
+            with dpg.group(tag=self._t("gpu_group")):
+                dpg.add_checkbox(label="Use the GPU", tag=self._t("gpu"), default_value=True)
+                widgets.attach_tooltip(
+                    self._t("gpu"),
+                    "Runs the detector on the GPU when one is available. It "
+                    "also runs on the CPU, more slowly. Frame scanning is CPU "
+                    "work either way.",
+                )
 
-            widgets.gap(1)
             with dpg.collapsing_header(
                 label="Advanced", default_open=False, tag=self._t("advanced")
             ):
+                with dpg.group(tag=self._t("model_setup"), show=False):
+                    dpg.add_text(
+                        "Already trained a detector? Add it to generate box candidates.",
+                        color=theme.TEXT_DIM, wrap=self.WIDTH - 60,
+                    )
+                    widgets.secondary_button(
+                        "Choose a model...", self._on_pick_model_clicked,
+                        width=220, height=28, tag=self._t("pick_model"),
+                    )
+                    dpg.add_text(
+                        "", tag=self._t("nomodel_reason"), color=theme.TEXT_DIM,
+                        wrap=self.WIDTH - 60,
+                    )
                 dpg.add_combo(
                     [sampling.STRATEGY_LABELS[k] for k in sampling.STRATEGIES],
                     tag=self._t("strategy"),
@@ -505,30 +480,38 @@ class SmartAnnotateDialog:
                 )
                 widgets.attach_tooltip(
                     self._t("stride"),
-                    "How densely the video is scanned for features. Lower is "
-                    "slower and finds shorter events.",
+                    "How densely the videos are scanned for the frames you "
+                    "could be offered. Worked out from how much video is in "
+                    "scope: a pool of about 20,000 places is already far more "
+                    "than 200 picks can use, and every extra place is a frame "
+                    "the detector runs on again next round. Lower is slower "
+                    "and finds shorter events.",
                 )
-                dpg.add_input_float(
-                    label="Candidate score threshold",
-                    tag=self._t("threshold"),
-                    default_value=0.3,
-                    width=130,
-                    step=0.05,
-                    min_value=0.0,
-                    max_value=1.0,
-                    min_clamped=True,
-                    max_clamped=True,
-                    format="%.2f",
-                )
-                widgets.attach_tooltip(
-                    self._t("threshold"),
-                    "How sure the detector has to be before a box is proposed. "
-                    "Lower proposes more and rejects more; nothing it proposes "
-                    "is written until you accept it.",
-                )
+                # The one knob in here that belongs to the detector rather
+                # than to the sampler, so it is the one that disappears with
+                # the detector.
+                with dpg.group(tag=self._t("threshold_group")):
+                    dpg.add_input_float(
+                        label="Candidate score threshold",
+                        tag=self._t("threshold"),
+                        default_value=0.3,
+                        width=130,
+                        step=0.05,
+                        min_value=0.0,
+                        max_value=1.0,
+                        min_clamped=True,
+                        max_clamped=True,
+                        format="%.2f",
+                    )
+                    widgets.attach_tooltip(
+                        self._t("threshold"),
+                        "How sure the detector has to be before a box is "
+                        "proposed. Lower proposes more and rejects more; "
+                        "nothing it proposes is written until you accept it.",
+                    )
 
     def _build_estimate(self) -> None:
-        with dpg.child_window(tag=self._t("estimate_card"), height=76, border=True):
+        with dpg.child_window(tag=self._t("estimate_card"), height=92, border=True):
             dpg.add_text("", tag=self._t("estimate"), color=theme.TEXT, wrap=self.WIDTH - 60)
             dpg.add_text(
                 "", tag=self._t("estimate_note"), color=theme.TEXT_FAINT, wrap=self.WIDTH - 60
@@ -613,7 +596,14 @@ class SmartAnnotateDialog:
             self._set(self._t("nomodel_reason"), predict_reason)
         self._show(self._t("prelabel_group"), not predict_reason)
         self._show(self._t("nomodel_group"), bool(predict_reason))
-        self._refresh_estimate()
+        self._show(self._t("model_setup"), bool(predict_reason))
+        # The GPU switch and the score threshold are about the detector, so
+        # they go where the detector went. The rest of Advanced - strategy,
+        # seed, clip length, scan stride - tunes the sampler, which runs with
+        # no checkpoint at all, so it stays.
+        self._show(self._t("gpu_group"), not predict_reason)
+        self._show(self._t("threshold_group"), not predict_reason)
+        self._on_sample_toggle()
 
     # ── reading the form ─────────────────────────────────────────────────
     def request(self) -> sampling.SamplingRequest:
@@ -632,14 +622,11 @@ class SmartAnnotateDialog:
             budget = sampling.Budget(samples=samples)
 
         strategy = sampling.DIVERSITY
-        if not self._get(self._t("smart"), True):
-            strategy = sampling.UNIFORM
-        else:
-            label = self._get(self._t("strategy"), "")
-            for key, text in sampling.STRATEGY_LABELS.items():
-                if text == label:
-                    strategy = key
-                    break
+        label = self._get(self._t("strategy"), "")
+        for key, text in sampling.STRATEGY_LABELS.items():
+            if text == label:
+                strategy = key
+                break
 
         return sampling.SamplingRequest(
             target=target,
@@ -648,7 +635,7 @@ class SmartAnnotateDialog:
             seed=int(self._get(self._t("seed"), 0) or 0),
             fps=self.fps,
             clip_seconds=float(self._get(self._t("clip"), 3.0) or 3.0),
-            prelabelled=bool(self._get(self._t("prelabel"), True)),
+            prelabelled=self.options()["generate_candidates"],
         )
 
     def options(self) -> Dict[str, Any]:
@@ -660,7 +647,8 @@ class SmartAnnotateDialog:
             "generate_candidates": (
                 bool(self._get(self._t("prelabel"), False)) and not self._predict_reason
             ),
-            "sample": bool(self._get(self._t("sample"), True)),
+            "sample": bool(self._get(self._t("sample"), True))
+            or not (self._get(self._t("prelabel"), False) and not self._predict_reason),
             "stride": max(1, int(self._get(self._t("stride"), 15) or 15)),
             "score_threshold": float(self._get(self._t("threshold"), 0.3) or 0.3),
         }
@@ -672,18 +660,15 @@ class SmartAnnotateDialog:
         self._show(self._t("budget_minutes"), by_time)
         self._refresh_estimate()
 
-    def _on_smart_toggle(self) -> None:
-        sample = bool(self._get(self._t("sample"), True))
-        smart = bool(self._get(self._t("smart"), True))
-        if dpg.does_item_exist(self._t("strategy")):
-            dpg.configure_item(self._t("strategy"), enabled=smart and sample)
-        self._refresh_estimate()
-
     def _on_sample_toggle(self) -> None:
+        prelabel = self.options()["generate_candidates"]
+        if not prelabel:
+            self._set(self._t("sample"), True)
+        self._show(self._t("sample"), prelabel)
         sample = bool(self._get(self._t("sample"), True))
-        if dpg.does_item_exist(self._t("smart")):
-            dpg.configure_item(self._t("smart"), enabled=sample)
-        self._on_smart_toggle()
+        if dpg.does_item_exist(self._t("strategy")):
+            dpg.configure_item(self._t("strategy"), enabled=sample)
+        self._refresh_estimate()
 
     def _on_scope_change(self) -> None:
         """Re-quote the size of what the new scope covers."""
@@ -785,12 +770,57 @@ class SmartAnnotateDialog:
         )
 
         estimate = request.workload.describe(frames, clips, request.prelabelled)
-        note = f"Estimated review workload: {estimate}."
-        if not request.prelabelled:
+        note = f"Your labelling afterwards: {estimate}."
+        if not request.prelabelled and not self._predict_reason:
             assisted = request.workload.describe(frames, clips, True)
             note += f" With candidates generated it would be about " f"{assisted.lstrip('~')}."
-        note += " The estimate is a guess, not a measurement."
+        scan = self._scan_estimate(request)
+        if scan:
+            # Said before the button, not discovered after it. The only number
+            # here used to be the human one, so pressing Analyze over a
+            # twenty-hour project began a scan of well over an hour that
+            # nothing had mentioned.
+            note = f"{scan} {note}"
         self._set(self._t("estimate_note"), note)
+
+    #: Seconds to step over one frame without decoding it, measured on
+    #: 640x480 30fps H.264 with the grab-forward reader in ``annotation.batch``
+    #: (4.0 ms per scanned frame at stride 15, so 0.27 ms per frame stepped
+    #: over).
+    #:
+    #: **The scan is priced per frame walked, not per frame scanned**, which is
+    #: why a coarser stride barely moves this number: the reader demuxes every
+    #: frame in the video either way. A previous version of this estimate
+    #: divided by the stride and so promised that doubling it halved the wait.
+    SECONDS_PER_WALKED_FRAME = 0.00027
+
+    #: Seconds to seek to an arbitrary frame and decode it. The reader gives up
+    #: on walking and seeks once the gap is over 48 frames, which caps the
+    #: per-scanned-frame cost - measured ~16 ms, against the ~16.8 ms a
+    #: stride-60 walk costs, which is where the two meet.
+    SECONDS_PER_SEEK = 0.016
+
+    def _scan_estimate(self, request) -> str:
+        """``"Scanning takes about 7 minutes."`` for the scope, or ``""``."""
+        if not self.num_frames or not self._get(self._t("sample"), True):
+            return ""
+        stride = max(1, int(self._get(self._t("stride"), 15) or 15))
+        passes = 2 if self._encoder_pass_likely() else 1
+        per_scanned = min(self.SECONDS_PER_SEEK, stride * self.SECONDS_PER_WALKED_FRAME)
+        seconds = (self.num_frames / stride) * per_scanned * passes
+        if seconds < 90:
+            return f"Scanning takes about {max(5, int(round(seconds / 5) * 5))} seconds."
+        if seconds < 5400:
+            return f"Scanning takes about {max(2, int(round(seconds / 60)))} minutes."
+        return f"Scanning takes about {seconds / 3600:.1f} hours."
+
+    def _encoder_pass_likely(self) -> bool:
+        """Whether the run reads every scanned frame twice.
+
+        It does when an embedding encoder is available: one pass to encode and
+        one to compute frame features, over the same list.
+        """
+        return True
 
     # ── the caller's interface ───────────────────────────────────────────
     def set_subject(
@@ -805,7 +835,21 @@ class SmartAnnotateDialog:
         self.fps = float(fps) if fps > 0 else 25.0
         self.num_frames = int(num_frames)
         self._project_mode = int(videos) > 1
+        # The scan stride follows the size of the scope, so opening the dialog
+        # on one video and on twenty does not propose the same scan. It is
+        # written into the visible field rather than kept beside it: Advanced
+        # is where a user overrides it for this run, and a hidden value the
+        # field disagrees with is the kind of thing that gets reported as the
+        # stride "not doing anything".
+        if self.num_frames > 0:
+            self._set(self._t("stride"), sampling.scan_stride(self.num_frames, fps=self.fps))
+        self._show(self._t("balanced"), self._project_mode)
 
+        # "Video 3 of 6", the overall bar and the per-video result list. Built
+        # hidden, so this is the only thing that reveals them; without it
+        # ``set_overall`` and ``add_result`` write into widgets nobody sees and
+        # a six-video run reports as if it were one.
+        self._show(self._t("project_group"), self._project_mode)
         self._set(self._t("video"), video_name or "No video")
         if num_frames > 0:
             minutes = num_frames / self.fps / 60.0
@@ -820,7 +864,6 @@ class SmartAnnotateDialog:
             )
         else:
             self._set(self._t("video_note"), "")
-        self._show(self._t("project_group"), self._project_mode)
         self._refresh_estimate()
 
     def show(
@@ -833,14 +876,21 @@ class SmartAnnotateDialog:
         scope: str = "",
         prelabel: Optional[bool] = None,
         sample: Optional[bool] = None,
+        strategy: str = "",
         title: str = "",
     ) -> None:
         """Open the dialog for one video, or for a scope full of them.
 
-        ``scope``, ``prelabel`` and ``sample`` are what the entry point that
-        opened this dialog means: *Pre-label videos with the model* and *Pick
-        frames to label* are the same form with two checkboxes the other way
-        round, which is exactly why they used to be two windows.
+        Everything here is a **preset**: where the one form starts, for the
+        entry point that opened it. The window, the engine and the progress
+        display do not change.
+
+        ``title`` may name a control - *Find animals with the model* names the
+        pre-label checkbox - only because the caller offering that caption is
+        gated on a checkpoint existing, so the control it names is on screen
+        whenever the caption is. Without that gate a caption could name the
+        very checkbox :meth:`set_capability` is about to hide, which is what
+        retired the last window that tried it.
         """
         if not self._built:
             self.build()
@@ -850,9 +900,13 @@ class SmartAnnotateDialog:
             self._set(self._t("prelabel"), bool(prelabel))
         if sample is not None:
             self._set(self._t("sample"), bool(sample))
+        if strategy:
+            self._set(self._t("strategy"), sampling.STRATEGY_LABELS.get(strategy, strategy))
         if dpg.does_item_exist(self.tag):
-            dpg.configure_item(self.tag, label=title or "Smart Annotate")
-
+            caption = title or "Pick frames to label"
+            if self._predict_reason:
+                caption = "Pick frames to label"
+            dpg.configure_item(self.tag, label=caption)
         self.set_subject(video_name, num_frames, fps, videos)
         self._on_reset_clicked()
         self._on_sample_toggle()
@@ -986,7 +1040,7 @@ class SmartAnnotateDialog:
             dpg.configure_item(
                 self._t("review"),
                 label=self._review_label or "Review",
-                show=bool(self._review_label),
+                show=bool(self._review_label) and not total,
             )
             # One primary action at a time: when there are samples to start
             # on, that is the point of the run and Review is the other door.

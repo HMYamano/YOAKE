@@ -338,6 +338,17 @@ def run_train(stage: int, argv: list) -> None:
 
     config_path, overrides = parse_argv(argv)
     root = overrides.pop("root", str(Path.cwd()))
+    # Weights-only warm start, popped before the config is built for the same
+    # reason ``root`` is: it is an instruction to this function, not a config
+    # field, and the config merge drops unknown keys in silence.
+    #
+    # This is what the annotator's active-learning rounds use to carry on from
+    # the previous round instead of re-learning the species from ImageNet every
+    # time. ``train.resume`` cannot serve: it restores the optimizer, the
+    # scheduler (so the learning rate resumes at its decayed floor) and the
+    # previous run's ``best_metric``, and it sets ``start_epoch`` past
+    # ``max_epochs`` so a finished run resumes into zero epochs.
+    init_weights = str(overrides.pop("init_weights", "") or "")
     if config_path:
         cfg = HTRTDETRConfig.from_yaml(config_path)
         if overrides:
@@ -379,7 +390,13 @@ def run_train(stage: int, argv: list) -> None:
     model.set_stage(stage)
     logger.info("Model parameters: %s", model.num_parameters())
 
-    if not cfg.train.resume and stage > 1 and load_model_weights is not None:
+    if init_weights and load_model_weights is not None:
+        if not Path(init_weights).is_file():
+            logger.error("init_weights not found: %s", init_weights)
+            sys.exit(1)
+        logger.info("Initialising from %s (weights only)", init_weights)
+        load_model_weights(init_weights, model, strict=False)
+    elif not cfg.train.resume and stage > 1 and load_model_weights is not None:
         for prev in range(stage - 1, 0, -1):
             ckpt = find_checkpoint(root, prev)
             if ckpt:
@@ -478,6 +495,28 @@ def run_predict(argv: list) -> None:
     class_names = [str(i) for i in range(cfg.model.detector.head.num_classes)]
     window_size = int(overrides.get("window_size", cfg.data.window_size))
     max_frames = int(overrides["max_frames"]) if "max_frames" in overrides else None
+
+    # detect_only: 箱だけが欲しい呼び出し (アノテーションの候補生成) 用。
+    # tracker も時間モデルも行動ヘッドも通さず、注釈動画も書かず、複数フレームを
+    # まとめて detector に投げる。検出そのものは streaming と同一 (detector は
+    # フレーム単位なので、16 枚を 1 バッチで通しても 1 枚ずつ通しても同じ箱が出る)。
+    # ``parse_argv`` already turns "true"/"false" into a real bool, and
+    # ``window_size`` / ``max_frames`` above read their overrides the same way.
+    if bool(overrides.get("detect_only", False)):
+        from .inference import DEFAULT_BATCH, run_detect_only
+
+        run_detect_only(
+            model,
+            source,
+            output_dir,
+            image_size=img_size,
+            score_threshold=cfg.model.detector.score_threshold,
+            batch_size=int(overrides.get("batch_size", DEFAULT_BATCH)),
+            max_frames=max_frames,
+            use_amp=cfg.inference.use_amp,
+            use_channels_last=cfg.inference.use_channels_last,
+        )
+        return
 
     if cfg.inference.mode == "streaming":
         # 各フレームを detector に 1 回だけ通す (既定)。窓長に依存しない。

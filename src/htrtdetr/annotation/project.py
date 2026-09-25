@@ -21,6 +21,7 @@ import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Collection
 
 from ..data.annotation import (
     DatasetAnno,
@@ -120,6 +121,11 @@ class ProjectSession:
     #: Videos this open had to find again by name, so the UI can say so once
     #: instead of letting the user wonder whether it opened the right file.
     relocated: list = field(default_factory=list)
+    #: ``video_id -> (session, (revision, base), row)`` from the last
+    #: :meth:`snapshot`. Not saved and not part of the project's identity - it
+    #: exists only so the autosave does not re-detach twenty videos'
+    #: candidates every four seconds to write the nineteen that did not change.
+    _row_cache: dict = field(default_factory=dict, repr=False, compare=False)
 
     # ── the folder ───────────────────────────────────────────────────────
     @property
@@ -361,57 +367,54 @@ class ProjectSession:
         project.last_video = next(iter(project.videos), "")
         return project
 
-    def snapshot(self, base: Path) -> tuple[DatasetAnno, dict]:
-        """Detach mutable data on the main thread before writing on a worker."""
+    def snapshot(
+        self, base: Path, *, always: Collection[str] = ()
+    ) -> tuple[DatasetAnno, dict]:
+        """Detach mutable data on the main thread before writing on a worker.
+
+        On the main thread deliberately: the worker must never read structures
+        the user is still editing. That makes the detach itself a freeze, and
+        after a detector has run it is a long one - 28,800 candidates a video,
+        and this study is twenty one-hour recordings. So the detach is both as
+        cheap as it can be made (:meth:`Candidate.to_dict`,
+        :meth:`ReviewSession.saved_rows`) and **not repeated for videos that
+        have not changed**.
+
+        ``always`` names video ids whose row must be rebuilt whatever the
+        cache thinks. The autosave passes the open video, because three of the
+        saved fields - ``visited``, ``last_frame`` and ``ui`` - change as the
+        user simply looks around and deliberately do **not** mark the video
+        dirty (a frame step must not make the save chip say "Unsaved"). Every
+        other write to a video goes through :meth:`VideoSession.touch`, which
+        is what the cache is keyed on. :meth:`save` passes every id, so a
+        deliberate Ctrl+S is never anything but a full, current detach.
+        """
+        # A removed video's row would otherwise sit here holding its
+        # candidates for the rest of the session - and, worse, a video removed
+        # and re-added under the same id gets a fresh session whose revision
+        # starts at 0 again, which is a cache hit on somebody else's data.
+        # Pruning covers the first; the ``is`` check below covers the second,
+        # and is why the entry keeps a reference to the session it was built
+        # from.
+        live = set(self.videos)
+        for stale in [vid for vid in self._row_cache if vid not in live]:
+            del self._row_cache[stale]
+
         rows = []
+        key = str(base)
         for video in self.videos.values():
-            review = []
-            if video.review is not None:
-                for frame in video.review.frames:
-                    review.append(
-                        {
-                            "frame": frame,
-                            "candidates": [
-                                {
-                                    "candidate": asdict(c),
-                                    "state": video.review.state(frame, i),
-                                    "edited": video.review.is_edited(frame, i),
-                                }
-                                for i, c in enumerate(video.review.candidates(frame))
-                            ],
-                        }
-                    )
-            issues = [
-                {"item": asdict(item), "decision": asdict(video.queue.decision(item))}
-                for item in video.queue.items
-            ]
-            rows.append(
-                {
-                    "video_id": video.video_id,
-                    "path": portable_path(video.path, base),
-                    # Only for captures outside the folder, and only as a
-                    # fallback: see layout.resolve_media for the order.
-                    "abs_path": anchor_path(video.path, base),
-                    "last_frame": video.current_frame,
-                    "active_track_id": video.active_track_id,
-                    "next_track_id": video.next_track_id,
-                    "active_class_id": video.active_class_id,
-                    "status": video.status,
-                    "visited": sorted(video.visited),
-                    "keyframes": {
-                        str(f): {str(o.object_id): o.keyframe for o in objects}
-                        for f, objects in video.annotations.items()
-                    },
-                    "ui": copy.deepcopy(video.ui),
-                    "review": review,
-                    "issues": issues,
-                    "intervals": [asdict(i) for i in video.intervals.intervals],
-                    "predictions": {
-                        str(f): [asdict(c) for c in cs] for f, cs in video.predictions.items()
-                    },
-                    "selection": asdict(video.selection) if video.selection is not None else None,
-                }
-            )
+            cached = self._row_cache.get(video.video_id)
+            if (
+                cached is not None
+                and cached[0] is video
+                and cached[1] == (video.revision, key)
+                and video.video_id not in always
+            ):
+                rows.append(cached[2])
+                continue
+            row = self._video_row(video, base)
+            self._row_cache[video.video_id] = (video, (video.revision, key), row)
+            rows.append(row)
         state = {
             # Still 1: the manifest only gained optional keys, and a reader of
             # either version ignores what it does not know. Bumping it would
@@ -426,10 +429,54 @@ class ProjectSession:
         }
         return copy.deepcopy(self.dataset(base)), state
 
+    def _video_row(self, video, base: Path) -> dict:
+        """One video's saved form, fully detached from the live objects."""
+        # ``saved_rows`` rather than a walk over the public accessors: it is
+        # the largest thing in the file by two orders of magnitude once a
+        # detector has run, and it was costing 0.41 s a video through
+        # ``asdict`` and a copied list per frame. Same rows, a fifteenth of
+        # the time.
+        review = video.review.saved_rows() if video.review is not None else []
+        issues = [
+            {"item": asdict(item), "decision": asdict(video.queue.decision(item))}
+            for item in video.queue.items
+        ]
+        return {
+            "video_id": video.video_id,
+            "path": portable_path(video.path, base),
+            # Only for captures outside the folder, and only as a fallback:
+            # see layout.resolve_media for the order.
+            "abs_path": anchor_path(video.path, base),
+            "last_frame": video.current_frame,
+            "active_track_id": video.active_track_id,
+            "next_track_id": video.next_track_id,
+            "active_class_id": video.active_class_id,
+            "status": video.status,
+            "visited": sorted(video.visited),
+            "keyframes": {
+                str(f): {str(o.object_id): o.keyframe for o in objects}
+                for f, objects in video.annotations.items()
+            },
+            "ui": copy.deepcopy(video.ui),
+            "review": review,
+            "issues": issues,
+            "intervals": [asdict(i) for i in video.intervals.intervals],
+            # The same candidates again, from the other side: a loaded
+            # predictions.json. ``to_dict`` for the same reason.
+            "predictions": {
+                str(f): [c.to_dict() for c in cs] for f, cs in video.predictions.items()
+            },
+            "selection": asdict(video.selection) if video.selection is not None else None,
+            # Where the final pass has got to. Small by construction - a
+            # fingerprint, two flags and a list of merged spans - because the
+            # boxes it is about live in the ledger beside this file.
+            "final_pass": copy.deepcopy(video.final_pass) if video.final_pass else None,
+        }
+
     def save(self, path: Path) -> None:
         path = Path(path).resolve()
         layout = ProjectLayout(path.parent).create()
-        data, state = self.snapshot(path.parent)
+        data, state = self.snapshot(path.parent, always=tuple(self.videos))
         save_snapshot(path, data, state)
         layout.write_readme(self.name)
         self.directory = path.parent
@@ -522,6 +569,8 @@ class ProjectSession:
                 values["frames"] = tuple(values.get("frames", []))
                 values["reasons"] = {int(k): v for k, v in values.get("reasons", {}).items()}
                 video.selection = Selection(**values)
+            if isinstance(row.get("final_pass"), dict):
+                video.final_pass = dict(row["final_pass"])
         return project
 
 

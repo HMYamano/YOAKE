@@ -183,8 +183,23 @@ def test_device_env_has_no_cli_flag(monkeypatch):
     """YOAKE has no device= key, so the device is pinned through the environment."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert "CUDA_VISIBLE_DEVICES" not in al.device_env("auto")
-    assert al.device_env("cpu")["CUDA_VISIBLE_DEVICES"] == ""
     assert al.device_env("cuda:1")["CUDA_VISIBLE_DEVICES"] == "1"
+
+
+def test_asking_for_the_cpu_actually_hides_the_gpu(monkeypatch):
+    """"-1", not "". Measured on this machine with torch installed:
+
+        CUDA_VISIBLE_DEVICES=""    is_available() True,  device_count() 0
+        CUDA_VISIBLE_DEVICES="-1"  is_available() False, device_count() 0
+
+    Every runner in this repo picks ``cuda if torch.cuda.is_available() else
+    cpu``, so the empty value did not select the processor - it selected a GPU
+    that is not there. "Use the GPU" unticked was a crash waiting for a device
+    index, in the one situation where the user had already told us the GPU was
+    not an option.
+    """
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert al.device_env("cpu")["CUDA_VISIBLE_DEVICES"] == "-1"
 
 
 # --------------------------------------------------------------------------- #
@@ -882,3 +897,22 @@ def test_tracked_boxes_become_candidates_in_the_same_review_loop():
     any_rec = merged[next(iter(merged))][0]
     assert any_rec["source"] == "track"
     assert any_rec["accepted"] is False
+
+
+def test_the_gpu_probe_answers_without_importing_torch():
+    """"Can this Python train" and "is there a GPU" are different questions.
+
+    torch imports and runs perfectly well on a machine with no NVIDIA device,
+    about ten times slower - so a duration quoted off Capability.torch can be
+    nine tenths short. The probe loads the driver library directly, which is
+    ~40ms against several seconds for an import.
+    """
+    saved = sys.modules.pop("torch", None)
+    try:
+        count = al.cuda_device_count()
+        assert isinstance(count, int) and count >= 0
+        assert al.has_gpu() is (count > 0)
+        assert "torch" not in sys.modules
+    finally:
+        if saved is not None:
+            sys.modules["torch"] = saved

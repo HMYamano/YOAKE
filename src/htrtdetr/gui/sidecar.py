@@ -324,7 +324,7 @@ def locked_reason(checked: Sequence[InterpreterInfo] = ()) -> str:
                  "reach has it.")
         fix = ("Point YOAKE at one with:  set YOAKE_SAM_PYTHON="
                r"C:\path\to\env\python.exe")
-    escape = ("Until then Click to Box keeps using the Local (OpenCV) fit, which needs "
+    escape = ("Until then Click animal keeps using the Local (OpenCV) fit, which needs "
               "nothing installed and is already the default - press C and click an animal.")
     return f"{cause}\n{fix}\n{escape}"
 

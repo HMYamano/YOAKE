@@ -287,7 +287,7 @@ def test_pre_labelling_without_a_model_offers_one_instead_of_greying_out(app):
     broken dialog. Without a model the option is not there at all, and what is
     there is the way to get one."""
     app.project.settings["weights"] = ""
-    app.open_smart_annotate("auto", "project")
+    app.open_smart_annotate("project")
     dpg.render_dearpygui_frame()
     dialog = app.smart_dialog
     assert not dpg.is_item_shown(dialog._t("prelabel_group"))
@@ -303,7 +303,7 @@ def test_the_run_takes_the_checkpoint_from_the_project(app, tmp_path, monkeypatc
     checkpoint = tmp_path / "best.pth"
     checkpoint.write_bytes(b"not a real checkpoint")
     app.project.settings.update(weights=str(checkpoint), config="cfg.yml")
-    app.open_smart_annotate("auto", "project")
+    app.open_smart_annotate("project")
     dpg.render_dearpygui_frame()
 
     started = {}
@@ -322,7 +322,7 @@ def test_the_run_takes_the_checkpoint_from_the_project(app, tmp_path, monkeypatc
 def test_choosing_a_model_unlocks_the_open_dialog(app, tmp_path):
     """The dialog that said "no model" has to notice when one arrives."""
     app.project.settings["weights"] = ""
-    app.open_smart_annotate("auto", "project")
+    app.open_smart_annotate("project")
     dpg.render_dearpygui_frame()
     assert dpg.is_item_shown(app.smart_dialog._t("nomodel_group"))
 
@@ -348,7 +348,7 @@ def test_the_finished_dialog_walks_into_the_review(app):
     a button that names them and goes there."""
     a, b = app.project.videos.values()
     b.review = ReviewSession({6: [Candidate([2, 2, 12, 12], class_id=1)]})
-    app.open_smart_annotate("auto", "project")
+    app.open_smart_annotate("project")
     candidates, issues = app.project_review_counts()
     app.smart_dialog.finish(None, predictions=candidates, issues=issues)
     dpg.render_dearpygui_frame()
@@ -386,6 +386,13 @@ def test_project_review_counts_span_every_video(app):
 
 
 def test_late_batch_result_is_applied_to_origin_video(app):
+    """A pre-label run's boxes land on the video they came from, not the open one.
+
+    ``sample=False`` on purpose: this is the dense *pre-label* path, which is
+    the one that still merges per video as each finishes. A sampling run cannot
+    merge there - the sampler spends its budget across every video, so nothing
+    is chosen until the last one is done - and it is covered by the test below.
+    """
     origin = app.project.videos["a"]
     app.switch_video("b")
     result = VideoResult(
@@ -395,13 +402,65 @@ def test_late_batch_result_is_applied_to_origin_video(app):
         width=96,
         height=64,
     )
-    app._batch_event(app.project, {"kind": "video", "result": result}, BatchOptions(detect=True))
+    options = BatchOptions(detect=True, sample=False)
+    app._batch_event(app.project, {"kind": "video", "result": result}, options)
     assert app._review is None
     assert origin.review.candidates(3)[0].class_id == 1
     assert not origin.annotations
     other = ProjectSession()
-    app._batch_event(other, {"kind": "video", "result": result}, BatchOptions(detect=True))
+    app._batch_event(other, {"kind": "video", "result": result}, options)
     assert len(origin.review.candidates(3)) == 1
+
+
+def test_a_sampling_run_merges_nothing_until_it_has_chosen(app):
+    """The whole scan must not reach the Review Inbox.
+
+    A round scans every video to choose 50-200 frames from them, and the choice
+    is not made until the last video is scanned. Merging on the per-video event
+    would put the entire scan in front of the user - tens of thousands of
+    candidates in answer to a request for a hundred frames - and nothing ever
+    removes a candidate once merged.
+    """
+    from htrtdetr.annotation import sampling
+
+    origin = app.project.videos["a"]
+    result = VideoResult(
+        "a",
+        candidates={f: [Candidate([1, 1, 10, 10], class_id=1)] for f in (3, 6, 9)},
+        num_frames=20,
+        width=96,
+        height=64,
+    )
+    options = BatchOptions(detect=True, sample=True)
+
+    app._batch_event(app.project, {"kind": "video", "result": result}, options)
+    assert origin.review is None, "the scan reached Review before anything was chosen"
+
+    # ...and on the finished event, only what the sampler kept.
+    result.selection = sampling.Selection(frames=(6,))
+    result.candidates = {6: result.candidates[6]}
+    app._batch_event(
+        app.project,
+        {"kind": "finished", "results": [result], "cancelled": False},
+        options,
+    )
+    assert sorted(origin.review.frames) == [6]
+
+
+def test_a_cancelled_sampling_run_merges_nothing_at_all(app):
+    """Nothing was chosen, so nothing was trimmed, so nothing may be merged."""
+    origin = app.project.videos["a"]
+    result = VideoResult(
+        "a",
+        candidates={f: [Candidate([1, 1, 10, 10], class_id=1)] for f in (3, 6, 9)},
+        num_frames=20,
+    )
+    app._batch_event(
+        app.project,
+        {"kind": "finished", "results": [result], "cancelled": True},
+        BatchOptions(detect=True, sample=True),
+    )
+    assert origin.review is None
 
 
 def test_candidates_cache_rerun_preserves_rejection(app):
@@ -438,7 +497,7 @@ def test_copy_and_class_edit_keep_obb_and_history(app):
 
 def test_browser_batch_help_build_with_current_project(app):
     app.show_video_browser()
-    app.open_smart_annotate("sample", "project")
+    app.open_smart_annotate("project")
     app.show_project_review()
     app.show_onboarding()
     app._show_help()

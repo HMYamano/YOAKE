@@ -78,25 +78,29 @@ _PAGES: Tuple[Dict[str, str], ...] = (
         "short": "Label",
         "subtitle": "Draw boxes, label actions",
         "action": "page.label",
-        "summary": "The whole labelling loop lives here: it picks the frames, "
-                   "proposes the boxes, and you review them. No model needed.",
+        "summary": "The whole loop lives here: it picks the frames, proposes "
+                   "the boxes, you review them, and it trains a detector on "
+                   "what you have so far. No model needed to start.",
     },
     {
         "key": "training",
         "label": "2. Train",
         "short": "Train",
-        "subtitle": "Build a model from finished labels",
+        "subtitle": "The full run, once the labels are done",
         "action": "page.train",
-        "summary": "Once the labels are done: create splits, train, watch the "
-                   "metrics. Nothing in step 1 waits on this.",
+        "summary": "The production run over finished labels: every stage, "
+                   "the full controls, the metrics. The labelling window "
+                   "trains its own quick rounds; this is the one you do once.",
     },
     {
         "key": "analysis",
         "label": "3. Analyze",
         "short": "Analyze",
-        "subtitle": "Review predictions",
+        "subtitle": "Review a finished model",
         "action": "page.analyze",
-        "summary": "Run inference, then step through detections, tracks and actions.",
+        "summary": "Step through a finished model's predictions frame by "
+                   "frame, with overlays and the track timeline. Labelling "
+                   "does its own inference; this is the workstation for it.",
     },
 )
 
@@ -109,6 +113,14 @@ _PAGE_ALIASES: Dict[str, str] = {
     "analyze": "analysis",
     "video analysis": "analysis",
 }
+
+
+#: Every name :func:`parse_argv` will accept for ``--page``: the canonical
+#: keys and the aliases, so the annotator can say "train" and the hub's own
+#: code can say "training" without a second table to keep in step.
+_PAGE_KEYS: Tuple[str, ...] = tuple(
+    [page["key"] for page in _PAGES] + list(_PAGE_ALIASES)
+)
 
 
 def _repo_root() -> Path:
@@ -673,31 +685,41 @@ class Hub:
             "does": "Draw a box around each subject, give it a track ID, and "
                     "label what it is doing. Range labeling applies one action "
                     "across a span of frames instead of one frame at a time. "
-                    "Then repeat: Smart Annotate picks the next frames, Find "
-                    "all in frame and Continue propose the boxes, and the "
-                    "Review Inbox is where you accept or reject them.",
+                    "Then repeat: Pick frames to label chooses the next "
+                    "frames, Find all and Continue "
+                    "propose the boxes, and the Review Inbox is where you "
+                    "accept or reject them.",
             "makes": "annotations.json in the project folder, beside "
-                     "project.yoake.json.",
-            "tip": "This step needs no trained model. The proposals come from "
-                   "the segmentation helper, and each pass avoids the frames "
-                   "the last one had you annotate. Candidates are never "
-                   "written to disk until you accept them, so re-running "
-                   "anything here is always safe.",
+                     "project.yoake.json - and, once you press Train, a "
+                     "detector in runs/rounds/ that becomes the project's "
+                     "model.",
+            "tip": "The whole loop closes here, including training. It needs "
+                   "no model to start: the proposals come from the "
+                   "segmentation helper, and each pass avoids the frames the "
+                   "last one had you annotate. Train builds a detector from "
+                   "what you have labelled so far and Analyze runs it back "
+                   "over the videos. Candidates are never written to disk "
+                   "until you accept them, so re-running anything here is "
+                   "always safe.",
         },
         {
             "key": "training",
-            "needs": "A label set you consider finished: annotations.json, "
+            "needs": "A label set you consider FINISHED: annotations.json, "
                      "converted to the dataset layout and split into "
-                     "train / val / test.",
+                     "train / val / test. The quick rounds you ran while "
+                     "labelling do not need this page at all.",
             "does": "Convert the annotations, create the splits, then train the "
                     "stages in order. The monitor plots loss and metrics while "
                     "the run is going.",
             "makes": "<project>/runs/train/stage{N}/weights/best.pth, plus "
                      "results.csv for the plots.",
-            "tip": "Each run writes to <project>/runs/train/stage{N}/ and is never "
-                   "overwritten. Picking \"detection\" as the model mode forces "
-                   "stage 1 regardless of the stage you chose - the log says so "
-                   "when it happens.",
+            "tip": "Each run writes to <project>/runs/train/stage{N}/; a "
+                   "second run of the same stage writes into the same folder, "
+                   "so rename or move one you want to keep. The labelling "
+                   "window's rounds live in <project>/runs/rounds/ and never "
+                   "collide with these. Picking \"detection\" as the model mode "
+                   "forces stage 1 regardless of the stage you chose - the log "
+                   "says so when it happens.",
         },
         {
             "key": "analysis",
@@ -707,29 +729,37 @@ class Hub:
                     "timeline for the whole video.",
             "makes": "predictions.json and output.mp4 in "
                      "<project>/analysis/predict/.",
-            "tip": "The detector's confidence is not a calibrated probability. "
-                   "Use the timeline to find the moments the model got wrong, "
-                   "then fix those frames in step 1.",
+            "tip": "The detector's confidence is not a calibrated "
+                   "probability. Use the timeline to find the moments a "
+                   "finished model got wrong. For the labelling loop you do "
+                   "not need this page: Analyze in the labelling window runs "
+                   "the model and ranks what it was least sure about.",
         },
     )
 
     _RECOMMENDED_LOOP: Tuple[str, ...] = (
-        "Step 1 is the loop, and it closes without a model. Run Pick frames to "
-        "label to choose them, let Find all in frame or Continue propose the "
-        "boxes, review them, and run it again - the next pass "
-        "scores frames by how unlike your existing labels they are, so it "
-        "carries on from where you stopped instead of re-rolling.",
+        "Step 1 is the whole loop, and it closes without a model and "
+        "without this window. Pick frames to label chooses where to start, "
+        "the segmentation helper proposes the boxes, Review is where you "
+        "accept them - and Train builds a detector from what you have so far, "
+        "right there.",
+        "Then Analyze runs that detector back over the videos and brings the "
+        "boxes it was least sure about into the Review Inbox. That is one "
+        "round: pick, label, train, analyze, pick again. Each pass scores "
+        "frames by how unlike your existing labels they are, so it carries on "
+        "from where you stopped instead of re-rolling.",
         "Label in rounds of 20-50 frames rather than one long sitting. The "
         "point of the loop is that what you label changes what you are asked "
         "to label next, and that only happens between rounds.",
-        "Steps 2 and 3 start when you decide the labels are good enough. Train "
-        "stage 1 first; \"detection\" as the model mode forces it whatever the "
-        "stage buttons say. Watch the validation curve, not the training one.",
-        "Analyze on a video the model has not seen, and step through the "
-        "timeline instead of trusting the summary numbers.",
-        "A trained checkpoint then makes step 1 faster - Pre-label videos with "
-        "the model does whole videos at a time and uncertainty joins the "
-        "sampling - but it was never required to get here.",
+        "Steps 2 and 3 are not part of that loop. They are the production run "
+        "you do ONCE, when the rounds have stopped teaching you anything: "
+        "every stage, the full controls, and the model you would report. "
+        "Train stage 1 first; \"detection\" as the model mode forces it "
+        "whatever the stage buttons say. Watch the validation curve, not the "
+        "training one.",
+        "Analyze here on a video the model has not seen, and step through the "
+        "timeline instead of trusting the summary numbers. Send predictions "
+        "to the annotator to fix what it got wrong.",
     )
 
     def _build_workflow(self, parent: str) -> None:
@@ -1456,6 +1486,7 @@ class Hub:
                 self.status(f"Playback error: {exc}", "error")
 
     def run(self, argv=None) -> None:
+        page, project = parse_argv(argv)
         dpg.create_context()
         theme.setup()
         width, height = _viewport_size()
@@ -1466,6 +1497,14 @@ class Hub:
         )
         dpg.setup_dearpygui()
         self.build_ui()
+        # The annotator opens this window on the page it means, for a project
+        # it already has open. Applied after ``build_ui`` because both calls
+        # write into widgets, and in this order because the page's status line
+        # should be the last thing said.
+        if project:
+            self.use_project(project, quiet=True)
+        if page:
+            self.switch(page)
         try:
             dpg.set_viewport_resize_callback(self._on_viewport_resize)
         except Exception:  # noqa: BLE001
@@ -1498,6 +1537,25 @@ class Hub:
                         runner_stop()
                     except Exception:  # noqa: BLE001
                         pass
+
+
+def parse_argv(argv=None) -> Tuple[str, Optional[Path]]:
+    """``--page`` and ``--project``, as the annotator hands them over.
+
+    A tolerant parser rather than :mod:`argparse`: this window is also
+    launched by a person typing ``python -m htrtdetr.gui`` with whatever they
+    remember, and a hub that refuses to open because of an unrecognised flag
+    is worse than one that opens on the Workflow page.
+    """
+    page, project = "", None
+    args = list(argv or [])
+    for index, token in enumerate(args):
+        value = args[index + 1] if index + 1 < len(args) else ""
+        if token == "--page" and value:
+            page = value.strip().lower()
+        elif token == "--project" and value:
+            project = Path(value)
+    return (page if page in _PAGE_KEYS else ""), project
 
 
 def main(argv=None) -> None:

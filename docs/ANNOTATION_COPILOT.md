@@ -394,7 +394,7 @@ Stated so an omission is not mistaken for an oversight.
 | `class_id` on a box | `to_dict` hardcodes `0` and `tests/test_labeling_ops.py` asserts it. The Inspector says so rather than appearing to work. |
 | Timeline drag-editing of behavior intervals | Edges move from the Inspector against the current frame. Dragging on the lane is the next increment. |
 | Per-sample reason shown *on the timeline* | Reasons are in the Smart Annotate summary and in `Selection.reasons`. The timeline draws samples as one marker kind. |
-| A detector trained *from inside* the annotator | Deliberate, not missing. Step 1 is the loop and closes without a model; step 2 turns a finished label set into one. See §12. |
+| ~~A detector trained *from inside* the annotator~~ | **Built.** `Train` in the top bar runs one active-learning round here: export the labelled frames, train stage 1 on them, adopt the checkpoint. The loop still *starts* without a model - that has not changed - but it no longer has to leave this window to get one. `docs/GUI_DESIGN.md` §0.4.9, `annotation/round.py`. Step 2 is now the production run over finished labels. |
 
 ---
 

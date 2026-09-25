@@ -439,10 +439,16 @@ class Trainer:
             # --- Checkpoint ---
             _ckpt_extra = self._checkpoint_extra()
             _out = Path(self.cfg.output_dir)
+            # ``save_optimizer_state=False`` writes weights only. Adam keeps two
+            # moments per parameter, so the optimizer is roughly two thirds of
+            # the file; a run that will never be resumed pays that on every
+            # epoch for state nothing reads. See TrainConfig.
+            _opt = self.optimizer if self.cfg.save_optimizer_state else None
+            _sched = self.scheduler if self.cfg.save_optimizer_state else None
             if self.cfg.save_last:
                 save_checkpoint(
                     str(_out / "weights" / "last.pth"),
-                    self.model, self.optimizer, self.scheduler,
+                    self.model, _opt, _sched,
                     epoch=epoch, metrics=all_metrics, extra=_ckpt_extra,
                 )
 
@@ -515,7 +521,7 @@ class Trainer:
                 _save_model = self.ema.ema if self.ema is not None else self.model
                 save_checkpoint(
                     str(_out / "weights" / "best.pth"),
-                    _save_model, self.optimizer, self.scheduler,
+                    _save_model, _opt, _sched,
                     epoch=epoch, metrics=all_metrics, extra=_ckpt_extra,
                 )
                 self.no_improve_count = 0

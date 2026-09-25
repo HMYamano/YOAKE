@@ -415,3 +415,155 @@ def test_no_two_inspector_sections_share_a_tag():
             owners[tag] = name
 
     assert not clashes, "inspector tags used by two sections: " + "; ".join(clashes)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Cost: the lane rules the module states about itself
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The module's docstring makes one promise about cost - "O(width), not
+# O(frames)" - and the behavior lane used to be the one lane that broke it.
+# ``intervals.merge_to_intervals`` can only join frames within ``max_gap`` of
+# each other, so a detector run at stride 15 yields one interval per box:
+# 28,800 of them for an hour of video with four animals, drawn one rectangle
+# each, rebuilt on every frame change. That is measurably the difference
+# between a window that steps frames at 60 fps and one that does not.
+#
+# These tests count draw calls through a stubbed dearpygui rather than opening
+# a viewport, so they run in the unit suite beside the arithmetic they protect.
+
+class _DrawCounter:
+    """The subset of dearpygui the renderer touches, counting instead of drawing."""
+
+    def __init__(self):
+        self.calls = {}
+        self.items = {"t"}
+
+    def _count(self, name):
+        def fn(*_a, **kw):
+            self.calls[name] = self.calls.get(name, 0) + 1
+            tag = kw.get("tag")
+            if tag:
+                self.items.add(tag)
+        return fn
+
+    def __getattr__(self, name):
+        if name.startswith(("draw_", "add_", "configure_", "set_", "delete_")):
+            return self._count(name)
+        raise AttributeError(name)
+
+    def does_item_exist(self, tag):
+        return tag in self.items
+
+    @property
+    def total_draws(self):
+        return sum(n for k, n in self.calls.items() if k.startswith("draw_"))
+
+
+@pytest.fixture
+def counted(monkeypatch):
+    stub = _DrawCounter()
+    monkeypatch.setattr(TL, "dpg", stub)
+    return stub
+
+
+def _one_frame_intervals(num_frames, stride=15, tracks=4):
+    """What a stride-15 detector run actually produces: nothing merges."""
+    return [(f, f, k % 3, False)
+            for f in range(0, num_frames, stride)
+            for k in range(tracks)]
+
+
+def test_the_behavior_lane_costs_the_window_not_the_video(counted):
+    """28,800 unmergeable intervals must not be 28,800 rectangles."""
+    line = TL.Timeline("t")
+    line._width = 1100
+    model = TL.TimelineModel(num_frames=108_000, current=0)
+    model.behaviors = _one_frame_intervals(108_000)
+    assert len(model.behaviors) == 28_800
+    line.set_model(model)
+    line.render()
+    assert counted.total_draws < 4_000, (
+        f"{counted.total_draws} draw calls for a 1,100-pixel strip - the "
+        "behavior lane is not bucketing"
+    )
+
+
+def test_a_confirmed_interval_is_not_hidden_by_an_unconfirmed_neighbour(counted):
+    """Inside one pixel column, a human's decision wins.
+
+    Colour and fill are the only channel a 9-pixel bar has, so a stretch a
+    human signed off must not be redrawn as a proposal because something
+    unconfirmed shares its pixel.
+    """
+    line = TL.Timeline("t")
+    line._width = 1100
+    model = TL.TimelineModel(num_frames=108_000, current=0)
+    # Two intervals one frame apart: the same pixel column, same behavior.
+    model.behaviors = [(5000, 5000, 1, False), (5001, 5001, 1, True)]
+    line.set_model(model)
+
+    # The alpha of the fill is what says confirmed (190) or not (55), and it
+    # is not observable any other way.
+    fills = []
+    real_rect = TL.dpg.draw_rectangle
+    TL.dpg.draw_rectangle = lambda *a, **kw: (fills.append(kw.get("fill")),
+                                              real_rect(*a, **kw))[1]
+    try:
+        line.render()
+    finally:
+        TL.dpg.draw_rectangle = real_rect
+
+    alphas = [f[3] for f in fills if f is not None and len(f) == 4]
+    assert 190 in alphas, "the confirmed interval lost its column to the unconfirmed one"
+    assert 55 not in alphas, "both were drawn - they share a pixel, so one must win"
+
+
+def test_a_wide_interval_is_still_drawn_whole(counted):
+    """Bucketing must not shrink a behavior long enough to read into a tick."""
+    line = TL.Timeline("t")
+    line._width = 1100
+    model = TL.TimelineModel(num_frames=1000, current=0)
+    model.behaviors = [(100, 900, 0, True)]
+    line.set_model(model)
+    line.render()
+    assert counted.calls.get("draw_rectangle", 0) >= 1
+
+
+def test_moving_the_playhead_does_not_redraw_the_lanes(counted):
+    """The frame-change path.
+
+    Stepping a frame changes one integer on the model. Rebuilding four lanes
+    for it cost 15 ms on an hour of video with a detector run in it, on a 16 ms
+    budget - which is the whole of "the window went treacle after I ran the
+    model".
+    """
+    line = TL.Timeline("t")
+    line._width = 1100
+    model = TL.TimelineModel(num_frames=108_000, current=0)
+    model.needs_review = set(range(0, 108_000, 15))
+    model.issues = [(f, f + 16, "low_confidence", 0.5) for f in range(0, 108_000, 108)]
+    line.set_model(model)
+
+    line.render()
+    full = counted.total_draws
+    assert full > 100, "the lanes did draw something to begin with"
+
+    counted.calls.clear()
+    for frame in range(0, 2000, 100):
+        model.current = frame
+        line.render_playhead()
+    per_move = counted.total_draws / 20
+    assert per_move <= 4, (
+        f"{per_move} draw calls to move the playhead - the lanes are being "
+        "rebuilt with it"
+    )
+
+
+def test_a_playhead_move_before_any_render_still_paints_the_lanes(counted):
+    """No layer yet means a full render, not an empty strip."""
+    line = TL.Timeline("t")
+    line._width = 1100
+    line.set_model(TL.TimelineModel(num_frames=1000, current=10))
+    line.render_playhead()
+    assert counted.total_draws > 4, "the lanes were never painted"

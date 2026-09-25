@@ -81,7 +81,7 @@ LANES: Tuple[Lane, ...] = (
     Lane("behavior", "Behavior", 9,
          "Behavior intervals, coloured by label. Hollow means not yet confirmed."),
     Lane("samples", "Samples", 9,
-         "Circles: frames Smart Annotate chose. Squares: frames you placed a box on."),
+         "Circles: frames chosen for you to label. Squares: frames you placed a box on."),
 )
 
 #: Issue kind -> marker shape. Kinds not named here use the default diamond.
@@ -97,7 +97,7 @@ SHAPE_HELP: Tuple[Tuple[str, str], ...] = (
     ("X", "Possible ID switch"),
     ("^", "Missing or merged animal"),
     ("<>", "Everything else to review"),
-    ("o", "Smart Annotate sample"),
+    ("o", "Chosen frame"),
     ("[]", "Frame you placed a box on"),
 )
 
@@ -197,17 +197,24 @@ class Timeline:
         on_seek: Optional[Callable[[int], None]] = None,
         on_issue: Optional[Callable[[Any], None]] = None,
         on_clip: Optional[Callable[[Tuple[int, int]], None]] = None,
+        on_sample: Optional[Callable[[int], None]] = None,
         lanes: Sequence[Lane] = LANES,
     ) -> None:
         self.tag = tag
         self.on_seek = on_seek
         self.on_issue = on_issue
         self.on_clip = on_clip
+        #: A sampled frame was clicked. ``None`` falls through to a plain seek,
+        #: which lands within a few frames rather than on the chosen one.
+        self.on_sample = on_sample
         self.lanes = tuple(lanes)
         self.model = TimelineModel()
         self._width = 800
         self._markers: List[Tuple[float, float, Any]] = []
         self._scrubbing = False
+        #: The playhead lives in a layer of its own so it can be moved without
+        #: the four lanes being rebuilt. See :meth:`render_playhead`.
+        self._playhead_layer = f"{tag}_playhead"
 
     # ── geometry ─────────────────────────────────────────────────────────
     @property
@@ -261,7 +268,13 @@ class Timeline:
 
     # ── rendering ────────────────────────────────────────────────────────
     def render(self) -> None:
-        """Redraw everything. Cheap enough to call on every frame change."""
+        """Redraw everything. Call it when the **model** changed.
+
+        Not on a frame change - :meth:`render_playhead` is that. Four lanes
+        over a video a detector has been run on is 1,500-odd draw nodes
+        deleted and rebuilt, measured at 18 ms on an hour of video at stride
+        15, and a frame change does not alter a single one of them.
+        """
         if not self.alive():
             return
         dpg.delete_item(self.tag, children_only=True)
@@ -285,7 +298,34 @@ class Timeline:
         self._draw_issue_lane(x0, x1)
         self._draw_behavior_lane(x0, x1)
         self._draw_sample_lane(x0, x1)
-        self._draw_playhead(total_h)
+        self._render_playhead_layer(total_h, rebuild=True)
+
+    def render_playhead(self) -> None:
+        """Move the playhead, leaving the lanes exactly as they are.
+
+        The frame-change path. Everything the lanes draw is a function of the
+        model, and stepping a frame changes one integer on it, so the only
+        thing that has to be redrawn is the line and its triangle - three draw
+        calls instead of fifteen hundred.
+
+        Falls back to a full :meth:`render` when there is no layer yet, so the
+        first call after a build cannot leave an empty strip.
+        """
+        if not self.alive():
+            return
+        if not dpg.does_item_exist(self._playhead_layer):
+            self.render()
+            return
+        self._render_playhead_layer(self.height, rebuild=False)
+
+    def _render_playhead_layer(self, total_h: float, *, rebuild: bool) -> None:
+        if rebuild:
+            if dpg.does_item_exist(self._playhead_layer):
+                dpg.delete_item(self._playhead_layer)
+            dpg.add_draw_layer(tag=self._playhead_layer, parent=self.tag)
+        else:
+            dpg.delete_item(self._playhead_layer, children_only=True)
+        self._draw_playhead(total_h, parent=self._playhead_layer)
 
     # -- scrubber --------------------------------------------------------
     def _draw_scrub_track(self, x0: float, x1: float) -> None:
@@ -354,13 +394,30 @@ class Timeline:
 
     # -- lane 3: behavior intervals --------------------------------------
     def _draw_behavior_lane(self, x0: float, x1: float) -> None:
+        """The one lane that used to break this module's own O(width) rule.
+
+        Behavior intervals arrive from ``intervals.merge_to_intervals``, which
+        can only join frames that are within ``max_gap`` of each other. A
+        detector run at stride 15 puts its candidates 15 frames apart, so
+        nothing merges and the "intervals" are one per box: 28,800 of them for
+        an hour of video with four animals. Drawn one rectangle each, that is
+        28,800 draw nodes rebuilt on every frame change and re-submitted on
+        every rendered frame - measured at 0.15 s per redraw before the GPU
+        sees any of it, which is the whole of "the window went treacle after I
+        ran the model".
+
+        So the same bucketing the other three lanes have always done. An
+        interval narrower than a pixel cannot be told from its neighbour on
+        screen anyway; what the eye needs from this lane is *which behavior,
+        where, and is it confirmed*, and one rectangle per column per behavior
+        says exactly that. Intervals wide enough to read are still drawn whole,
+        because those are the ones a user clicks towards.
+        """
         lane = self._lane_of("behavior")
         top = self._lane_top("behavior")
         self._lane_ground(x0, x1, top, lane.height)
 
-        for start, end, action_id, confirmed in self.model.behaviors:
-            left = self.frame_to_x(start)
-            right = max(self.frame_to_x(end), left + 1.5)
+        def bar(left: float, right: float, action_id: int, confirmed: bool) -> None:
             color = theme.class_color(action_id)
             if confirmed:
                 dpg.draw_rectangle((left, top + 1), (right, top + lane.height - 1),
@@ -373,6 +430,22 @@ class Timeline:
                 dpg.draw_rectangle((left, top + 1), (right, top + lane.height - 1),
                                    color=theme.rgba(color, 235),
                                    fill=theme.rgba(color, 55), parent=self.tag)
+
+        # ``(column, action_id) -> confirmed``. Confirmed wins inside a column:
+        # a stretch a human has signed off must not be redrawn as a proposal
+        # because an unconfirmed neighbour shares its pixel.
+        columns: Dict[Tuple[int, int], bool] = {}
+        for start, end, action_id, confirmed in self.model.behaviors:
+            left = self.frame_to_x(start)
+            right = self.frame_to_x(end)
+            if right - left >= 2.0:
+                bar(left, right, action_id, confirmed)
+                continue
+            key = (int(left), int(action_id))
+            columns[key] = columns.get(key, False) or bool(confirmed)
+
+        for (column, action_id), confirmed in columns.items():
+            bar(float(column), float(column) + 1.5, action_id, confirmed)
 
     # -- lane 4: samples and keyframes ------------------------------------
     def _draw_sample_lane(self, x0: float, x1: float) -> None:
@@ -401,18 +474,19 @@ class Timeline:
                                fill=theme.rgba(theme.VERIFIED, 235), parent=self.tag)
 
     # -- playhead ---------------------------------------------------------
-    def _draw_playhead(self, total_h: float) -> None:
+    def _draw_playhead(self, total_h: float, *, parent: Optional[str] = None) -> None:
+        parent = parent or self.tag
         x = self.frame_to_x(self.model.current)
         color = theme.rgba(theme.PENDING if self._scrubbing else theme.TEXT, 255)
         dpg.draw_line((x, 2), (x, total_h - 2), color=color, thickness=1.5,
-                      parent=self.tag)
+                      parent=parent)
         dpg.draw_triangle((x - 5, 0), (x + 5, 0), (x, 7),
-                          color=color, fill=color, parent=self.tag)
+                          color=color, fill=color, parent=parent)
         if self._scrubbing:
             x0, x1 = self._span()
             label_x = min(max(x + 8, x0), max(x1 - 56, x0))
             dpg.draw_text((label_x, 2), str(self.model.current),
-                          color=color, size=13, parent=self.tag)
+                          color=color, size=13, parent=parent)
 
     # -- primitives -------------------------------------------------------
     def _lane_of(self, key: str) -> Lane:
@@ -506,12 +580,37 @@ class Timeline:
                     best = (int(start), int(end))
         return best
 
+    def sample_at(self, x: float, y: float) -> Optional[int]:
+        """The sampled frame nearest ``x`` within :attr:`HIT_PX`, or ``None``.
+
+        The samples lane drew its circles and hit-tested nothing, so the
+        frames *Pick frames to label* had just chosen were the one thing on
+        the timeline a click could not reach. Tolerance in x, like
+        :meth:`marker_at` and for the same reason: over an hour of video a
+        circle is about three pixels wide and eighty-six frames apart from its
+        neighbour, and requiring a hit inside it makes the lane decorative.
+        """
+        lane_top = self._lane_top("samples")
+        lane = self._lane_of("samples")
+        if not (lane_top - 3 <= y <= lane_top + lane.height + 3):
+            return None
+        best, best_dx = None, float(self.HIT_PX)
+        for frame in self.model.samples:
+            dx = abs(self.frame_to_x(frame) - x)
+            if dx <= best_dx:
+                best, best_dx = int(frame), dx
+        return best
+
     def on_press(self) -> bool:
         """Handle a left press. ``True`` when the timeline consumed it.
 
         Marker first, seek second. Clicking a marker is the feature; falling
         through to a seek would put the playhead near the issue and select
         nothing, which looks like the click missed.
+
+        A sampled frame outranks the clip it sits inside: both are in the
+        samples lane, and "that frame" is the more specific answer to a click
+        than "the forty-frame span around it".
         """
         if not self.hovered():
             return False
@@ -522,6 +621,10 @@ class Timeline:
         marker = self.marker_at(x, y)
         if marker is not None and self.on_issue is not None:
             self.on_issue(marker)
+            return True
+        sample = self.sample_at(x, y)
+        if sample is not None and self.on_sample is not None:
+            self.on_sample(sample)
             return True
         clip = self.clip_at(x, y)
         if clip is not None and self.on_clip is not None:

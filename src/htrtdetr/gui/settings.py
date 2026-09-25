@@ -226,7 +226,9 @@ class SettingsDialog:
                 width=270,
                 callback=lambda s, a: self._call("end_of_video", a),
             )
-            widgets.secondary_button("Guided Annotation", self._cb("guided_help"), width=200)
+            # No "Guided Annotation" button here. It is a Help topic, it is in
+            # the Help menu, and a settings tab is not where anyone looks for
+            # one.
             widgets.gap(2)
             widgets.section_header(
                 "Animals per frame", "The single most useful thing you can tell the checks."
@@ -337,7 +339,7 @@ class SettingsDialog:
             dpg.add_text(
                 "When on, stepping to the next frame moves every initialised "
                 "tracker with the animal. Propagated boxes are drawn dashed: "
-                "they are suggestions to correct, not annotations.",
+                "they are candidates to correct, not annotations.",
                 color=theme.TEXT_DIM,
                 wrap=self.WIDTH - 60,
             )

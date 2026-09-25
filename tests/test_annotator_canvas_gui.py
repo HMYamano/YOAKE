@@ -279,11 +279,10 @@ def _chrome_buttons():
     import htrtdetr.annotator as module
 
     tags = [f"rail_{tool}" for tool, *_rest in module._TOOLS]
-    tags += ["rail_propagate", "rail_sticky"]
-    tags += [f"rail_{a.replace('.', '_')}" for a in
-             ("view.zoom_in", "view.zoom_out", "view.fit")]
-    tags += ["top_smart", "top_review", "top_undo", "top_redo", "top_save",
-             "top_panels", "top_settings", "nav_propagate"]
+    tags += ["rail_propagate", "rail_sticky", "rail_view_fit", "rail_panels"]
+    tags += ["top_smart", "top_review", "top_train", "top_analyze",
+             "top_undo", "top_redo", "top_save", "top_settings",
+             "nav_propagate"]
     return tags
 
 
@@ -324,21 +323,25 @@ MIN_VIEWPORT_W = 900
 
 
 def test_the_top_bar_fits_inside_the_smallest_allowed_window(app):
-    """Fixed widths pushed Panels and Settings off the right edge at 900 px.
+    """Fixed widths pushed the last buttons off the right edge at 900 px.
 
     They were not clipped, they were **unreachable**: a horizontal group does
     not wrap, so the last two buttons of the row simply had no pixels. Sizing
     each button to its own label is what brings the row back inside the
     smallest window the viewport allows.
+
+    The row now carries Train and Analyze as well, which is exactly why this
+    stays measured rather than assumed: two more buttons is how a row that
+    fits stops fitting.
     """
-    tags = ["top_smart", "top_review", "top_undo", "top_redo", "top_save",
-            "top_panels", "top_settings"]
+    tags = ["top_smart", "top_review", "top_train", "top_analyze",
+            "top_undo", "top_redo", "top_save", "top_settings"]
     widths = []
     for tag in tags:
         assert dpg.does_item_exist(tag), tag
         widths.append(dpg.get_item_rect_size(tag)[0])
-    # The row also carries the YOAKE wordmark, the save pill and two spacers.
-    chrome = 40 + 90 + 26
+    # Three 10-12 px spacers, and dearpygui's own item spacing per button.
+    chrome = 32
     total = sum(widths) + 8 * len(widths) + chrome
     assert total <= MIN_VIEWPORT_W, (
         f"the top bar needs {total:.0f} px and the window can be "
@@ -346,12 +349,52 @@ def test_the_top_bar_fits_inside_the_smallest_allowed_window(app):
     )
 
 
+def test_the_context_row_keeps_both_chips_inside_the_smallest_window(app):
+    """Save state and the model chip are facts you must be able to read.
+
+    They used to sit after the identity text, which is as long as the project
+    name plus the video name - so on a real project they were pushed past the
+    right edge and the only honest answer to "have my changes been written"
+    was off screen.
+    """
+    tags = ["top_videos", "top_prev_video", "top_next_video",
+            "top_saved", "top_model"]
+    right = 0.0
+    for tag in tags:
+        assert dpg.does_item_exist(tag), tag
+        x = dpg.get_item_rect_min(tag)[0]
+        right = max(right, x + dpg.get_item_rect_size(tag)[0])
+    assert right <= MIN_VIEWPORT_W, (
+        f"the context row reaches {right:.0f} px inside a "
+        f"{MIN_VIEWPORT_W} px window"
+    )
+
+
+def test_the_loop_reads_left_to_right_in_the_top_bar(app):
+    """Pick frames, Review, Train, Analyze - in that order, on one row.
+
+    The order is the claim. A user who has just finished a round of labelling
+    has to be able to find the next step without knowing that a second window
+    exists, and a row that puts Train before Review, or Analyze on a different
+    row, is a row you have to read rather than follow.
+    """
+    tags = ["top_smart", "top_review", "top_train", "top_analyze"]
+    xs, ys = [], []
+    for tag in tags:
+        assert dpg.does_item_exist(tag), tag
+        x, y = dpg.get_item_rect_min(tag)
+        xs.append(x)
+        ys.append(y)
+    assert xs == sorted(xs), list(zip(tags, xs))
+    assert max(ys) - min(ys) <= 2, list(zip(tags, ys))
+
+
 def test_the_tool_rail_can_be_scrolled_to_its_last_control(app):
     """At 600 px tall the rail is taller than the canvas.
 
-    With ``no_scrollbar=True`` the zoom controls and the zoom readout below the
+    With ``no_scrollbar=True`` the view controls and the zoom readout below the
     fold did not exist for the user and nothing said why.
     """
     assert dpg.get_item_configuration("toolrail").get("no_scrollbar") is False
-    for tag in ("rail_view_zoom_in", "rail_view_zoom_out", "rail_view_fit", "rail_zoom"):
+    for tag in ("rail_view_fit", "rail_panels", "rail_zoom"):
         assert dpg.does_item_exist(tag), f"{tag} is not in the rail at all"

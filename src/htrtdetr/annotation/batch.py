@@ -44,6 +44,37 @@ class BatchOptions:
     connect_tracks: bool = True
     sample: bool = True
     stride: int = 15
+    #: Run the detector on every ``detect_stride``-th frame instead of on all
+    #: of them. ``1`` is the old behaviour and stays the default for anything
+    #: that genuinely wants a dense pass.
+    #:
+    #: For active learning, dense is waste: the sampler can only ever choose a
+    #: scanned frame, so detections on the 14 frames between two scan positions
+    #: are computed, cached and never looked at. Measured on this machine at
+    #: 121 frames/s, 20 one-hour videos cost 4.1 hours dense and 17 minutes at
+    #: stride 15.
+    detect_stride: int = 1
+    #: Ask the child for **boxes only**, several frames at a time
+    #: (:mod:`htrtdetr.inference.detect_only`).
+    #:
+    #: On by default, because it is what this loop actually needs and because
+    #: the alternative is slower at everything it does. A round trains
+    #: ``stage=1``; the identity, temporal and behavior heads that the
+    #: streaming path runs on every frame are still at their random
+    #: initialisation, and their output is discarded here. Dropping them also
+    #: drops the constraint that made the detector run one frame at a time -
+    #: the tracker's sequential memory - and batching it is measured 4.8x
+    #: faster on the same GPU with the same weights (73.7 -> 350.6 fps).
+    #:
+    #: The trade is identity. Detections come back with ``track_id = -1``:
+    #: :func:`connect_detections` links them by IoU on a dense pass, and a
+    #: strided pass has no identity to give anyway - the online tracker used
+    #: to join detections 15 frames apart as if they were neighbours, which is
+    #: the defect ``detect_stride`` was introduced beside.
+    detect_only: bool = True
+    #: Frames per forward pass. 0 takes the runner's default (16, which is
+    #: where the measured throughput curve flattens).
+    detect_batch: int = 0
     balanced: bool = True
     request: sampling.SamplingRequest = field(default_factory=sampling.SamplingRequest)
     quality: quality.QualityConfig = field(default_factory=quality.QualityConfig)
@@ -100,7 +131,15 @@ def connect_detections(candidates: dict, threshold=0.3) -> dict:
     return result
 
 
-def check_video(candidates, annotations, config, num_frames):
+def check_video(candidates, annotations, config, num_frames, frames=None):
+    """Run the quality checks over the frames that were actually examined.
+
+    ``frames`` matters as soon as the detector runs sparsely. The checks treat
+    every frame in this sequence as one they have an opinion about, so passing
+    ``range(num_frames)`` after a stride-15 pass declares 14 frames out of
+    every 15 to be places the detector found nothing - and the review inbox
+    fills with tens of thousands of items about frames nobody ran a model on.
+    """
     combined = {f: list(cs) for f, cs in candidates.items()}
     for frame, objects in annotations.items():
         row = combined.setdefault(frame, [])
@@ -119,10 +158,12 @@ def check_video(candidates, annotations, config, num_frames):
             for o in objects
         )
     parts = tracklet.build_tracklets(combined, max_gap=config.fragment_gap)
+    if frames is None:
+        frames = range(num_frames) if num_frames else sorted(combined)
     issues = quality.analyze(
         combined,
         config=config,
-        frames=range(num_frames) if num_frames else sorted(combined),
+        frames=frames,
         tracklets=parts,
         num_frames=num_frames,
     )
@@ -131,13 +172,90 @@ def check_video(candidates, annotations, config, num_frames):
     return issues
 
 
+def write_scan_frames(video, plan, folder, cancel):
+    """Write the planned frames as ``%06d.jpg``, numbered from zero.
+
+    ``yoake predict`` re-indexes an image directory from 0 and has no
+    start-frame option, which is why the local numbering and
+    :func:`auto_label.remap_frame_indices` exist at all.
+
+    Sequential ``grab()`` with a selective ``retrieve()``, never
+    ``cap.set(CAP_PROP_POS_FRAMES)``: seeking is off-by-one at non-integer fps
+    and agrees at frame 0, so the error is near-impossible to notice. At
+    stride 15 a grab costs about a quarter of a millisecond, so walking an
+    hour-long video to collect 6,000 frames is seconds, against the minutes
+    the detector would have spent on the 84,000 frames in between.
+    """
+    import cv2
+
+    folder.mkdir(parents=True, exist_ok=True)
+    wanted = list(plan.frames)
+    if not wanted:
+        return 0
+    cap = cv2.VideoCapture(str(video.path))
+    written = 0
+    try:
+        if not cap.isOpened():
+            raise OSError("Video codec is unsupported or the file cannot be opened")
+        # ``position`` is the index of the frame the next read/grab consumes.
+        #
+        # Grab up to the target and then ``read()`` it. Not ``grab()`` through
+        # the target and ``retrieve()``: retrieve returns the frame the LAST
+        # grab consumed, which is target-1, and the only symptom is that every
+        # exported frame is one early - invisible at frame 0, where it agrees.
+        # The first version of this loop had exactly that bug, and the index
+        # test did not catch it because the frame numbers come from the index
+        # map and were right; only the pixels were wrong.
+        position = 0
+        for local, target in enumerate(wanted):
+            if cancel.is_set():
+                raise Cancelled()
+            while position < target:
+                if cancel.is_set():
+                    raise Cancelled()
+                if not cap.grab():
+                    raise OSError(f"Could not read frame {position} while collecting frame {target}")
+                position += 1
+            ok, frame = cap.read()
+            position += 1
+            if not ok or frame is None:
+                # predict enumerates the remaining files, so skipping one
+                # would shift every later prediction onto the wrong frame.
+                raise OSError(f"Could not read frame {target}")
+            ok, buffer = cv2.imencode(".jpg", frame)
+            if not ok:
+                raise OSError(f"Could not encode frame {target}")
+            # imencode + write_bytes, not imwrite: imwrite silently returns
+            # False for any path outside the active code page on Windows, and
+            # a project folder named in Japanese is the normal case here.
+            (folder / f"{local:06d}.jpg").write_bytes(buffer.tobytes())
+            written += 1
+    finally:
+        cap.release()
+    return written
+
+
 def predict_video(video, options, root, output, cancel, progress):
+    stride = max(1, int(getattr(options, "detect_stride", 1)))
+    index_map = {}
+    source = str(video.path)
+    if stride > 1:
+        plan = auto_label.export_plan(0, -1, video.num_frames, "scan", stride=stride)
+        folder = output / "frames"
+        progress(0.1, f"Collecting every {stride}th frame")
+        written = write_scan_frames(video, plan, folder, cancel)
+        if not written:
+            raise OSError("No frames could be read for detection")
+        index_map = plan.index_map
+        source = str(folder)
     req = auto_label.PredictRequest(
-        source=str(video.path),
+        source=source,
         weights=options.weights,
         output_dir=str(output),
         score_threshold=options.score_threshold,
         config=options.config,
+        detect_only=bool(getattr(options, "detect_only", True)),
+        batch_size=int(getattr(options, "detect_batch", 0)),
     )
     argv = [sys.executable, *auto_label.predict_argv(req)]
     env = auto_label.device_env(options.device, auto_label.child_env(root))
@@ -176,9 +294,13 @@ def predict_video(video, options, root, output, cancel, progress):
             if process.poll() is None:
                 process.kill()
                 process.wait()
-    return auto_label.load_candidates(
+    found = auto_label.load_candidates(
         output / "predictions.json", min_score=options.score_threshold
     )
+    # Local index -> real video frame. Without this every candidate from a
+    # strided run lands on the wrong frame; an empty map is the identity, so
+    # the dense path is unchanged.
+    return auto_label.remap_frame_indices(found, index_map)
 
 
 
@@ -319,6 +441,42 @@ def sample_project(results: list[VideoResult], request, *, balanced=True):
         )
 
 
+def keep_chosen(results: list[VideoResult]) -> None:
+    """Throw away every candidate outside the frames the sampler chose.
+
+    **This is the difference between a round and an analysis**, and without it
+    the two are the same operation with a different button.
+
+    A round asks for 50-200 frames. To find them the detector scans the whole
+    scope - 36,000 positions across twenty one-hour videos - and every one of
+    those positions comes back carrying boxes. Merged whole, that is roughly
+    72,000 candidates arriving in a Review Inbox that was asked for a hundred
+    frames: the user is handed the entire project to check, the timeline fills
+    end to end, and the one number they wanted - *how much of this round is
+    left* - cannot be read off anything. The scan is scaffolding. Only the
+    picks are the job.
+
+    What survives: the chosen frames, and every frame inside a chosen clip
+    (:meth:`~htrtdetr.annotation.sampling.Selection.frame_set`).
+
+    What does not survive is still *cached*. The detections are on disk under
+    their model fingerprint, so nothing here is recomputed if the same round is
+    run again, and a dense pre-label pass - which does not sample, and does not
+    come through this function - still gets all of them.
+
+    A video the sampler gave nothing is emptied rather than left alone. It was
+    scanned, it was ranked, and it lost; carrying its boxes into Review would
+    say the opposite of what the ranking decided.
+    """
+    for result in results:
+        if result.status == "failed":
+            continue
+        wanted = result.selection.frame_set() if result.selection is not None else set()
+        result.candidates = {
+            frame: row for frame, row in result.candidates.items() if frame in wanted
+        }
+
+
 class BatchRunner:
     def __init__(
         self, root: Path, cache_dir: Path, *, predictor: Callable = predict_video, encoder=None
@@ -330,6 +488,20 @@ class BatchRunner:
         self.cancel = Event()
 
     def run(self, videos, options, emit=lambda event: None):
+        """Every video in turn, then - if this was a round - the choosing.
+
+        **A sampling run's candidates are not final until the last video is
+        done.** The budget is spent project-wide, so no video's picks are known
+        until every video has been scanned, and :func:`keep_chosen` cannot trim
+        anything before that. The ``video`` event therefore carries a full
+        scan's worth of boxes and the ``finished`` event carries the trimmed
+        ones; a caller that merges on ``video`` merges the scan.
+
+        The consequence on cancel is the reason this is written down: a stopped
+        run never reaches :func:`sample_project`, so nothing is trimmed and the
+        caller must merge **nothing**. What was scanned is not lost - it is in
+        the cache, and the next run gets it back without the detector.
+        """
         results = []
         for ordinal, video in enumerate(videos):
             if self.cancel.is_set():
@@ -367,6 +539,7 @@ class BatchRunner:
             emit({"kind": "video", "result": result})
         if options.sample and not self.cancel.is_set():
             sample_project(results, options.request, balanced=options.balanced)
+            keep_chosen(results)
         emit({"kind": "finished", "results": results, "cancelled": self.cancel.is_set()})
         return results
 
@@ -400,6 +573,12 @@ class BatchRunner:
                     config=video_fingerprint(options.config),
                     threshold=options.score_threshold,
                     device=options.device,
+                    stride=int(getattr(options, "detect_stride", 1)),
+                    # Part of the key because it changes what comes back, not
+                    # only how fast: a detect-only pass has no track ids in it.
+                    # Without this, a project scanned before this option
+                    # existed would keep serving its old rows for ever.
+                    detect_only=bool(getattr(options, "detect_only", True)),
                     operation="project_detection_v1",
                 )
                 cached = self.cache.get(key, "candidates")
@@ -429,11 +608,24 @@ class BatchRunner:
                         "candidates",
                         {str(f): [asdict(c) for c in cs] for f, cs in candidates.items()},
                     )
-            if options.connect_tracks:
+            detect_stride = max(1, int(getattr(options, "detect_stride", 1)))
+            # Linking detections into tracklets means "these two are the same
+            # animal a frame apart". On a strided pass consecutive detections
+            # are ``detect_stride`` frames apart, where an animal can have
+            # crossed the dish, so the greedy link would invent identities
+            # rather than find them.
+            if options.connect_tracks and detect_stride == 1:
                 candidates = connect_detections(candidates)
             result.candidates = candidates
             progress(0.6, "Checking tracks and behavior")
-            result.issues = check_video(candidates, video.annotations, options.quality, count)
+            # Only the frames a detector actually looked at. Anything else is
+            # the checks reporting on frames nobody ran a model on.
+            examined = None
+            if detect_stride > 1 and options.detect:
+                examined = sorted(set(range(0, count, detect_stride)) | set(video.annotations))
+            result.issues = check_video(
+                candidates, video.annotations, options.quality, count, frames=examined
+            )
             if options.sample:
                 encoder_key = (
                     asdict(self.encoder.info())
@@ -450,9 +642,43 @@ class BatchRunner:
                 cached = self.cache.get(key, "features")
                 if cached is None:
 
+                    # Grab forward instead of seeking. ``cap.grab()`` demuxes a
+                    # frame without decoding it, so stepping over the stride is
+                    # far cheaper than asking the container to seek - and the
+                    # frame list is ascending, which is the case this wins on.
+                    #
+                    # Measured on a 640x480 30fps H.264 hour (the videos this
+                    # was written for), per scanned frame:
+                    #
+                    #   stride  seek     grab-skip
+                    #   15      19.5 ms  4.0 ms
+                    #   30      15.7 ms  8.2 ms
+                    #   60      ~16 ms   16.8 ms
+                    #
+                    # So it is a five-fold win at the default stride and a
+                    # losing trade past about 60, which is where the cap
+                    # below hands the work back to the seek. At the default,
+                    # one pass over a twenty-hour project goes from 32 minutes
+                    # to under 7 - and this ``read`` is called twice over the
+                    # same list, once to encode and once to scan.
+                    max_skip = 48
+                    cursor = {"at": None}
+
                     def read(index):
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                        here = cursor["at"]
+                        if here is not None and here < index <= here + max_skip:
+                            for _ in range(index - here - 1):
+                                if not cap.grab():
+                                    here = None
+                                    break
+                        else:
+                            here = None
+                        if here is None:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
                         ok, frame = cap.read()
+                        # A failed read leaves the position unusable, so the
+                        # next call has to seek rather than trust the cursor.
+                        cursor["at"] = index if ok else None
                         return frame if ok else None
 
                     frames = list(range(0, count, max(1, options.stride)))

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..annotation import intervals, quality, review_queue, tracklet
 from ..annotation.batch import BatchRunner, VideoInput, check_video
-from . import auto_label
+from . import auto_label, commands
 
 
 class WorkspaceOperations:
@@ -20,7 +20,7 @@ class WorkspaceOperations:
         video, project = self._video_session, self.project
         if video.transient.get("tracker_busy"):
             self._status(
-                "Tracker is still working. Wait for its suggestions before stepping again."
+                "Tracker is still working. Wait for its candidates before stepping again."
             )
             return
         trackers = list(self._trackers.items())
@@ -123,6 +123,66 @@ class WorkspaceOperations:
     def _set_continue_method(self, value):
         self.project.settings["continue_method"] = value
         self._mark_dirty()
+
+    # ── the way out to the production run ────────────────────────────
+    #: ``page -> (button word, what that page is for)``. One entry now: the
+    #: active-learning round and its inference pass happen in the annotator,
+    #: and the workflow window is where the *final* model is made - every
+    #: stage, every label, once, with the full controls.
+    WORKFLOW_PAGES = {
+        "workflow": (
+            "Workflow",
+            "The full training run: stages 1-4, the metrics, and the "
+            "frame-by-frame review of a finished model. Done once, when the "
+            "labels are finished - not every round.",
+        ),
+    }
+
+    def open_workflow_page(self, page: str = "workflow"):
+        """Open the workflow window on this project, for the production run.
+
+        This used to be how the annotator reached training at all, which made
+        the active-learning loop a thing you left the labelling window to
+        continue. Training and inference for a round now happen here
+        (:mod:`gui.train_operations`), and this is the door to the other job:
+        the long run over finished labels.
+
+        Two honest preconditions, both named rather than silently worked
+        around: the workflow window works on a project folder, so there has to
+        **be** one, and what is on disk has to be what is on screen - hence
+        the save.
+        """
+        import subprocess
+        import sys
+
+        word, _purpose = self.WORKFLOW_PAGES.get(page, self.WORKFLOW_PAGES["workflow"])
+        if self.project_dir is None:
+            self._status(
+                f"{word} works on a project folder, and this project has none "
+                "yet. Settings > Project > Change folder... sets one."
+            )
+            self.open_settings("project")
+            return
+        if self._dirty:
+            self.save_annotation()
+        root = auto_label.repo_root_for(Path(__file__))
+        cmd = [sys.executable, "-u"] + commands.workflow_command(page, str(self.project_dir))
+        kwargs = {
+            "cwd": str(root),
+            "env": auto_label.child_env(root),
+            "stdin": subprocess.DEVNULL,
+        }
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            subprocess.Popen(cmd, **kwargs)
+        except (OSError, ValueError) as exc:
+            self._status(f"Could not open the workflow window: {exc}")
+            return
+        self._status(
+            "Opening the workflow window. This annotator stays open - come "
+            "back to it when the run is done."
+        )
 
     def show_onboarding(self):
         from .onboarding import show_guide
@@ -247,7 +307,7 @@ class WorkspaceOperations:
                         self._render_timeline()
                         self._refresh_inspector()
                     self._status(
-                        f"{len(rows)} tracking suggestions for {video.video_id}. Review before accepting. {reason}"
+                        f"{len(rows)} tracking candidates for {video.video_id}. Review before accepting. {reason}"
                     )
 
                 self._post(finish)
@@ -384,7 +444,7 @@ class WorkspaceOperations:
         if job is None:
             self._status(
                 f"This clip has {why}. Draw a box (W), click an animal (C), or "
-                "use Find all in frame on one frame of it, then try again."
+                "use Find every animal in this frame on one frame of it, then try again."
             )
             return False
         return self._start_clip_jobs([job], clips=1)
@@ -408,7 +468,7 @@ class WorkspaceOperations:
         clip = self.clip_at(frame)
         if clip is None:
             self._status(
-                "The playhead is not inside a sampled clip. Run Smart Annotate "
+                "The playhead is not inside a sampled clip. Run Pick frames to label "
                 "with a behavior or 'both' target, or use Continue to follow "
                 "one animal from here."
             )
@@ -423,7 +483,7 @@ class WorkspaceOperations:
         clips = list(getattr(selection, "clips", ()) or ())
         if not clips:
             self._status(
-                "No sampled clips yet. Run Smart Annotate with a behavior or "
+                "No sampled clips yet. Run Pick frames to label with a behavior or "
                 "'both' target first."
             )
             return False
@@ -583,6 +643,52 @@ class WorkspaceOperations:
         self._refresh_workspace()
         self._status(describe_clip_run(pairs, clips=clips, skipped=skipped))
 
+    def measure_videos(self, videos) -> int:
+        """Fill in ``num_frames``/``fps`` for videos that have never been read.
+
+        Length lives in the container header, so this is a metadata read and
+        not a decode: measured on the twenty one-hour files this was written
+        for, all twenty answered in 80 ms total, 4 ms each.
+
+        It exists because the alternative was worse than slow, it was silent.
+        A scope with one unmeasured video quoted no total at all, so the
+        dialog that decides how much work to start opened on "Total length
+        appears once every video in scope has been read." on the one day it
+        matters - the day the project was created and nothing had been opened
+        yet - and the run began with no number ever shown.
+
+        Returns how many videos it measured, so a caller can tell whether
+        anything changed.
+        """
+        try:
+            import cv2
+        except ImportError:  # pragma: no cover - the GUI cannot run without it
+            return 0
+        from .video_source import probe_capture
+
+        done = 0
+        for video in videos:
+            if video.num_frames or video.path is None:
+                continue
+            try:
+                if not Path(video.path).exists():
+                    continue
+                cap = cv2.VideoCapture(str(video.path))
+                if not cap.isOpened():
+                    cap.release()
+                    continue
+                probe = probe_capture(cap, default_fps=video.fps or 25.0)
+                cap.release()
+            except Exception:  # noqa: BLE001 - an unreadable file is not fatal
+                continue
+            if probe.num_frames > 0:
+                video.num_frames = int(probe.num_frames)
+                video.fps = float(probe.fps)
+                video.width = int(probe.width) or video.width
+                video.height = int(probe.height) or video.height
+                done += 1
+        return done
+
     def scope_summary(self, scope):
         """``(label, frames, fps, count)`` for what a scope covers.
 
@@ -594,6 +700,7 @@ class WorkspaceOperations:
         videos = list(project.scope(scope, self._video_session.video_id))
         if not videos:
             return ("No videos in this scope", 0, 25.0, 0)
+        self.measure_videos(videos)
         # A video is measured when it is first read, so a scope can hold
         # videos with no frame count yet. Summing over them anyway quotes
         # "3 videos, 40 frames" for three 40-frame videos, which is worse
@@ -663,6 +770,10 @@ class WorkspaceOperations:
             target=runner.run, args=(videos, options, emit), daemon=True, name="yoake-project-batch"
         )
         self._batch_thread.start()
+        self.note_activity(
+            f"Started {'finding animals in' if options.detect else 'scanning'} "
+            f"{len(videos)} video{'s' if len(videos) != 1 else ''}."
+        )
         return True
 
     def stop_project_batch(self):
@@ -684,13 +795,27 @@ class WorkspaceOperations:
             video = project.videos[result.video_id]
             if result.status == "failed":
                 video.ui["last_failure"] = result.error
+                # One failed video in a run of twenty is the failure most
+                # likely to go unnoticed: the dialog keeps going, the other
+                # nineteen succeed, and the only trace is a field on a record
+                # nobody opens. So it is also said out loud, once, where the
+                # Activity window will still have it tomorrow.
+                self.note_activity(
+                    f"{result.video_id} failed: {result.error}", failed=True
+                )
                 return
             video.ui.pop("last_failure", None)
             video.fps, video.num_frames = result.fps, result.num_frames
             video.width, video.height = result.width, result.height
-            if options.detect:
-                self._merge_video_candidates(video, result.candidates)
-            self._check_session(video)
+            # A sampling run's boxes arrive on the ``finished`` event instead,
+            # because until every video has been scanned the sampler has not
+            # chosen and :func:`batch.keep_chosen` has nothing to trim against.
+            # Merging here would put the whole scan in the Review Inbox and
+            # then leave it there: nothing removes a candidate once merged.
+            if not options.sample:
+                if options.detect:
+                    self._merge_video_candidates(video, result.candidates)
+                self._check_session(video)
             video.touch()
             self._dirty = True
             self._save_due = time.time() + 4
@@ -705,6 +830,16 @@ class WorkspaceOperations:
                 if result.selection is not None:
                     video = project.videos[result.video_id]
                     video.selection = result.selection
+                    # The trimmed boxes, and the checks run over the frames
+                    # they are actually on. Nothing was merged for this video
+                    # while the batch was running (see the ``video`` branch).
+                    if options.sample and not event["cancelled"]:
+                        chosen = sorted(result.selection.frame_set())
+                        if options.detect:
+                            self._merge_video_candidates(video, result.candidates)
+                        self._check_session(
+                            video, frames=sorted(set(chosen) | set(video.annotations))
+                        )
                     video.touch()
                     project.sampling_log.append(
                         {
@@ -716,19 +851,29 @@ class WorkspaceOperations:
                             "time": time.time(),
                         }
                     )
+            # A stopped sampling run chose nothing, so nothing was trimmed and
+            # nothing was merged. Saying "results were kept" would be a lie
+            # about the Review Inbox; what was actually kept is the cached
+            # scan, which is the thing that makes the next attempt fast.
+            kept = (
+                "The frames it already looked at are kept, so starting again "
+                "is quick."
+                if options.sample
+                else "Results from completed videos were kept."
+            )
             if getattr(self, "_smart_running", False):
                 self._smart_running = False
                 if event["cancelled"]:
-                    self.smart_dialog.stopped("Stopped. Results from completed videos were kept.")
+                    self.smart_dialog.stopped(f"Stopped. {kept}")
                 else:
                     self._report_batch_finished(event)
             self._save_due = time.time() + 4
             self._render_timeline()
             self._refresh_workspace()
             self._status(
-                "Project operation cancelled; completed videos kept."
+                f"Project operation cancelled. {kept}"
                 if event["cancelled"]
-                else "Project operation finished. Review suggestions or open a sampled frame."
+                else "Project operation finished. Review the candidates, or open a chosen frame."
             )
 
     def _report_batch_progress(self, event):
@@ -818,10 +963,22 @@ class WorkspaceOperations:
                     additions.append(candidate)
             video.review.add_frame(frame, additions)
 
-    def _check_session(self, video):
+    def _check_session(self, video, *, frames=None):
+        """Re-run the checks over this video's pending candidates.
+
+        ``frames`` is the list the checks are allowed to have an opinion
+        about, and leaving it out means *all of them*. That default is right
+        for a dense pass and wrong for everything else: a check that reports
+        "the detector found nothing here" over the frames no detector ever ran
+        on is not a finding, it is the stride. A round now looks at one frame
+        in sixty and keeps a hundred of them, so the caller passes the frames
+        the boxes are on, plus the ones a human has already annotated.
+        """
         candidates = video.review.pending_candidates() if video.review is not None else {}
         parts = tracklet.build_tracklets(candidates, max_gap=self.quality_config.fragment_gap)
-        items = check_video(candidates, video.annotations, self.quality_config, video.num_frames)
+        items = check_video(
+            candidates, video.annotations, self.quality_config, video.num_frames, frames=frames
+        )
         items = [replace(i, video_id=video.video_id) for i in items]
         carried = {
             (video.video_id, *key) if len(key) == 4 else key: value
@@ -913,7 +1070,7 @@ class WorkspaceOperations:
                             frame,
                             frame,
                             ids,
-                            detail="Accept or reject the suggestions on this frame.",
+                            detail="Accept or reject the candidates on this frame.",
                             video_id=video.video_id,
                         )
                     )

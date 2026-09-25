@@ -72,7 +72,8 @@ def two_flies():
 # ══════════════════════════════════════════════════════════════════════════
 
 MODULES = ("status", "tracklet", "quality", "review_queue", "intervals",
-           "features", "sampling", "propagation", "cache")
+           "features", "sampling", "propagation", "cache", "release",
+           "finalpass")
 
 
 def _imports(name):
@@ -982,3 +983,56 @@ def test_infinite_distance_survives_serialisation(tmp_path):
     assert store.put(key, "features", [feature])
     restored = store.get(key, "features")
     assert restored[0]["frame"] == 0
+
+
+# ── the cold start: no detections, so two score columns say nothing ──────
+
+def _unlabelled_scan(n=800, dim=8, seed=0):
+    """A scanned video with appearance but no detections at all.
+
+    Every new project starts here: no checkpoint has run, so ``FrameFeature``
+    keeps its defaults and ``uncertainty`` and ``interaction`` are constant.
+    Vectors are L2-normalised because :func:`features.distance` is cosine and
+    assumes it.
+    """
+    import math
+    import random
+
+    rnd = random.Random(seed)
+
+    def unit():
+        v = [rnd.gauss(0.0, 1.0) for _ in range(dim)]
+        norm = math.sqrt(sum(x * x for x in v)) or 1.0
+        return tuple(x / norm for x in v)
+
+    return [features.FrameFeature(frame=i * 15, embedding=unit()) for i in range(n)]
+
+
+@pytest.mark.parametrize("strategy", [sampling.UNCERTAINTY, sampling.INTERACTION,
+                                      sampling.DIVERSITY_UNCERTAINTY])
+def test_a_flat_score_column_does_not_return_the_opening_of_the_video(strategy):
+    """With nothing detected, ranking a constant column is ``range(k)``.
+
+    Every strategy breaks ties by index, so a column that is the same for all
+    frames sorts into frame order and the "informative" selection is the first
+    k frames — the opening thirty seconds of a one-hour video, returned with no
+    indication that the signal was absent. Appearance still carries
+    information, so the flat column falls through to diversity.
+    """
+    ctx = sampling.SamplingContext(features=_unlabelled_scan(), seed=3)
+    chosen = sampling.select_frames(ctx, 65, strategy=strategy)
+
+    assert len(chosen) == 65
+    assert chosen != list(range(65)), "this is the bug: pure index order"
+    assert max(chosen) > 600, "the back half of the video must be reachable"
+    runs = sum(1 for a, b in zip(chosen, chosen[1:]) if b - a == 1)
+    assert runs < 30, "a third of the picks adjacent means it is still ranking noise"
+
+
+def test_flat_interaction_clips_do_not_all_come_from_the_opening():
+    ctx = sampling.SamplingContext(features=_unlabelled_scan(), seed=3)
+    clips = sampling.select_clips(ctx, 8, clip_frames=40, strategy=sampling.INTERACTION)
+
+    assert len(clips) == 8
+    assert max(c.start for c in clips) > 4000, \
+        "eight clips from the first minutes is what a constant score buys"

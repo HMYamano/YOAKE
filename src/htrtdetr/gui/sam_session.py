@@ -63,6 +63,35 @@ class SamSessionMixin:
     def _sam_ready(self) -> bool:
         return self._sam_client is not None and self._sam_client.is_running()
 
+    def _set_find_all_available(self, available: bool, reason: str = "") -> None:
+        """Dim or restore *Find every ... in this frame* after a probe.
+
+        Called only once the helper has actually been asked for and answered.
+        Before that the button stays live on purpose: pressing it *is* the
+        request to start the helper, and a control that refuses until you have
+        found some other control to press first is the dead-looking button
+        this replaced.
+
+        The two negative answers differ and both are worth saying: no
+        interpreter here can run a helper at all, or one is running but this
+        backend cannot turn a word into boxes.
+        """
+        inspector = getattr(self, "inspector", None)
+        setter = getattr(inspector, "set_find_all_available", None)
+        if setter is None:
+            return
+        if not available and not reason:
+            backend = getattr(self._sam_client, "backend_name", "") or "This"
+            reason = (
+                f"{backend} can fit a box to an animal you click, but it "
+                f"cannot find animals from a description. Press C and click "
+                f"them one at a time instead."
+            )
+        try:
+            setter(bool(available), reason)
+        except Exception:  # noqa: BLE001  - a UI hint must never break a start
+            pass
+
     def set_click_backend(self, name: str) -> None:
         """フィットに使うバックエンドを切り替える。
 
@@ -71,6 +100,8 @@ class SamSessionMixin:
         """
         if name not in ("auto", *click_segment.BACKENDS):
             name = "local"
+        if name == "auto":
+            self._click_auto_attempted = False
         if name == "sam" and not self._sam_ready():
             # The start is asynchronous now, so whether it worked is not known
             # here. Selecting the backend optimistically keeps the window
@@ -79,7 +110,8 @@ class SamSessionMixin:
         if name == "model" and not self._predictions:
             self._status(
                 "No model predictions are loaded. Use File > Load Predictions "
-                "for Click to Box... first, or keep the Local (OpenCV) fit."
+                "> As boxes for Click animal... first, or keep the Local "
+                "(OpenCV) fit."
             )
             name = "local"
         self._click_backend = name
@@ -100,7 +132,46 @@ class SamSessionMixin:
         if not ok and self._click_backend == "sam":
             self.set_click_backend("local")
 
-    def _start_sam(self, on_done: Optional[Callable[[bool], None]] = None) -> bool:
+    def _prepare_auto_click(self, x: float, y: float) -> bool:
+        """Start assistance on the first click and resume only on the same image."""
+        if self._click_start_pending:
+            self._status("Preparing click assistance. Your first click is queued; please wait.")
+            return True
+        if (
+            self._sam_ready()
+            or self._predictions.get(self.current_frame_idx)
+            or self._click_auto_attempted
+        ):
+            return False
+
+        self._click_auto_attempted = True
+        self._click_start_pending = True
+        frame = self._current_bgr
+        context = (
+            self.current_frame_idx, self._tool,
+            getattr(self, "active_class_id", 0), self.active_track_id,
+        )
+
+        def resume(ok: bool) -> None:
+            self._click_start_pending = False
+            current = (
+                self.current_frame_idx, self._tool,
+                getattr(self, "active_class_id", 0), self.active_track_id,
+            )
+            if self._current_bgr is not frame or current != context or self._click_backend != "auto":
+                self._status("Selection changed; the queued click was cancelled. Click an animal to continue.")
+                return
+            if not ok:
+                self._status("Using basic click fitting. Check the box, or press W to draw it by hand.")
+            self._click_to_box(x, y)
+
+        self._status("Preparing click assistance (first use may take a minute). Your click will run when ready.")
+        self._start_sam(on_done=resume, report_failure=False)
+        return True
+
+    def _start_sam(
+        self, on_done: Optional[Callable[[bool], None]] = None, *, report_failure: bool = True
+    ) -> bool:
         """SAM ヘルパーを遅延起動する。使うと言われて初めて探索します。
 
         probe も起動も**この瞬間まで一切走りません**。torch のあるインタプリタを
@@ -125,11 +196,13 @@ class SamSessionMixin:
         if on_done is not None:
             self._sam_on_ready.append(on_done)
         if self._sam_starting:
+            self._sam_report_failure = self._sam_report_failure or report_failure
             return False
+        self._sam_report_failure = report_failure
         self._sam_starting = True
         self._sam_start_token += 1
         token = self._sam_start_token
-        self._status("Looking for a Python with PyTorch...")
+        self._status("Preparing annotation assistance (first use may take a minute)...")
         threading.Thread(
             target=self._sam_start_worker, args=(token,), daemon=True
         ).start()
@@ -184,10 +257,22 @@ class SamSessionMixin:
         waiting, self._sam_on_ready = self._sam_on_ready, []
         if client is None:
             self._sam_client = None
-            reason = error or cap.reason
-            self._status(
-                (reason.splitlines() or ["The segmentation helper did not start."])[0]
-            )
+            reason = error or cap.reason or "The segmentation helper did not start."
+            # The whole reason, not its first line. ``sidecar.locked_reason``
+            # writes three: the cause, the command that fixes it, and - the
+            # one that actually matters here - "you can keep working without
+            # it, press C and click an animal". Taking ``[0]`` threw the third
+            # away, so a biologist on the documented GUI install (no torch, no
+            # sam2) read one line about PyTorch and concluded the app needed a
+            # model. It does not: the default click backend is a local OpenCV
+            # fit that needs nothing installed.
+            # Dialog first, status line second: ``_show_unavailable`` writes a
+            # status of its own, and the one-line summary is the one that has
+            # to survive (tests/test_gui_click_segment.py pins it).
+            if self._sam_report_failure:
+                self._show_unavailable("The segmentation helper", reason)
+            self._set_find_all_available(False, reason)
+            self._status((reason.splitlines() or [reason])[0])
         else:
             self._sam_client = client
             self._arm_sam_pump()
@@ -202,6 +287,7 @@ class SamSessionMixin:
                 if detail
                 else "Segmentation helper ready."
             )
+            self._set_find_all_available("concept" in getattr(client, "capabilities", ()))
         ok = client is not None
         for callback in waiting:
             try:
@@ -216,6 +302,7 @@ class SamSessionMixin:
         # waiting on it runs after they said no.
         self._sam_start_token += 1
         self._sam_starting = False
+        self._click_start_pending = False
         self._sam_on_ready = []
         self._sam_jobs.clear()
         self._sam_waiting = False
@@ -331,7 +418,7 @@ class SamSessionMixin:
 
     def _on_frame_changed_for_sam(self) -> None:
         """フレームが変わったときに呼ぶ。投機 encode の予約だけ置く。"""
-        if self._click_backend != "sam" or not self._sam_ready():
+        if self._click_backend not in ("sam", "auto") or not self._sam_ready():
             return
         self._sam_embed_due = time.monotonic() + SAM_EMBED_DELAY
         self._arm_sam_pump()

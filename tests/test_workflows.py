@@ -146,8 +146,19 @@ def app(viewport, video, tmp_path):
 
 
 def _pump(app, frames: int = 2) -> None:
+    """One turn of the render loop, including the deferred work it carries.
+
+    ``_tick_copilot`` is in that loop for the same reason ``_pump_ui`` is:
+    accepting a candidate schedules the re-analysis rather than running it
+    inline (it costs 0.8 s on an hour of video, and a held-down Y key used to
+    buy one of those per frame). A test that accepts and then reads the review
+    queue has to give the loop the same chance the window does, so the clock
+    is wound past the quiet period here rather than slept through.
+    """
     for _ in range(frames):
         app._pump_ui()
+        app._copilot_due = 0.0
+        app._tick_copilot()
         dpg.render_dearpygui_frame()
 
 
@@ -585,7 +596,16 @@ def test_every_control_fits_inside_the_default_viewport(app):
     and every status message were unreachable until the user resized the
     window. The bottom reservation is derived from the timeline's real height
     now, and this asserts the result rather than the arithmetic.
+
+    The reflow is explicit because this fixture builds the window directly
+    rather than through ``run()``, so nothing has wired
+    ``set_viewport_resize_callback``. The real app gets this call from the
+    toolkit the moment the OS clamps the window to the display - which it does
+    here, asking for 820 and being given 561 - and without it the test would be
+    measuring a layout built for a viewport that never existed.
     """
+    app._on_viewport_resize()
+    _pump(app, 2)
     height = dpg.get_viewport_client_height()
     width = dpg.get_viewport_client_width()
     for tag in ("canvas", "timeline", "navbar", "statusbar"):
@@ -700,10 +720,21 @@ def test_accepting_in_review_mode_advances_to_the_next_item(app, predictions):
 
 
 def _at(app, image_x, image_y):
-    """Pretend the cursor is over this image pixel."""
+    """Pretend the cursor is over this image pixel.
+
+    The timeline is stubbed out as well as the canvas, and it has to be:
+    ``_on_mouse_press`` gives the timeline first refusal through
+    ``_begin_scrub``, and ``timeline.hovered()`` asks dearpygui where the
+    **real** mouse pointer is. Stubbing only the canvas therefore left these
+    tests reading the operator's cursor: with the pointer resting over the
+    timeline strip of the test window every press was swallowed as a scrub,
+    every draw produced no box, and the failure moved around depending on how
+    many tests had run and where the window had been placed.
+    """
     cx, cy = app._i2c(image_x, image_y)
     app._is_over_canvas = lambda: True
     app._get_canvas_mouse = lambda: (cx, cy)
+    app.timeline.hovered = lambda: False
     return cx, cy
 
 
@@ -859,3 +890,116 @@ def test_every_tool_reachable_by_key_has_mouse_behaviour(app):
             assert len(boxes) >= 1, "Click to Box must not lose the frame"
         else:  # select
             assert len(boxes) == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Workflow F — accepting in bulk stays responsive
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The re-analysis behind the Review Inbox is a whole-video computation: nine
+# detectors over every pending candidate, plus the tracklet index and the
+# interval merge. Measured on this project's own scale - one hour at 30 fps,
+# detections every 15th frame, four animals - it costs about 0.8 s, and it
+# used to run once per accepted candidate. Holding Y down through fifty frames
+# bought fifty full re-analyses of the same video.
+#
+# So the accept path schedules it. These tests pin the two halves of that
+# bargain: the accept itself must still be immediate and complete, and the
+# analysis must actually catch up.
+
+def test_accepting_does_not_re_analyse_once_per_candidate(app, predictions):
+    """A burst of accepts is one rebuild, not one per accept."""
+    app.import_predictions(predictions)
+    _pump(app)
+
+    calls = []
+    real = type(app).rebuild_copilot
+    type(app).rebuild_copilot = lambda self: (calls.append(1), real(self))[1]
+    try:
+        for frame in range(0, 40):
+            app.goto_frame(frame)
+            app.accept_frame()
+        assert not calls, "accepting rebuilt the copilot inline"
+        assert app._copilot_dirty, "nothing was scheduled either"
+        _pump(app)
+        assert len(calls) == 1, f"{len(calls)} rebuilds for one burst of accepts"
+    finally:
+        type(app).rebuild_copilot = real
+
+
+def test_the_accept_itself_is_still_immediate(app, predictions):
+    """Deferring the analysis must not defer the boxes.
+
+    What the user is looking at - the canvas, the saved annotations, the undo
+    entry - is microseconds of work and stays synchronous. Only the analysis
+    that feeds the Inbox waits.
+    """
+    app.import_predictions(predictions)
+    _pump(app)
+    app.goto_frame(20)
+    pending = len(app.candidates_here())
+    assert pending, "the fixture must have candidates on this frame"
+
+    before = len(app.annotations.get(20, []))
+    app.accept_frame()
+    assert len(app.annotations.get(20, [])) == before + pending, (
+        "the boxes did not land until the scheduled rebuild"
+    )
+    assert not app.candidates_here(), "they are still drawn as proposals"
+    assert app._undo, "one undo entry, right away"
+
+
+def test_the_scheduled_rebuild_reaches_the_review_inbox(app, predictions):
+    """The Inbox catches up on its own, without another click.
+
+    Identity, not length: ``rebuild_copilot`` builds a fresh
+    :class:`ReviewQueue` and carries the decisions across by content key, so a
+    rebuild that changed nothing the user can see still replaced the object.
+    That is exactly what has to happen for the Inbox to be looking at the
+    current analysis rather than the one from before the accept.
+    """
+    app.import_predictions(predictions)
+    _pump(app)
+    assert len(app._queue), "the fixture plants defects, so there is something to review"
+    before = app._queue
+
+    targets = app._pending_targets(range(FRAMES))
+    assert targets
+    app._accept_targets(targets)
+    assert app._copilot_dirty
+    assert app._queue is before, "the accept re-analysed inline after all"
+
+    _pump(app)
+    assert not app._copilot_dirty, "the tick never ran the scheduled rebuild"
+    assert app._queue is not before, "the Inbox is still showing the stale queue"
+    assert app.inbox.queue is app._queue, "the Inbox was not handed the new one"
+
+
+def test_switching_video_does_not_reuse_the_other_ones_timeline(app, predictions):
+    """A frame count is not an identity.
+
+    This study is twenty recordings of one hour each. Keying the reuse of the
+    timeline model on ``num_frames`` would have drawn a freshly opened video
+    with the previous one's annotations until something forced a rebuild.
+    """
+    app.import_predictions(predictions)
+    _pump(app)
+    assert app._timeline_model_video is not None
+    built_for = app._timeline_model_video
+
+    app._timeline_model_video = "some other video of the same length"
+    app._render_timeline(playhead_only=True)
+    assert app._timeline_model_video == built_for, (
+        "the light path reused a model built for a different video"
+    )
+
+
+def test_a_pending_rebuild_is_visible_to_the_user(app, predictions):
+    """A deferral nobody can see reads as a click the window ignored."""
+    app.import_predictions(predictions)
+    _pump(app)
+    app.goto_frame(20)
+    app.accept_frame()
+    assert "Re-checking the candidates" in app.running_jobs()
+    _pump(app)
+    assert "Re-checking the candidates" not in app.running_jobs()

@@ -58,13 +58,14 @@ class VideoBrowser:
                     dpg.add_button(label="Select visible", callback=self._select_visible)
                     dpg.add_button(label="Clear selection", callback=self._clear_selection)
                 with dpg.group(horizontal=True):
-                    dpg.add_button(
-                        label="Pre-label with the model...",
-                        callback=lambda: self.app.open_smart_annotate("auto", "project"),
-                    )
+                    # One button, not two. "Pre-label with the model..." next
+                    # to it opened the same window with one checkbox already
+                    # ticked - and with no checkpoint, that checkbox is hidden
+                    # before the window is drawn, so the two were the same
+                    # click under two names on the day it mattered most.
                     dpg.add_button(
                         label="Pick frames to label...",
-                        callback=lambda: self.app.open_smart_annotate("sample", "project"),
+                        callback=lambda: self.app.open_smart_annotate("project"),
                     )
                     dpg.add_button(
                         label="Quality Check",
@@ -110,7 +111,7 @@ class VideoBrowser:
                 "Video",
                 "Status",
                 "Visited",
-                "Suggestions / issues",
+                "Candidates / issues",
                 "Last frame",
                 "Duration",
                 "File",

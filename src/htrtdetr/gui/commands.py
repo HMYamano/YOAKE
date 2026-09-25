@@ -145,3 +145,29 @@ def analyze_command(
     return build_analyze_command(
         mode, output_dir, predictions=predictions, annotation=annotation
     )
+
+
+# ─── the workflow window ──────────────────────────────────────────────────
+#: Pages ``python -m htrtdetr.gui --page`` accepts, as the annotator names
+#: them. They are the aliases :func:`htrtdetr.gui.hub._page_meta` already
+#: resolves, so this list cannot invent a destination the hub does not have.
+WORKFLOW_PAGES: tuple = ("workflow", "label", "train", "analyze")
+
+
+def workflow_command(page: str = "", project_dir: str = "") -> List[str]:
+    """``python -m htrtdetr.gui --page train --project <dir>``。
+
+    唯一のGUI起動コマンド生成器。他の関数と違い ``htrtdetr.cli`` ではなく
+    ``htrtdetr.gui`` を返す —— 学習と解析はハブのページであってCLIの一発実行
+    ではないため (データセット変換・split・stage選択・monitorが要る)。
+
+    ``page`` に未知の名前を渡した場合はページ指定を落とす。存在しない
+    ``--page`` でハブが起動に失敗するより、既定の Workflow ページで開くほうが
+    「押したのに何も出ない」より正直だから。
+    """
+    cmd = ["-m", "htrtdetr.gui"]
+    if page and str(page).lower() in WORKFLOW_PAGES:
+        cmd += ["--page", str(page).lower()]
+    if project_dir:
+        cmd += ["--project", str(project_dir)]
+    return cmd

@@ -110,7 +110,9 @@ class EditHistoryMixin:
         if target != self.current_frame_idx and 0 <= target < max(self.num_frames, 1):
             self.goto_frame(target)
         self._mark_dirty()
-        self.rebuild_copilot()
+        # Scheduled: an undo can restore hundreds of frames and the user may
+        # well press Ctrl+Z again straight away.
+        self.schedule_copilot_rebuild()
         self._refresh_sidebar()
         self._render_canvas()
         self._refresh_history_ui()

@@ -523,6 +523,18 @@ class TrainConfig:
     val_interval: int = 1            # epoch interval
     save_best: bool = True
     save_last: bool = True
+    # checkpoint に optimizer / scheduler の state を含めるか。
+    #
+    # True (既定) は ``train.resume`` できる完全な checkpoint。Adam は
+    # パラメータ 1 つにつきモーメントを 2 つ持つので、これが checkpoint の
+    # 大半を占める: stage 1 のモデルは 24.6M param = 94 MB (fp32) だが、
+    # 実測で best.pth は 249 MB、last.pth は 348 MB になる。
+    #
+    # False は重みだけ。アクティブラーニングのラウンドはこちらを使う。
+    # ラウンドは resume しない (次のラウンドは ``init_weights`` で重みだけを
+    # 引き継ぎ、optimizer も epoch もスケジュールも作り直す) ので、残りは
+    # 一度も読まれないまま毎エポック書かれるだけである。
+    save_optimizer_state: bool = True
     # wandb (optional)
     use_wandb: bool = False
     wandb_project: str = "ht-rtdetr"
