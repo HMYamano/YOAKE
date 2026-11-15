@@ -15,10 +15,18 @@ that every request for a clip reports the **same window**.
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
 from htrtdetr.annotation.objects import AnnObject
 from htrtdetr.gui import video_segment as vs
+
+#: The live test needs SAM 2's video predictor in this interpreter. Without it
+#: the helper still starts - sam2 is imported lazily - and answers ``hello``
+#: without ``video``, so the test must not rely on a start failure to skip.
+_SAM2_HERE = all(importlib.util.find_spec(m) is not None
+                 for m in ("sam2", "huggingface_hub", "torch"))
 
 
 def obj(x0, y0, x1, y1, **kw):
@@ -362,6 +370,8 @@ def test_a_stopped_helper_does_not_block_the_button():
 
 
 @pytest.mark.live_model
+@pytest.mark.skipif(not _SAM2_HERE,
+                    reason="sam2 + huggingface_hub not installed in this interpreter")
 def test_one_export_serves_two_animals():
     """The correctness half of the measurement: both animals get covered.
 
@@ -401,6 +411,11 @@ def test_one_export_serves_two_animals():
         client.start(timeout=300)
     except sidecar.SidecarError as exc:
         pytest.skip(f"sam2 helper would not start: {exc}")
+    if not client.can("video"):
+        # Gate on what the helper said, not on its backend name (sidecar.CAPABILITIES).
+        client.stop()
+        shutil.rmtree(folder, ignore_errors=True)
+        pytest.skip(f"the helper cannot propagate here (capabilities: {client.capabilities})")
 
     prompt = n // 2
     try:
