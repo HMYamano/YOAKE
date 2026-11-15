@@ -602,6 +602,21 @@ class Trainer:
 
             total_loss = loss_dict.get("total_loss", loss_dict.get("loss_detection", 0.0))
 
+            if not (isinstance(total_loss, torch.Tensor) and total_loss.requires_grad):
+                # Nothing trainable produced a loss on this batch: in Stage 2 the
+                # detector is frozen, so a batch where no detection matched a
+                # label has a detection loss with no gradient and no action loss
+                # at all. Backward would raise and end the whole run; the batch
+                # simply has nothing to teach, so it is skipped and counted.
+                self._skipped_batches = getattr(self, "_skipped_batches", 0) + 1
+                if self._skipped_batches in (1, 10, 100):
+                    self.logger.warning(
+                        "%d batch(es) so far had no trainable loss and were skipped "
+                        "(no detection matched a label, or nothing trainable is unfrozen).",
+                        self._skipped_batches,
+                    )
+                continue
+
             if self.scaler is not None:
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
@@ -714,8 +729,8 @@ class Trainer:
                         output = eval_model.forward_single_frame(images)
                         last_targets = targets
                     else:
-                        output = eval_model(images)
                         last_targets = last_frame_targets(targets)
+                        output = eval_model(images, **self._sequence_kwargs(last_targets))
                     loss_dict = self.criterion(output, last_targets, stage=stage)
 
             loss = loss_dict.get("total_loss", 0.0)
@@ -928,10 +943,26 @@ class Trainer:
             images = batch["images"]        # (B, T, 3, H, W)
             targets = batch["targets"]      # BatchSequenceTargets
 
-            output = self.model(images)
+            key_targets = last_frame_targets(targets)
+            output = self.model(images, **self._sequence_kwargs(key_targets))
 
             # モデルは最終フレームについて予測するので、GT も最終フレームに揃える
-            return self.criterion(output, last_frame_targets(targets), stage=stage)
+            return self.criterion(output, key_targets, stage=stage)
+
+    def _sequence_kwargs(self, key_targets) -> Dict[str, Any]:
+        """Extra forward arguments for a sequence batch.
+
+        Keyframe-labelled data (``data.label_mode == "keyframe"``) anchors the
+        keyframe's instances to the labelled boxes, so every labelled animal
+        teaches the behavior head whether or not the detector found it yet
+        (``HTRTDETR._anchor_keyframe``). Dense data is unchanged.
+        """
+        cfg = self.full_cfg
+        if cfg is None or str(getattr(cfg.data, "label_mode", "")) != "keyframe":
+            return {}
+        if not bool(getattr(cfg.train, "anchor_keyframe_instances", True)):
+            return {}
+        return {"keyframe_targets": key_targets}
 
     def _log_epoch(
         self,

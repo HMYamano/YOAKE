@@ -71,7 +71,7 @@ def two_flies():
 # The purity contract
 # ══════════════════════════════════════════════════════════════════════════
 
-MODULES = ("status", "tracklet", "quality", "review_queue", "intervals",
+MODULES = ("status", "tracklet", "quality", "review_queue", "intervals", "keyframes",
            "features", "sampling", "propagation", "cache", "release",
            "finalpass")
 

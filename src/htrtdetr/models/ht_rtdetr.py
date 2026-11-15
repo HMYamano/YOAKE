@@ -57,6 +57,32 @@ from ..utils.misc import freeze_module, unfreeze_module
 from ..data.feature_builder import GEO_FEAT_DIM
 
 
+def _one_to_one_queries(iou: torch.Tensor) -> torch.Tensor:
+    """(Q, N) の IoU から、GT ごとに互いに異なる query を貪欲に選ぶ (N,)。
+
+    IoU の高い組から確定させる。query が GT より少ない (Q < N) 異常系では
+    残りの GT に最良の query を重複して割り当てる (落とすより安全)。
+    """
+    Q, N = iou.shape
+    chosen = torch.full((N,), -1, dtype=torch.long, device=iou.device)
+    if N == 0:
+        return chosen
+    if Q == 0:
+        raise ValueError("the detector produced no queries to anchor the keyframe labels to")
+    flat = iou.flatten().argsort(descending=True).tolist()
+    used_q: set = set()
+    for k in flat:
+        q, n = divmod(int(k), N)
+        if chosen[n] >= 0 or q in used_q:
+            continue
+        chosen[n] = q
+        used_q.add(q)
+        if len(used_q) == min(Q, N):
+            break
+    best = iou.argmax(dim=0)
+    return torch.where(chosen >= 0, chosen, best)
+
+
 # ---------------------------------------------------------------------------
 # Unified Model Output
 # ---------------------------------------------------------------------------
@@ -310,6 +336,22 @@ class HTRTDETR(nn.Module):
     def set_stage(self, stage: int) -> None:
         """外部から stage を変更する"""
         self._configure_stage(stage)
+        if self.training:
+            self.train(True)
+
+    def train(self, mode: bool = True) -> "HTRTDETR":
+        """Stage 2/3 では凍結した detector を eval のまま保つ。
+
+        ``freeze_module`` は ``requires_grad`` を落とすだけなので、Trainer が
+        ``model.train()`` を呼ぶと凍結した detector の BatchNorm も train モードに
+        なり、(1) 各時刻の小さなバッチ (B 枚) の統計で正規化された特徴と検出で
+        学習し、(2) running statistics が文脈フレームで書き換わる。推論は eval
+        (running statistics) なので学習時と特徴の意味がずれる。凍結は凍結として扱う。
+        """
+        super().train(mode)
+        if mode and self.training_stage in (2, 3):
+            self.detector.eval()
+        return self
 
     # ------------------------------------------------------------------ #
     # Forward (シーケンス入力)
@@ -320,6 +362,7 @@ class HTRTDETR(nn.Module):
         images: torch.Tensor,   # (B, T, 3, H, W)
         memory_list: Optional[List[IdentityMemory]] = None,  # 推論時のみ使用
         track_ids_per_frame: Optional[List[List[Sequence[int]]]] = None,
+        keyframe_targets: Optional[List[Dict]] = None,
     ) -> HTRTDETROutput:
         """
         窓単位の forward。
@@ -337,6 +380,12 @@ class HTRTDETR(nn.Module):
             track_ids_per_frame: teacher forcing 用の track_id。
                 ``track_ids_per_frame[b][t]`` がバッチ要素 b・フレーム t の
                 各検出に対応する track_id。None なら内部 tracker が付与する。
+            keyframe_targets: キーフレーム方式の学習 (Stage 2/4) で、最終フレーム
+                (= キーフレーム) の GT。与えると、キーフレームの検出集合を**ラベル
+                された個体そのもの**に置き換える (:meth:`_anchor_keyframe`)。
+                AVA 系の行動検出が GT 箱で行動分類器を学習するのと同じ考え方で、
+                detector が見落とした個体のラベルも行動の学習に必ず使われる。
+                文脈フレームは従来どおり detector + tracker で扱う。
 
         Returns:
             HTRTDETROutput
@@ -381,6 +430,8 @@ class HTRTDETR(nn.Module):
             )
             for fo in frame_outs
         ]
+        if keyframe_targets is not None:
+            per_frame[-1] = self._anchor_keyframe(last_out, keyframe_targets)
         det_results = per_frame[-1]   # 現フレーム (main output)
 
         # ---------------------------------------------------------------- #
@@ -454,7 +505,8 @@ class HTRTDETR(nn.Module):
         if self.training_stage in (2, 4):
             if self.behavior_enabled and self.track_aligned_temporal and aligned is not None:
                 behavior_pred = self._run_behavior(
-                    aligned, last_out, temporal_last, det_results
+                    aligned, last_out, temporal_last, det_results,
+                    frame_outs=frame_outs,
                 )
                 if behavior_pred is not None and behavior_pred.logits is not None:
                     # track 単位の予測を現フレームの検出順に並べ直す
@@ -505,6 +557,69 @@ class HTRTDETR(nn.Module):
     # ------------------------------------------------------------------ #
     # forward のヘルパー
     # ------------------------------------------------------------------ #
+
+    def _anchor_keyframe(
+        self, out: DetectionOutput, targets: List[Dict]
+    ) -> List[Dict]:
+        """キーフレームの検出を、ラベルされた個体 (GT 箱) に置き換える。
+
+        各 GT 箱について、予測箱が最もよく重なる query を 1 対 1 で選び、その
+        query 特徴 (detector が見たもの) と GT の箱を組にする。箱は GT なので
+        行動損失の IoU マッチングは必ず成立し、**ラベルを付けた個体はすべて行動の
+        学習に使われる**。detector がまだ弱い初期ラウンドでも行動の学習が止まらない。
+
+        回転が付いていない (derived) GT は角度だけ予測値を使う。theta=0 で
+        actor crop を切ると、斜めの個体が斜めのまま写るため。
+        """
+        from ..geometry.obb import aabb_to_obb
+        from ..utils.misc import box_iou, cxcywh_to_xyxy, xyxy_to_cxcywh
+
+        device = out.pred_boxes.device
+        dtype = out.pred_boxes.dtype
+        probs = F.softmax(out.pred_logits, dim=-1)[..., :-1]
+        results: List[Dict] = []
+        for b in range(out.pred_boxes.shape[0]):
+            tgt = targets[b] if b < len(targets) else {}
+            gt = tgt.get("boxes")
+            if gt is None or gt.shape[0] == 0:
+                idx = torch.zeros(0, dtype=torch.long, device=device)
+                q_boxes = None
+            else:
+                gt = gt.to(device=device, dtype=dtype)
+                iou = box_iou(cxcywh_to_xyxy(out.pred_boxes[b].detach()), gt)  # (Q, N)
+                idx = _one_to_one_queries(iou)
+                q_boxes = xyxy_to_cxcywh(gt)
+            entry: Dict[str, torch.Tensor] = {
+                "boxes": q_boxes if q_boxes is not None else out.pred_boxes[b][idx],
+                "scores": (torch.ones(idx.shape[0], device=device, dtype=dtype)
+                           if q_boxes is not None else probs[b].max(dim=-1).values[idx]),
+                "class_ids": (tgt["class_ids"].to(device).long()
+                              if q_boxes is not None and "class_ids" in tgt
+                              else torch.zeros(idx.shape[0], dtype=torch.long, device=device)),
+                "features": out.query_features[b][idx],
+                "query_indices": idx,
+            }
+            if out.pred_obb is not None:
+                if q_boxes is None:
+                    entry["obb"] = out.pred_obb[b][idx]
+                else:
+                    gt_obb = tgt.get("obb")
+                    obb = (aabb_to_obb(gt) if gt_obb is None
+                           else gt_obb.to(device=device, dtype=dtype).clone())
+                    valid = tgt.get("obb_valid")
+                    if valid is None and gt_obb is None:
+                        valid = torch.zeros(obb.shape[0], dtype=torch.bool, device=device)
+                    if valid is not None:
+                        valid = valid.to(device).bool()
+                        pred_theta = out.pred_obb[b][idx][:, 4].detach().to(dtype)
+                        obb[~valid, 4] = pred_theta[~valid]
+                    entry["obb"] = obb
+            if out.pred_keypoints is not None:
+                entry["keypoints"] = out.pred_keypoints[b][idx]
+            if out.pred_polarity is not None:
+                entry["polarity"] = out.pred_polarity[b][idx]
+            results.append(entry)
+        return results
 
     def _det_obb(self, det: Dict) -> torch.Tensor:
         """
@@ -636,13 +751,15 @@ class HTRTDETR(nn.Module):
         last_out: DetectionOutput,
         temporal_last: torch.Tensor,
         det_results: List[Dict],
+        frame_outs: Optional[List[DetectionOutput]] = None,
     ) -> Optional[BehaviorPrediction]:
         """
         BehaviorBranch を track 単位で走らせる。
 
         actor / context crop は detector の最高解像度 FPN レベルから取る
         (P2 有効なら stride 4、無効なら stride 8)。細かい姿勢を見る actor stream に
-        とって解像度が効くため。
+        とって解像度が効くため。clip tube も同じレベルを、窓の全フレームについて
+        使う (フレームごとに 1 回だけ縮約してから tube を切り出す)。
         """
         if aligned.num_tracks == 0:
             return None
@@ -672,6 +789,16 @@ class HTRTDETR(nn.Module):
                 K = self.cfg.detector.pose.num_keypoints
                 keypoints = aligned.obb.new_zeros(aligned.num_tracks, K, 3)
 
+        clip_frames = None
+        if getattr(self.behavior, "use_clip", False):
+            outs = frame_outs if frame_outs else [last_out]
+            if any(not fo.encoder_features for fo in outs):
+                return None
+            clip_frames = [
+                self.behavior.clip_encoder.reduce_frame(fo.encoder_features[0])
+                for fo in outs
+            ]
+
         return self.behavior(
             obb_history=aligned.obb,
             history_mask=aligned.mask,
@@ -680,6 +807,7 @@ class HTRTDETR(nn.Module):
             detector_features=detector_feats,
             temporal_features=temporal_last if cfg_b.use_temporal else None,
             keypoints=keypoints,
+            clip_frames=clip_frames,
         )
 
     @staticmethod

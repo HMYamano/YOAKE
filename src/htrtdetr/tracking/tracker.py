@@ -307,14 +307,17 @@ class OnlineTracker:
     # 読み出し
     # ------------------------------------------------------------------ #
 
-    def track_history(self):
+    def track_history(self, stride: int = 1):
         """
         アクティブ track の履歴を (N, T, D) で返す (HTM への入力)。
+
+        Args:
+            stride: 何フレームおきに読むか (キーフレーム学習のクリップ間隔に合わせる)
 
         Returns:
             feats, obbs, mask, ids — ``TrackFeatureCache.stacked_history`` と同じ
         """
-        return self.cache.stacked_history()
+        return self.cache.stacked_history(stride=stride)
 
     def stats(self) -> Dict[str, int]:
         s = self.cache.stats()

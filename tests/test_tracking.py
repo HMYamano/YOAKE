@@ -110,6 +110,33 @@ class TestAssociator:
         with pytest.raises(ValueError, match="重み"):
             OBBAssociator(iou_weight=0.0, appearance_weight=0.0)
 
+    def test_similarity_averages_only_the_cues_it_could_compute(self):
+        """
+        embedding の無い呼び出しで appearance の重みを分母に残すと、同一の箱でも
+        類似度が 0.5 で頭打ちになり閾値を超えない (学習時の内部 tracker が
+        一度も連結しなかった原因)。計算できた手がかりだけで平均する。
+        """
+        a = OBBAssociator()   # 既定: iou 0.5 + appearance 0.5
+        box = torch.tensor([[0.5, 0.5, 0.2, 0.1, 0.3]])
+        sim, terms = a.similarity(box, box)
+        assert "appearance" not in terms
+        assert float(sim[0, 0]) == pytest.approx(1.0, abs=1e-4)
+
+    def test_similarity_with_every_cue_is_unchanged(self):
+        """全手がかりが揃う streaming 推論の値は修正前と同じ重み付き平均。"""
+        a = OBBAssociator(iou_weight=0.5, appearance_weight=0.5)
+        box = torch.tensor([[0.5, 0.5, 0.2, 0.1, 0.3]])
+        e1 = F.normalize(torch.tensor([[1.0, 0.0]]), dim=-1)
+        e2 = F.normalize(torch.tensor([[0.0, 1.0]]), dim=-1)     # cos 0 -> 0.5
+        sim, _ = a.similarity(box, box, det_embed=e1, track_embed=e2)
+        assert float(sim[0, 0]) == pytest.approx((0.5 * 1.0 + 0.5 * 0.5) / 1.0, abs=1e-4)
+
+    def test_no_usable_cue_means_no_match_not_a_crash(self):
+        a = OBBAssociator(iou_weight=0.0, appearance_weight=1.0)
+        box = torch.tensor([[0.5, 0.5, 0.2, 0.1, 0.3]])
+        res = a.associate(box, box)     # embedding が無い -> 手がかりゼロ
+        assert res.matches == []
+
 
 # ---------------------------------------------------------------------------
 # Ring buffer
@@ -215,6 +242,28 @@ class TestOnlineTracker:
             seen.append(tuple(sorted(o.track_id for o in out)))
         assert len(set(seen)) == 1, f"ID が揺れた: {set(seen)}"
         assert seen[0] == (0, 1)
+
+    def test_default_config_links_detections_without_embeddings(self):
+        """
+        学習時の内部 tracker (``HTRTDETR._build_track_aligned``) と同じ呼び方:
+        既定の TrackingConfig、embedding なし。以前は毎フレーム新しい ID になり、
+        track 単位の履歴が 1 フレームしか無かった。
+        """
+        from htrtdetr.config.config import TrackingConfig
+
+        tr = OnlineTracker.from_config(TrackingConfig(), feat_dim=4, window=8)
+        seen = []
+        for t in range(6):
+            obb = torch.tensor([
+                [0.30 + 0.004 * t, 0.40, 0.08, 0.03, 0.3],
+                [0.70 - 0.004 * t, 0.60, 0.08, 0.03, -0.5],
+            ])
+            out = tr.update(t, obb, torch.randn(2, 4), has_obb=True)
+            seen.append([o.track_id for o in out])
+        assert seen == [[0, 1]] * 6, seen
+        _feats, _obbs, mask, ids = tr.track_history()
+        assert sorted(ids) == [0, 1]
+        assert int(mask.sum(dim=1).min()) == 6     # 6 フレームすべてが同じ track に積まれる
 
     def test_new_track_created_for_new_object(self):
         tr = self._tracker()

@@ -20,7 +20,12 @@ from .analyzer import (
 def _load_prediction_frames(predictions_path: str) -> List[tuple[int, Dict]]:
     with open(predictions_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    frames = [(int(frame_idx), payload) for frame_idx, payload in data.items()]
+    # Frame keys are integers; anything else (the ``_meta`` block streaming
+    # writes) describes the run and is not a frame.
+    frames = [
+        (int(frame_idx), payload) for frame_idx, payload in data.items()
+        if str(frame_idx).lstrip("-").isdigit()
+    ]
     frames.sort(key=lambda item: item[0])
     return frames
 

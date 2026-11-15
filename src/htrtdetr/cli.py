@@ -186,6 +186,135 @@ def _dataset_root_for(path_str: str, cfg) -> str:
     return resolve_dataset_root(path_str)
 
 
+def _resolve_label_mode(cfg, train_ann: Path, stage: int, overrides: Dict[str, Any], logger) -> str:
+    """Decide keyframe vs dense training, and write the decision into ``cfg``.
+
+    The decision is written back (``data.label_mode``, the resolved clip, and
+    ``window_size``) so it travels inside the checkpoint's config: inference
+    reads it to feed the temporal model history at the spacing it trained on.
+    """
+    from .annotation import keyframes as kf
+    from .data.annotation import load_annotation
+
+    try:
+        anno = load_annotation(str(train_ann))
+    except Exception as exc:  # noqa: BLE001 - the dataset build reports it properly
+        logger.warning("Could not read %s to decide the label mode: %s", train_ann, exc)
+        anno = None
+    mode = kf.resolve_label_mode(str(getattr(cfg.data, "label_mode", "auto")), anno)
+    cfg.data.label_mode = mode
+    if mode != kf.KEYFRAME:
+        return mode
+
+    if stage == 3:
+        logger.error(
+            "This dataset is keyframe-labelled (meta.labeling.mode = keyframe). Stage 3 "
+            "trains an identity classifier from track ids, and keyframe labels have none "
+            "on purpose: identity comes from the tracker at analysis time. Train stages "
+            "1, 2 and 4 instead. See docs/KEYFRAME_BEHAVIOR.md."
+        )
+        sys.exit(2)
+
+    clip = kf.clip_spec_of(anno) if anno is not None else kf.ClipSpec()
+    length = int(getattr(cfg.data, "clip_length", 0) or clip.length)
+    stride = int(getattr(cfg.data, "clip_stride", 0) or clip.stride)
+    clip = kf.ClipSpec(length=length, stride=stride)
+    cfg.data.clip_length, cfg.data.clip_stride = clip.length, clip.stride
+    cfg.data.window_size = clip.length
+    behavior = getattr(cfg.model, "behavior", None)
+    if behavior is not None:
+        behavior.temporal_window = clip.length
+        if getattr(behavior, "use_clip", None) is None:
+            behavior.use_clip = True
+    if anno is not None and anno.action_names:
+        # The behaviors are the dataset's, not the config default's five. A
+        # mismatch is the num_classes trap again (annotation/round.py): a
+        # behavior numbered past the head's width cannot be learned at all.
+        names = [str(n) for n in anno.action_names]
+        explicit = ((overrides.get("model") or {}).get("action_head") or {})
+        if "num_actions" not in explicit and cfg.model.action_head.num_actions != len(names):
+            logger.info(
+                "behaviors: %d (%s) - model.action_head.num_actions set to match",
+                len(names), ", ".join(names),
+            )
+            cfg.model.action_head.num_actions = len(names)
+        if len(names) == cfg.model.action_head.num_actions:
+            cfg.eval.action_names = names
+    logger.info(
+        "label mode: keyframe - clip %s; track ids are not used (identity comes from tracking)",
+        kf.describe_clip(clip),
+    )
+    if anno is not None:
+        logger.info("  %s", kf.summarize(anno, anno.action_names).sentence(anno.action_names))
+        for warning in kf.check(anno, anno.action_names, clip):
+            logger.warning("  %s", warning)
+    return mode
+
+
+def _build_keyframe_dataloaders(cfg, stage: int, img_size, loader_kwargs):
+    """Loaders over :class:`KeyframeClipDataset` - one sample per keyframe.
+
+    Stage 1 sees the keyframe alone; stages 2 and 4 see the clip ending at it.
+    Stage 2 skips keyframes with no behavior label at all: the detector is
+    frozen there, so such a clip would cost a full forward pass for no loss.
+    """
+    from torch.utils.data import DataLoader
+
+    from .annotation.keyframes import ClipSpec
+    from .data.keyframe_clip import (
+        KeyframeClipDataset,
+        collate_keyframe_clips,
+        collate_keyframe_single,
+    )
+
+    clip = ClipSpec(length=int(cfg.data.clip_length), stride=int(cfg.data.clip_stride))
+    single = stage == 1
+    train_path = resolve_annotation_path(str(cfg.data.train_root))
+    val_path = resolve_annotation_path(str(cfg.data.val_root))
+    if not val_path.exists():
+        val_path = train_path
+    common = dict(
+        clip=clip,
+        image_size=img_size,
+        frame_source=str(getattr(cfg.data, "frame_source", "auto") or "auto"),
+        single_frame=single,
+    )
+    train_ds = KeyframeClipDataset(
+        str(train_path),
+        augment=cfg.data.augment_train,
+        hflip=cfg.data.aug_hflip,
+        vflip=cfg.data.aug_vflip,
+        brightness=cfg.data.aug_brightness,
+        contrast=cfg.data.aug_contrast,
+        saturation=cfg.data.aug_saturation,
+        require_behavior=(stage == 2),
+        **common,
+    )
+    val_ds = KeyframeClipDataset(
+        str(val_path), augment=False, require_behavior=(stage == 2), **common
+    )
+    collate_fn = collate_keyframe_single if single else collate_keyframe_clips
+    num_workers = cfg.data.num_workers
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.data.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        drop_last=len(train_ds) > cfg.data.batch_size,
+        **loader_kwargs,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.data.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        **loader_kwargs,
+    )
+    return train_loader, val_loader
+
+
 def _build_dataloaders(cfg, stage: int, use_dummy: bool):
     from torch.utils.data import DataLoader
 
@@ -207,6 +336,9 @@ def _build_dataloaders(cfg, stage: int, use_dummy: bool):
         if isinstance(cfg.data.image_size, int)
         else tuple(cfg.data.image_size)
     )
+
+    if not use_dummy and str(getattr(cfg.data, "label_mode", "")) == "keyframe":
+        return _build_keyframe_dataloaders(cfg, stage, img_size, loader_kwargs)
 
     if stage == 1:
         if use_dummy:
@@ -384,8 +516,16 @@ def run_train(stage: int, argv: list) -> None:
         if not _ask_confirm("Run a DummyDataset smoke test instead?"):
             logger.error("Aborted. Set data.train_root to a real dataset before training.")
             sys.exit(1)
+    elif fmt == "json":
+        # Keyframe or dense? Decided from the annotation file (data.label_mode=auto)
+        # before the loaders and the model are built, because both depend on it.
+        _resolve_label_mode(cfg, train_ann, stage, overrides, logger)
+        if stage > 1:
+            clamp_temporal_branches(cfg)
 
     train_loader, val_loader = _build_dataloaders(cfg, stage, use_dummy)
+    if hasattr(train_loader.dataset, "report"):
+        logger.info("train: %s", train_loader.dataset.report())
     model = build_model(cfg.model)
     model.set_stage(stage)
     logger.info("Model parameters: %s", model.num_parameters())
@@ -494,6 +634,13 @@ def run_predict(argv: list) -> None:
         action_names = [str(i) for i in range(cfg.model.action_head.num_actions)]
     class_names = [str(i) for i in range(cfg.model.detector.head.num_classes)]
     window_size = int(overrides.get("window_size", cfg.data.window_size))
+    # A keyframe-trained model saw clips of ``clip_length`` frames ``clip_stride``
+    # apart; its checkpoint config says so (written back at training time), and
+    # streaming must read track history at that same spacing.
+    clip_stride = 1
+    if str(getattr(cfg.data, "label_mode", "")) == "keyframe":
+        window_size = int(overrides.get("window_size", cfg.data.clip_length or window_size))
+        clip_stride = int(overrides.get("clip_stride", cfg.data.clip_stride or 1))
     max_frames = int(overrides["max_frames"]) if "max_frames" in overrides else None
 
     # detect_only: 箱だけが欲しい呼び出し (アノテーションの候補生成) 用。
@@ -523,6 +670,7 @@ def run_predict(argv: list) -> None:
         _run_predict_streaming(
             cfg, model, source, output_dir, img_size,
             action_names, class_names, window_size, max_frames,
+            clip_stride=clip_stride,
         )
         return
 
@@ -546,6 +694,7 @@ def _run_predict_streaming(
     cfg, model, source: str, output_dir: str, img_size,
     action_names: list, class_names: list, window_size: int,
     max_frames: Optional[int],
+    clip_stride: int = 1,
 ) -> None:
     """streaming 推論で動画/画像ディレクトリを処理し、注釈動画と JSON を書く。"""
     import json
@@ -568,14 +717,28 @@ def _run_predict_streaming(
         class_names=class_names,
         window_size=window_size,
         image_size=img_size,
+        clip_stride=clip_stride,
     )
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     writer: Optional[VideoWriter] = None
-    results: Dict[str, Any] = {}
+    # ``_meta`` is not a frame: every reader skips keys that are not integers.
+    # It is what the bout analysis needs to turn frames into seconds and ids
+    # into names without being told again.
+    results: Dict[str, Any] = {"_meta": {
+        "source": str(src),
+        "action_names": list(action_names),
+        "class_names": list(class_names),
+        "label_mode": str(getattr(cfg.data, "label_mode", "") or "dense"),
+        "window": int(window_size),
+        "clip_stride": int(clip_stride),
+        "fps": None,
+    }}
 
     for frame_idx, frame_rgb, fps in frame_gen:
+        if results["_meta"]["fps"] is None and fps:
+            results["_meta"]["fps"] = float(fps)
         res = si.process_frame(frame_rgb, frame_index=frame_idx)
         results[str(frame_idx)] = res.to_json()
 
@@ -706,9 +869,45 @@ def run_analyze(argv: list) -> None:
         run_confidence_analysis(predictions, output_dir)
         return
 
+    if mode == "bouts":
+        # Keyframe scheme: per-frame behavior probabilities + tracks -> bouts.
+        predictions = str(overrides.get("predictions", ""))
+        if not predictions:
+            print("Error: mode=bouts requires predictions=")
+            sys.exit(1)
+        from .analysis.bouts import (
+            DEFAULT_MAX_GAP,
+            DEFAULT_MIN_BOUT_S,
+            DEFAULT_STAY,
+            analyze_predictions,
+        )
+
+        names = overrides.get("action_names")
+        if isinstance(names, str):
+            names = [n.strip() for n in names.split(",") if n.strip()]
+        summary = analyze_predictions(
+            predictions,
+            output_dir,
+            fps=float(overrides["fps"]) if "fps" in overrides else None,
+            stay=float(overrides.get("stay", DEFAULT_STAY)),
+            min_bout_s=float(overrides.get("min_bout_s", DEFAULT_MIN_BOUT_S)),
+            max_gap=int(overrides.get("max_gap", DEFAULT_MAX_GAP)),
+            bin_s=float(overrides.get("bin_s", 60.0)),
+            action_names=names or None,
+        )
+        overall = summary["overall"]
+        budget = ", ".join(f"{k} {v:.0%}" for k, v in overall["time_budget"].items() if v)
+        print(
+            f"Bouts: {sum(overall['bouts'].values())} across {overall['tracks']} track(s), "
+            f"{overall['tracked_seconds']:.1f} s tracked. Time budget: {budget or '-'}"
+        )
+        for name, path in summary["files"].items():
+            print(f"  {name}: {path}")
+        return
+
     print(
         f"Unknown analyze mode: {mode!r}. "
-        "Supported: timeline | distribution | id_switches | confidence"
+        "Supported: timeline | distribution | id_switches | confidence | bouts"
     )
     sys.exit(1)
 
@@ -723,7 +922,7 @@ Commands:
   train    stage=<1-4> [config=path.yaml] [key=value ...]
   val      stage=<1-4> [checkpoint=path.pth] [key=value ...]
   predict  source=<video/dir> weights=<path.pth> [key=value ...]
-  analyze  mode=<timeline|distribution|id_switches|confidence> [key=value ...]
+  analyze  mode=<timeline|distribution|id_switches|confidence|bouts> [key=value ...]
   pipeline config=<pipeline.yaml> source=<video/dir> [output_dir=path] [max_frames=N]
   project  <new|info|collect|relink> [key=value ...]   プロジェクトフォルダ操作
   gui      統一 GUI (Labeling / Training / Video Analysis) を起動する
@@ -734,6 +933,7 @@ Examples:
   yoake val stage=2 checkpoint=runs/train/stage2/weights/best.pth
   yoake predict source=data/videos/video.mp4 weights=runs/train/stage4/weights/best.pth
   yoake analyze mode=timeline predictions=runs/predict/predictions.json
+  yoake analyze mode=bouts predictions=runs/predict/predictions.json output_dir=runs/bouts
   yoake pipeline config=configs/pipeline/full_offline.yaml source=data/videos/video.mp4
   yoake project new dir="D:/studies" name="courtship 2026" videos=D:/captures
   yoake project info path="D:/studies/courtship 2026"

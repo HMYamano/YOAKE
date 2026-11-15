@@ -347,6 +347,7 @@ class TrackFeatureCache:
     def stacked_history(
         self,
         track_ids: Optional[List[int]] = None,
+        stride: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
         """
         指定 track (既定はアクティブ全件) の履歴を (N, T, ...) に積んで返す。
@@ -354,21 +355,31 @@ class TrackFeatureCache:
         これが HTM への入力になる。**時間軸は track に沿って揃っている**ので、
         HTM は「同一個体の時系列」だけを見る。
 
+        Args:
+            stride: 履歴を何フレームおきに読むか。キーフレーム学習のクリップは
+                ``stride`` フレームおきなので、streaming も同じ間隔で読まないと
+                速度・加速度の単位が学習時とずれる。トラッキング自体は毎フレーム
+                行い、読む時だけ間引く。最新フレームは必ず含まれる
+                (``window = (T-1)*stride + 1`` のとき T 本ちょうどになる)。
+
         Returns:
             feats: (N, T, feat_dim)
             obbs:  (N, T, 5)
             mask:  (N, T) bool — True が実観測
             ids:   長さ N の track_id リスト (feats の行に対応)
         """
+        stride = max(1, int(stride))
+        start = (self.window - 1) % stride
+        steps = len(range(start, self.window, stride))
         ids = track_ids if track_ids is not None else self.active_ids()
         ids = [int(tid) for tid in ids if int(tid) in self._tracks]
         if not ids:
-            empty = torch.zeros(0, self.window, self.feat_dim,
+            empty = torch.zeros(0, steps, self.feat_dim,
                                 device=self.device, dtype=self.dtype)
             return (
                 empty,
-                torch.zeros(0, self.window, 5, device=self.device, dtype=self.dtype),
-                torch.zeros(0, self.window, device=self.device, dtype=torch.bool),
+                torch.zeros(0, steps, 5, device=self.device, dtype=self.dtype),
+                torch.zeros(0, steps, device=self.device, dtype=torch.bool),
                 [],
             )
 
@@ -379,6 +390,8 @@ class TrackFeatureCache:
             if state is None:
                 continue
             f, o, v = state.history()
+            if stride > 1:
+                f, o, v = f[start::stride], o[start::stride], v[start::stride]
             feats.append(f)
             obbs.append(o)
             masks.append(v)

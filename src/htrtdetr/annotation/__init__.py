@@ -13,6 +13,8 @@ draws it does. The modules answer, in order:
 :mod:`review_queue`  The worklist over those moments: filter, navigate, decide.
 :mod:`intervals`     Behavior as spans of time, projected back onto the
                      per-frame ``action_id`` the file format already stores.
+:mod:`keyframes`     The keyframe scheme: label one image (boxes and
+                     behaviors, no track ids), take the time from the video.
 :mod:`features`      Cheap per-frame descriptors — motion, difference, focus.
 :mod:`sampling`      Given a budget, which frames and clips should a human
                      spend it on?
@@ -37,6 +39,6 @@ functions in :mod:`features` that cannot avoid them. Consequences:
 from __future__ import annotations
 
 __all__ = [
-    "status", "tracklet", "quality", "review_queue", "intervals",
+    "status", "tracklet", "quality", "review_queue", "intervals", "keyframes",
     "features", "sampling", "propagation", "cache",
 ]

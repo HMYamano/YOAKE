@@ -271,6 +271,13 @@ class BehaviorConfig:
     use_interaction: bool = True   # 個体間 interaction
     use_temporal: bool = True      # HTM の時間特徴
     use_pose: bool = False         # pose (pose head が有効なときのみ)
+    # clip tube ストリーム (YOWO の 3D 分岐に相当、tracking 非依存)。
+    # None = 自動: キーフレーム方式の学習では True、それ以外では False。
+    # 既定を False 側にしているのは、既存 checkpoint を strict に読めるようにするため
+    # (True にするとパラメータが増える)。docs/KEYFRAME_BEHAVIOR.md §6.2
+    use_clip: Optional[bool] = None
+    clip_roi_size: int = 7         # tube の各フレームの ROIAlign 解像度
+    clip_channels: int = 64        # フレームごとに圧縮した特徴のチャネル数
 
     # --- 分類器 ---
     # "single"       — 従来どおり単一 softmax (完全後方互換)
@@ -387,6 +394,17 @@ class DataConfig:
     # Sequence window の設定
     window_size: int = 16            # 1 sample あたりのフレーム数
     window_stride: int = 8           # sliding window のストライド
+    # --- キーフレーム (YOWO 型) 学習: docs/KEYFRAME_BEHAVIOR.md ---
+    # "auto" はアノテーションの meta.labeling.mode を読む。学習開始時に
+    # "keyframe" / "dense" へ解決して書き戻すので、checkpoint がどちらの方式で
+    # 学習したかを覚えており、推論はそれを見て履歴の間隔を学習時に合わせる。
+    label_mode: str = "auto"
+    # キーフレームの直前から切り出すクリップ。0 はアノテーションの
+    # meta.labeling.clip に従う (学習開始時に実際の値へ解決して書き戻す)。
+    clip_length: int = 0
+    clip_stride: int = 0
+    # "auto" (書き出し画像があればそれ、無ければ動画) | "images" | "video"
+    frame_source: str = "auto"
     # データ拡張
     augment_train: bool = True
     aug_hflip: bool = True
@@ -535,6 +553,10 @@ class TrainConfig:
     # 引き継ぎ、optimizer も epoch もスケジュールも作り直す) ので、残りは
     # 一度も読まれないまま毎エポック書かれるだけである。
     save_optimizer_state: bool = True
+    # キーフレーム方式の Stage 2/4 で、キーフレームの検出集合をラベルされた
+    # 個体 (GT 箱) に置き換えて行動を学習する (AVA 系と同じ)。False にすると
+    # detector の検出のうち GT と重なったものだけが行動の学習に使われる。
+    anchor_keyframe_instances: bool = True
     # wandb (optional)
     use_wandb: bool = False
     wandb_project: str = "ht-rtdetr"

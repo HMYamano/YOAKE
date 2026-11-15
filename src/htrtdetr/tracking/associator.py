@@ -119,7 +119,15 @@ class OBBAssociator:
             has_obb: False なら回転情報が無いとみなし、IoU は軸平行、
                      orientation 項は 0 になる (AABB detector 用の fallback)。
         Returns:
-            (sim, terms) — sim は各項の重み付き平均 ∈ [0, 1] 近傍
+            (sim, terms) — sim は**実際に計算した**各項の重み付き平均 ∈ [0, 1] 近傍
+
+        正規化の分母は「計算できた手がかりの重みの和」であって、設定された重みの
+        総和ではない。以前は後者で割っていたため、embedding を渡さない呼び出し
+        (学習時の内部 tracker、パイプラインの一部の段) では類似度が
+        ``iou_weight / 総和 × IoU`` = 既定で ``0.5 × IoU`` に頭打ちになり、閾値 0.5 を
+        決して超えなかった。結果として学習中はどの検出もフレーム間で連結されず、
+        track 単位の履歴は実質 1 フレームだった (推論は embedding を渡すので連結され、
+        学習と推論で時間特徴の意味がずれていた)。全手がかりが揃う場合の値は従来と同一。
         """
         D, T = det_obb.shape[0], track_obb.shape[0]
         device = det_obb.device
@@ -129,6 +137,8 @@ class OBBAssociator:
         if D == 0 or T == 0:
             return sim, terms
 
+        used_weight = 0.0
+
         # --- IoU ---
         if self.iou_weight > 0:
             if self.use_rotated_iou and has_obb:
@@ -137,6 +147,7 @@ class OBBAssociator:
                 iou = box_iou(obb_to_aabb(det_obb), obb_to_aabb(track_obb))
             terms["iou"] = iou
             sim = sim + self.iou_weight * iou
+            used_weight += self.iou_weight
 
         # --- Appearance ---
         if self.appearance_weight > 0 and det_embed is not None and track_embed is not None:
@@ -145,6 +156,7 @@ class OBBAssociator:
             app = (cos + 1.0) * 0.5
             terms["appearance"] = app
             sim = sim + self.appearance_weight * app
+            used_weight += self.appearance_weight
 
         # --- Motion (等速度予測との一致) ---
         if self.motion_weight > 0 and track_velocity is not None:
@@ -155,6 +167,7 @@ class OBBAssociator:
             motion = torch.exp(-dist / scale.unsqueeze(0))
             terms["motion"] = motion
             sim = sim + self.motion_weight * motion
+            used_weight += self.motion_weight
 
         # --- Orientation ---
         if self.orientation_weight > 0 and has_obb:
@@ -165,8 +178,13 @@ class OBBAssociator:
             orient = 1.0 - dtheta.abs() / (torch.pi / 2)
             terms["orientation"] = orient
             sim = sim + self.orientation_weight * orient
+            used_weight += self.orientation_weight
 
-        sim = sim / self._weight_sum
+        if used_weight <= 0:
+            # 有効な手がかりが 1 つも無い (例: appearance だけを重み付けしたのに
+            # embedding が無い)。類似度ゼロ = 全員新規として扱い、0 除算はしない。
+            return sim, terms
+        sim = sim / used_weight
 
         # --- 中心距離ゲート ---
         if self.max_center_distance > 0:

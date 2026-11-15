@@ -257,8 +257,8 @@ class TestStreamingEdgeCases:
         # Force history order to differ from detection order.
         original_history = si.tracker.track_history
 
-        def reversed_history():
-            hist, obb, mask, ids = original_history()
+        def reversed_history(stride=1):
+            hist, obb, mask, ids = original_history(stride=stride)
             return hist.flip(0), obb.flip(0), mask.flip(0), ids[::-1]
 
         si.tracker.track_history = reversed_history

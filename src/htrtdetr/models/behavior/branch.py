@@ -11,6 +11,7 @@ branch.py — BehaviorBranch: 行動認識ブランチ全体
         ├─ orient   : 体軸と移動方向の関係
         ├─ interact : 最近傍距離 / 相対速度 / facing
         ├─ temporal : HTM の時間特徴
+        ├─ clip     : context box をクリップ全体に固定した tube (tracking 非依存, 任意)
         └─ pose     : キーポイント (任意)
                 ↓
         EvidenceBehaviorHead  → 行動 + 寄与分解
@@ -26,6 +27,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from .clip import ClipTubeEncoder
 from .evidence_head import BehaviorPrediction, EvidenceBehaviorHead
 from .kinematics import KinematicsEncoder
 from .roi import ContextROIExtractor, RotatedROIExtractor
@@ -127,6 +129,19 @@ class BehaviorBranch(nn.Module):
             )
             group_dims["temporal"] = d
 
+        # --- Clip tube (YOWO の 3D 分岐に相当。None は「自動」= ここでは無効) ---
+        self.use_clip = bool(getattr(cfg, "use_clip", False))
+        if self.use_clip:
+            self.clip_encoder = ClipTubeEncoder(
+                in_channels=feature_channels,
+                out_dim=d,
+                reduced_channels=int(getattr(cfg, "clip_channels", 64)),
+                roi_size=int(getattr(cfg, "clip_roi_size", 7)),
+                context_scale=cfg.context_scale,
+                square=cfg.context_square,
+            )
+            group_dims["clip"] = d
+
         # --- Pose (任意) ---
         if cfg.use_pose and num_keypoints > 0:
             self.pose_proj = nn.Sequential(
@@ -167,6 +182,7 @@ class BehaviorBranch(nn.Module):
         detector_features: Optional[torch.Tensor] = None,  # (N, detector_dim)
         temporal_features: Optional[torch.Tensor] = None,  # (N, temporal_dim)
         keypoints: Optional[torch.Tensor] = None,          # (N, K, 3)
+        clip_frames: Optional[List[torch.Tensor]] = None,  # T x (B, c, H, W)
     ) -> BehaviorPrediction:
         """
         Args:
@@ -174,6 +190,8 @@ class BehaviorBranch(nn.Module):
             history_mask: True が実観測のフレーム
             spatial_features: actor / context crop を取る特徴マップ
             batch_index: 各 track がどのバッチ要素に属するか
+            clip_frames: clip tube 用に ``clip_encoder.reduce_frame`` を通した
+                各フレームの特徴マップ (古い → 新しい、最後がキーフレーム)
         Returns:
             BehaviorPrediction
         """
@@ -218,6 +236,13 @@ class BehaviorBranch(nn.Module):
                     "behavior.use_temporal=true には temporal_features が必要です"
                 )
             features["temporal"] = self.temporal_proj(temporal_features)
+
+        if self.use_clip:
+            if not clip_frames:
+                raise ValueError(
+                    "behavior.use_clip=true には clip_frames (各フレームの縮約特徴) が必要です"
+                )
+            features["clip"] = self.clip_encoder(clip_frames, current_obb, batch_index)
 
         if "pose" in self.group_dims:
             if keypoints is None:

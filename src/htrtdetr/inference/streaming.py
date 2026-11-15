@@ -35,8 +35,9 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -141,7 +142,14 @@ class StreamingResult:
             "scores": self.scores.tolist(),
             "track_ids": self.track_ids.tolist(),
             "action_ids": self.action_ids.tolist(),
+            "class_ids": np.asarray(self.class_ids).astype(int).tolist(),
         }
+        if self.action_probs is not None:
+            # The full distribution, not just the argmax: bout decoding along a
+            # track (analysis/bouts.py) needs to know how sure each frame was.
+            d["action_probs"] = np.round(
+                np.asarray(self.action_probs, dtype=np.float64), 4
+            ).tolist()
         if self.obb is not None:
             d["obb"] = self.obb.tolist()
         if self.context_boxes is not None:
@@ -163,9 +171,14 @@ class StreamingInferencer:
         model: 学習済み HTRTDETR
         cfg: InferenceConfig
         action_names / class_names: 表示名
-        window_size: track ごとの履歴長 (HTM の時間窓)
+        window_size: HTM に渡す履歴の長さ (フレーム数ではなく時間ステップ数)
         image_size: detector 入力サイズ (H, W)
         device: 明示指定 (None なら自動)
+        clip_stride: 履歴を何フレームおきに読むか。キーフレーム方式で学習した
+            モデルはクリップを ``stride`` フレームおきに見ているので、ここも同じ値に
+            する (``cli._run_predict_streaming`` が checkpoint の config から渡す)。
+            トラッキングは毎フレーム行い、リングバッファは
+            ``(window_size - 1) * clip_stride + 1`` フレーム分を持つ。
     """
 
     def __init__(
@@ -177,11 +190,15 @@ class StreamingInferencer:
         window_size: int = 16,
         image_size: Tuple[int, int] = (640, 640),
         device: Optional[torch.device] = None,
+        clip_stride: int = 1,
     ):
         self.cfg = cfg or InferenceConfig()
         self.action_names = action_names or ["unknown"]
         self.class_names = class_names or ["animal"]
         self.window_size = int(window_size)
+        self.clip_stride = max(1, int(clip_stride))
+        #: Frames of video one history covers, newest included.
+        self.span = (self.window_size - 1) * self.clip_stride + 1
         self.image_size = image_size
         self.logger = get_logger("streaming")
 
@@ -208,12 +225,18 @@ class StreamingInferencer:
         self.tracker = OnlineTracker.from_config(
             self.model.cfg.tracking,
             feat_dim=feat_dim,
-            window=self.window_size,
+            window=self.span,
             device=self.device,
         )
         self.memory = self.model.id_head.create_memory(self.device)
         self.latency = LatencyBreakdown()
         self._frame_index = -1
+        # clip tube 用: 各フレームの縮約特徴マップ (古い → 新しい)。
+        # フレームは detector を 1 回だけ通り、その縮約結果をここで使い回す。
+        self._use_clip = bool(
+            self.model.behavior_enabled and getattr(self.model.behavior, "use_clip", False)
+        )
+        self._clip_maps: Deque[torch.Tensor] = deque(maxlen=self.span)
 
     def _try_compile(self) -> None:
         """torch.compile を試す。失敗しても推論自体は継続する。"""
@@ -233,6 +256,22 @@ class StreamingInferencer:
         self.memory = self.model.id_head.create_memory(self.device)
         self.latency = LatencyBreakdown()
         self._frame_index = -1
+        self._clip_maps.clear()
+
+    def _clip_frames(self) -> List[torch.Tensor]:
+        """clip tube の入力: ``clip_stride`` おきの ``window_size`` 枚、最後が現フレーム。
+
+        動画の先頭でまだ足りない分は最も古いマップで埋める。学習側
+        (``ClipSpec.indices``) が先頭フレームを繰り返すのと同じ扱い。
+        """
+        maps = list(self._clip_maps)
+        if not maps:
+            return []
+        newest = len(maps) - 1
+        out = []
+        for k in range(self.window_size - 1, -1, -1):
+            out.append(maps[max(0, newest - k * self.clip_stride)])
+        return out
 
     def _autocast(self):
         if not self._use_amp:
@@ -305,6 +344,13 @@ class StreamingInferencer:
                 pred_polarity=det_out.pred_polarity,
             )[0]
 
+        if self._use_clip and det_out.encoder_features:
+            # 検出の有無に関わらず毎フレーム積む (時間軸を詰めない)。
+            with self._autocast():
+                self._clip_maps.append(
+                    self.model.behavior.clip_encoder.reduce_frame(det_out.encoder_features[0])
+                )
+
         feats = dets["features"].float()
         boxes = dets["boxes"].float()
         n = int(boxes.shape[0])
@@ -350,7 +396,9 @@ class StreamingInferencer:
 
         # --- Temporal: ring buffer の履歴を HTM に通す (再検出なし) ---
         with self.latency.measure("temporal"):
-            hist, obb_hist, mask, active_ids = self.tracker.track_history()
+            hist, obb_hist, mask, active_ids = self.tracker.track_history(
+                stride=self.clip_stride
+            )
             if hist.shape[0] > 0:
                 packed = self.model.track_temporal_fusion.pack_from_cache(hist, mask)
                 with self._autocast():
@@ -431,6 +479,11 @@ class StreamingInferencer:
                 row = row_of.get(int(tid))
                 if row is not None:
                     keypoints[row] = det_keypoints[i].float()
+        clip_frames = None
+        if self._use_clip:
+            clip_frames = [m.float() for m in self._clip_frames()]
+            if not clip_frames:
+                return empty
         with self._autocast():
             pred = self.model.behavior(
                 obb_history=obb_hist,
@@ -440,6 +493,7 @@ class StreamingInferencer:
                 detector_features=hist[:, -1] if cfg_b.use_detector_feat else None,
                 temporal_features=temporal_last if cfg_b.use_temporal else None,
                 keypoints=keypoints,
+                clip_frames=clip_frames,
             )
 
         action_ids = np.full(n, -1, dtype=int)

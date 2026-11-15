@@ -231,7 +231,8 @@ class TestPredictAnalyzeEntryPoints:
                 calls["stage"] = stage
 
         def fake_streaming(cfg, model, source, output_dir, img_size,
-                           action_names, class_names, window_size, max_frames):
+                           action_names, class_names, window_size, max_frames,
+                           clip_stride=1):
             calls["streaming"] = {
                 "output_dir": output_dir,
                 "window_size": window_size,

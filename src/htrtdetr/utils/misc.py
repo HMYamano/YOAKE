@@ -114,12 +114,27 @@ def load_model_weights(
             for k, v in state.items()
             if k.startswith(prefix_to_remove)
         }
+    mismatched: List[str] = []
+    if not strict:
+        # strict=False is the partial-load mode (warm starts, stage N from stage
+        # N-1). A tensor whose shape changed - e.g. the behavior gate after an
+        # evidence group was added - cannot be partially loaded, and
+        # load_state_dict raises on it even with strict=False. Skip it, and
+        # report it as missing, which is what it is.
+        own = model.state_dict()
+        mismatched = [
+            k for k, v in state.items()
+            if k in own and tuple(own[k].shape) != tuple(v.shape)
+        ]
+        if mismatched:
+            print(f"[WARN] Shape changed, not loaded: {mismatched}")
+            state = {k: v for k, v in state.items() if k not in set(mismatched)}
     missing, unexpected = model.load_state_dict(state, strict=strict)
     if missing:
         print(f"[WARN] Missing keys: {missing}")
     if unexpected:
         print(f"[WARN] Unexpected keys: {unexpected}")
-    return list(missing), list(unexpected)
+    return list(missing) + [k for k in mismatched if k not in missing], list(unexpected)
 
 
 # ---------------------------------------------------------------------------
