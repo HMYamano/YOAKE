@@ -82,6 +82,7 @@ Two planes coexist and remain independent:
 
 ## Key Features
 
+- **Keyframe labels, YOWO-style**: a human labels single frames - a box and a behavior for every animal, no track IDs, no intervals. Training cuts the clip that ends at each keyframe out of the video for free, identity comes from tracking at analysis time, and behavior bouts come from decoding per-frame probabilities along each track (`yoake analyze mode=bouts`). Design and prior-work comparison: [docs/KEYFRAME_BEHAVIOR.md](docs/KEYFRAME_BEHAVIOR.md).
 - **Rotated (oriented) box detection**: individuals are detected as OBBs (`cx, cy, w, h, theta`), which separate elongated animals lying close together far better than axis-aligned boxes. Angle is regressed as `sin(2θ), cos(2θ)` so the period matches the box's own period of π — the boundary discontinuity disappears by construction.
 - **Track-aligned temporal modeling**: the HTM consumes per-**track** history, not per-**query** history. DETR query indices do not identify the same individual across frames, so query-aligned sequences silently mix different animals.
 - **True streaming inference**: every frame passes the detector exactly **once**. Past frames are served from per-track ring buffers instead of being re-fed, so cost no longer scales with window size (**~4.5–6.2× faster**, detector calls 78 → 12 at window=16).
@@ -552,6 +553,10 @@ python tools/analyze.py mode=distribution \
 python tools/analyze.py mode=id_switch \
     predictions=outputs/inference/experiment_01_pred.json \
     output=outputs/analysis/experiment_01
+
+# Behavior bouts per track (keyframe-trained models): Viterbi decoding along each track,
+# time budgets, latencies, transitions, identity-free population counts
+yoake analyze mode=bouts predictions=outputs/inference/predictions.json output_dir=outputs/bouts
 
 # Detection confidence histogram
 python tools/analyze.py mode=confidence \

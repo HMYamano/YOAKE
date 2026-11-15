@@ -239,7 +239,8 @@ def test_rebound_keys_match_the_changelog():
     assert "review.discard_all" in [b.action for b in shortcuts.by_key("N")]
     assert "tool.draw_rotated" in [b.action for b in shortcuts.by_key("R")]
     assert "auto.toggle_autotrack" in [b.action for b in shortcuts.by_key("Ctrl+T")]
-    assert shortcuts.by_key("P") == ()          # P is deliberately free now
+    # P was freed by the N/P rebind and is now Play: the keyframe context loop.
+    assert [b.action for b in shortcuts.by_key("P")] == ["view.context_loop"]
 
 
 def test_actions_cover_zero_through_nine():
@@ -367,7 +368,7 @@ def test_binding_row_and_aliases():
 
 def test_changed_rows_are_three_columns():
     rows = shortcuts.changed_rows()
-    assert len(rows) == 4
+    assert len(rows) == 5       # the fifth: P plays the keyframe context loop
     for row in rows:
         assert len(row) == 3
         assert all(isinstance(cell, str) and cell for cell in row)

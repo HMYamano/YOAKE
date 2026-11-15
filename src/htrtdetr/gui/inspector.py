@@ -183,6 +183,10 @@ class InspectorContext:
     class_names: Sequence[str] = ()
     action_names: Sequence[str] = ()
 
+    #: Keyframe labelling only: how far this frame is from done, as one
+    #: sentence ("3 animals - 1 still needs a behavior."). Empty otherwise.
+    keyframe_note: str = ""
+
     @property
     def state(self) -> str:
         """VERIFIED / PREDICTED / PENDING for the selected box."""
@@ -839,7 +843,8 @@ class Inspector:
         self._set(self._t("n_frame"), f"Frame {ctx.frame:,} of {max(ctx.num_frames - 1, 0):,}")
         self._set(self._t("n_time"), _timecode(ctx.frame, ctx.fps))
         self._set(
-            self._t("n_animals"), f"{ctx.animals} animal{'s' if ctx.animals != 1 else ''} here"
+            self._t("n_animals"),
+            ctx.keyframe_note or f"{ctx.animals} animal{'s' if ctx.animals != 1 else ''} here",
         )
 
         # The count check, right where the count is shown. This is the cheapest

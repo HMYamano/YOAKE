@@ -322,6 +322,14 @@ class ProjectSession:
         )
         data.meta.setdefault("description", f"YOAKE project: {self.name}")
         data.meta.setdefault("image_root", "")
+        if self.settings.get("label_mode") == "keyframe":
+            # The file says what its frames mean, so training reads them as
+            # keyframes (docs/KEYFRAME_BEHAVIOR.md) without being told again.
+            from .keyframes import ClipSpec, set_labeling
+
+            set_labeling(data.meta, ClipSpec.from_dict(self.settings.get("clip") or {}))
+        else:
+            data.meta.pop("labeling", None)
         return data
 
     @classmethod
@@ -365,6 +373,14 @@ class ProjectSession:
             video.active_track_id = video.next_track_id
             project.videos[video.video_id] = video
         project.last_video = next(iter(project.videos), "")
+        from .keyframes import KEYFRAME, clip_spec_of, label_mode_of
+
+        if label_mode_of(data) == KEYFRAME:
+            # A file that declares keyframe labels opens as a keyframe project:
+            # its frames are keyframes, and it has no track ids to edit.
+            project.settings["label_mode"] = KEYFRAME
+            project.settings["use_track_ids"] = False
+            project.settings["clip"] = clip_spec_of(data).to_dict()
         return project
 
     def snapshot(

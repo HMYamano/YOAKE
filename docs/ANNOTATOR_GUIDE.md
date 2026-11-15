@@ -18,7 +18,7 @@ annotate --folder videos --recursive
 
 ## 最初の作業
 
-1. **Create Project** で名前・プロジェクトフォルダ・Classes・Behaviors、そして **Follow each individual across frames (track IDs)** を指定します。ラベルの並び順がIDになります。フォルダ欄は `~/YOAKE/<Project名>` が既定で、名前を変えると追従します（自分で編集すると追従を止めます）。**Copy the videos into the project folder** を選ぶと動画も取り込み、フォルダ単体で完結します。
+1. **Create Project** で名前・プロジェクトフォルダ・Classes・Behaviors、そして **What do you label?**（既定は Keyframes。Tracksを選ぶと **Follow each individual across frames (track IDs)** も指定できます）を指定します。ラベルの並び順がIDになります。フォルダ欄は `~/YOAKE/<Project名>` が既定で、名前を変えると追従します（自分で編集すると追従を止めます）。**Copy the videos into the project folder** を選ぶと動画も取り込み、フォルダ単体で完結します。
 2. **Add Files... / Add Folder...** で動画を登録します。フォルダの再帰走査は任意です。MP4、AVI、MOV、MKV、WebM、M4Vを対象にし、ドットで始まるファイルやフォルダを除外します。
 3. **Project Videos** で動画を選びます。動画を開くまで全フレームの読み込みは行いません。
 4. **Pick frames to label**（`Ctrl+R`）で最初にラベルを付けるフレームを選びます。学習済みモデルは不要です。
@@ -51,7 +51,30 @@ Timelineは動画ごとに切り替わります。全動画をつないだ一本
 
 `track_id` は動画内のIDです。動画AのTrack 1と動画BのTrack 1は別物で、自動的に同一個体へ統合しません。
 
+## キーフレームで付ける（新規Projectの既定）
+
+新しいProjectは **Keyframes** 方式で作られます（Create Projectの **What do you label?**）。考え方と先行研究との違いは [KEYFRAME_BEHAVIOR.md](KEYFRAME_BEHAVIOR.md) にあります。
+
+**人が付けるのは「選んだフレームの、全個体の箱と行動」だけです。** Track IDも行動の区間も付けません。個体の同一性は解析時のトラッキングが作り、行動のbout（始まりと終わり）は解析時にモデルのフレームごとの確率をtrackに沿って復号して得ます。学習では、各キーフレームの直前のクリップ（既定 8フレーム×4おき ≒ 1秒）を動画から切り出して時間文脈に使うので、そのためのラベルは要りません。
+
+| 操作 | 内容 |
+|---|---|
+| 箱 | いつもどおり `C` / `W` / `E`。そのフレームの**全個体**を囲みます（囲まない場所は背景として学習されます） |
+| 行動 | 箱を選んで数字キー `1`〜`9`（Inspectorの Behavior でも可）。判断できない個体は付けなくて構いません — 箱は検出の学習に使われ、行動の学習からは外れます |
+| **`P` 文脈ループ** | そのフレームの **1.0秒前〜0.5秒後** を繰り返し再生します。キーフレームの箱は輪郭だけ重なり、ループ中に数字キーを押してもラベルはキーフレームに付きます。`P` / `Esc` / キャンバスのクリック / フレーム移動で戻ります |
+| 箱の色 | 行動の色（Timelineと同じ）。行動未判定は灰色・塗りなし |
+| Inspector | 「3 animals - 1 still needs a behavior.」のように、そのキーフレームの残りを表示 |
+| Timeline | Behaviorレーンは区間ではなく、ラベルされた個体ごとの行動の目盛り。行動の例がまだ無い区間が一目で分かります |
+| Train（ラウンド） | キーフレームに加えて**クリップの文脈フレーム**も書き出し、detector（stage 1）→ 行動（stage 2、クリップ）の順に学習して後者を採用します。行動ラベルが8個未満ならdetectorだけを学習し、そう表示します |
+
+Settings > Tracking > **What do you label?** でいつでも切り替えられます。**切り替えても保存済みのTrack IDや区間は書き換えません。** 既存Project（この設定が無いもの）は **Tracks** として開きます。`meta.labeling.mode = "keyframe"` を持つ `annotations.json` を開くと Keyframes のProjectになります。
+
+学習後の解析は `yoake predict` → `yoake analyze mode=bouts predictions=... output_dir=...` です（bouts.csv / summary.json / population.csv / proximity.csv）。
+
 ## Track IDを使うか使わないか
+
+この節は **Tracks** 方式のProjectの話です（Keyframes方式では常にTrack IDを使いません）。
+
 
 個体を追わない実験（フレームごとの検出数や行動だけを見る場合）では、Track IDは「埋めろと言われ続ける欄」であり「決して発火しないチェック」です。Project設定 **use_track_ids** でProject単位に切り替えます。
 

@@ -158,6 +158,10 @@ class VideoControllerMixin:
         """
         if self.cap is None:
             return
+        if getattr(self, "context_loop_active", False):
+            # Moving to another frame ends the loop around this one; the frame
+            # about to be drawn replaces it, so nothing needs restoring.
+            self.stop_context_loop(restore=False)
         if self._advance_at_end(idx):
             return
         idx = max(0, min(idx, self.num_frames - 1))

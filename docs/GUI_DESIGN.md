@@ -831,6 +831,25 @@ collapses the timeline to one lane, and passes `inference.show_id=False` /
 `track_ids`. Loading a file with no `track_id >= 0` in it switches the box off by itself and
 says so in the run log — offering a view of data that is not there is worse than not offering it.
 
+## §0.3.9a Keyframe labelling is a project-level scheme
+
+`ProjectSession.settings["label_mode"]` — `keyframe` or `tracks` — decides what a human is
+asked for on every frame (`docs/KEYFRAME_BEHAVIOR.md`). Read through
+`AnnotationApp.label_mode` / `keyframe_mode` and written only through `set_label_mode`
+(`gui/keyframe_mode.py`); the context loop is `gui/context_loop.py`. Both live outside
+`annotator.py` because its line budget is a ratchet.
+
+| Rule | Why |
+|---|---|
+| An **absent** key reads `tracks`; the setup screen creates new projects as `keyframe` | Same reasoning as §0.3.9: a project written before the scheme existed behaves exactly as it did. |
+| In `keyframe`, `use_track_ids` reads `False` whatever the stored flag says, and the flag is not touched | Identity is the tracker's job at analysis time. Switching back to `tracks` restores what was there. |
+| Switching never rewrites saved track ids or intervals | §0.3.9's trap, again. |
+| Boxes are coloured by **behavior** (`theme.class_color(action_id)`, the colour the timeline lane uses); unanswered is grey and unfilled | One question per box - what is it doing - so colour answers it. Dashed already means "interpolated", so it is not reused for "unanswered". |
+| The behavior lane draws one tick per labelled animal, not intervals; the copilot builds no intervals | A keyframe answer is one frame. Bouts are an analysis output (`analysis/bouts.py`), not an editing unit. |
+| `P` loops 1.0 s before to 0.5 s after the frame; labels still go on the keyframe; `P`, `Esc`, a canvas click or a frame change ends it | AVA's annotators judged a keyframe from the clip around it. The loop never moves `current_frame_idx`, so "select, `P`, press a number" is one gesture. Frames are decoded once per loop (P15) and kept as BGR `uint8`. |
+| A file with `meta.labeling.mode = "keyframe"` opens as a keyframe project, and a keyframe project's export writes that block | The file says what its frames mean; training reads it with `data.label_mode=auto`. |
+| A keyframe round exports the clip frames, trains stage 1 then stage 2, adopts the stage-2 checkpoint on the **detector's** score, and keeps the detector if stage 2 is skipped or fails | §0.4.9's adoption compares like with like; a behavior F1 is recorded beside it in `rounds.json`, never compared against a detector loss. |
+
 ## §0.3.10 A project is a folder, and the folder can be moved
 
 A project used to be `annotations.json` plus an *optional* autosave directory, and everything

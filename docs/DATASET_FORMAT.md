@@ -13,6 +13,7 @@ This document describes the annotation format used by YOAKE, explains how to pre
 5. [CSV Input Format](#5-csv-input-format)
 6. [Preparing Your Own Data — Step by Step](#6-preparing-your-own-data--step-by-step)
 7. [Data Quality Guidelines](#7-data-quality-guidelines)
+8. [Keyframe Labels (`meta.labeling`)](#8-keyframe-labels-metalabeling)
 
 ---
 
@@ -338,3 +339,39 @@ Following these guidelines will improve training stability and metric reliabilit
 - JPEG is recommended for storage efficiency. Use quality setting ≥ 90 (`-q:v 2` in ffmpeg) to avoid compression artifacts affecting small animal textures.
 - PNG is acceptable but increases disk usage significantly for 1024×1024 frame sequences.
 - All images in a dataset should have the same resolution. Mixed resolutions require padding/resizing pre-processing before loading.
+
+---
+
+## 8. Keyframe Labels (`meta.labeling`)
+
+The file structure above does not change. A file can declare that its frames
+are **keyframes** — single labelled images inside a video — instead of a dense
+run of frames. Design and rationale: [KEYFRAME_BEHAVIOR.md](KEYFRAME_BEHAVIOR.md).
+
+```json
+"meta": {
+  "version": "2.0",
+  "labeling": {"mode": "keyframe", "clip": {"length": 8, "stride": 4, "anchor": "end"}}
+}
+```
+
+| Rule | Meaning |
+|---|---|
+| `frames` | Keyframes only, in any order, any spacing. Consecutive frames are **not** implied. |
+| Completeness | The boxes on a keyframe are *every* animal in it. Unboxed areas are background; a keyframe with no boxes says "nothing here". |
+| `action_id` | What the animal is doing at this instant, judged with the surrounding motion in view. `-1` = not judged: the box trains the detector and is skipped by the behavior loss. |
+| `track_id` | Not a label. Write `-1`. Identity comes from tracking at analysis time. |
+| `clip` | Training reads `length` frames `stride` apart ending at the keyframe (`anchor: "end"`), straight from the video or from an exported `images/<video_id>/<frame:06d>.jpg` tree beside the file. Positions before frame 0 repeat frame 0 and are masked. |
+
+Training resolves `data.label_mode=auto` from this block (`keyframe` or `dense`)
+and writes the result into the checkpoint's config, so `yoake predict` reads
+track history at the same spacing. Stage 3 (identity classifier) is refused for
+keyframe data. A file without `meta.labeling` is read exactly as before.
+
+Converting an older track/interval dataset:
+
+```python
+from htrtdetr.annotation.keyframes import to_keyframes
+keyframe_data = to_keyframes(old_data_dict, every=15)   # one keyframe per 15 frames, track ids dropped
+```
+

@@ -280,7 +280,7 @@ ID が入れ替わると個体別の統計は混ざるが、bout の検出その
 
 | 要素 | 振る舞い |
 |---|---|
-| 箱 | track ID 欄なし (`use_track_ids` は実効的に False)。**色は行動**、行動未判定は灰色の破線 |
+| 箱 | track ID 欄なし (`use_track_ids` は実効的に False)。**色は行動** (タイムラインと同じ色)、行動未判定は灰色・塗りなし (破線は「補間された箱」の意味で既に使われているため) |
 | 行動 | 箱を選んで数字キー `1`–`9` (既存)。Inspector の Behavior 欄 (既存) |
 | **文脈ループ** (`P`) | キーフレームの前 1.0 秒〜後 0.5 秒を繰り返し再生する。キーフレームの箱は輪郭だけ重ねて表示し、ループ中もラベルはキーフレームにしか付かない。もう一度 `P` か `Esc` で戻る。AVA の「±1.5 秒を見て 1 枚に付ける」手順をそのまま道具にしたもの |
 | タイムライン | Behavior レーンは区間ではなく**キーフレームごとの行動の目盛り** (色 = 行動) |
@@ -335,14 +335,18 @@ ID が入れ替わると個体別の統計は混ざるが、bout の検出その
 ## 11. 進捗
 
 - [x] P0 計画
-- [ ] P1 `annotation/keyframes.py`
-- [ ] P2 トラッカー正規化
-- [ ] P3 データセット + CLI
-- [ ] P4 clip tube + streaming
-- [ ] P5 bout 解析
-- [ ] P6 アノテーター
-- [ ] P7 ラウンド
-- [ ] P8 文書
+- [x] P1 `annotation/keyframes.py` — `tests/test_keyframes.py` (純粋ロジック、torch/dpg 非依存を AST で確認)
+- [x] P2 トラッカー正規化 — `tests/test_tracking.py` に再現テスト (既定設定・embedding なしで 6 フレーム同一 ID)
+- [x] P3 データセット + CLI — `tests/test_keyframe_clip.py` (フレーム番号を画素に埋めた合成動画で「正しいフレームが入っているか」まで確認)
+- [x] P4 clip tube + streaming — `tests/test_clip_stream.py`
+- [x] P5 bout 解析 — `tests/test_bouts.py`
+- [x] P6 アノテーター — `tests/test_keyframe_mode_gui.py`
+- [x] P7 ラウンド — `tests/test_keyframe_round.py` (trainer は既存テストと同じく偽装)
+- [x] P8 文書 — `DATASET_FORMAT.md` §8、`ANNOTATOR_GUIDE.md`「キーフレームで付ける」
+
+合成データでの end-to-end (CPU, 2 epoch): `train stage=1` → `train stage=2` (クリップ) →
+`predict` (checkpoint から keyframe / window / stride を復元) → `analyze mode=bouts` が通ることを確認。
+**実データ (20 本 × 1 時間のハエ動画) での学習・精度評価はまだ行っていない。**
 
 ---
 
@@ -359,6 +363,52 @@ ID が入れ替わると個体別の統計は混ざるが、bout の検出その
 4. **交尾中の重なり。** 2 匹が 1 塊に見える場面を「2 つの箱 (各々 copulation)」とするか、
    「1 つの箱 (ペア)」とするか。既定は 2 つの箱。
 5. **既存の区間ラベル。** 変換してキーフレームとして使う / 破棄する。
+
+---
+
+## 13. 実装メモ — 計画からの変更点
+
+実装中に分かったことで、計画 (§5–§8) を変えた点。
+
+1. **学習時のキーフレーム個体を GT 箱に固定する** (`HTRTDETR._anchor_keyframe`,
+   `train.anchor_keyframe_instances`, 既定 True)。最初の end-to-end で、Stage 2 は
+   「detector の検出のうち GT と IoU 0.5 以上で重なったもの」しか行動を学習しない、
+   つまり detector が見落とした個体のラベルは捨てられることが分かった (初期ラウンドでは
+   全部捨てられ、損失に勾配が無く学習が落ちた)。AVA 系の行動検出と同じく、キーフレームの
+   個体集合をラベルされた箱そのものにし、特徴は予測箱が最も重なる query から取る。
+   文脈フレームは従来どおり detector + tracker。検証時も同じ (箱が正しいときの行動分類
+   精度を測る。検出の精度は Stage 1 が測る)。
+2. **凍結した detector は eval のまま** (`HTRTDETR.train`)。`freeze_module` は
+   `requires_grad` を落とすだけで、Stage 2/3 でも BatchNorm が各時刻 B 枚の統計で正規化し、
+   running statistics も書き換わっていた。dense 方式にも効く修正。
+3. **勾配の無いバッチは飛ばす** (Trainer)。上記 1 の前は Stage 2 全体が例外で終わっていた。
+4. **`load_model_weights(strict=False)` は形の変わったテンソルを飛ばす**。clip group を
+   足すと gate の入力次元が変わり、部分読み込みのはずが例外になっていた。
+5. **行動ラウンドの長さは optimizer step で決める** (`train_operations._round_begin_behavior`)。
+   Stage 2 は行動の無いキーフレームを飛ばし、クリップはバッチ半分なので、1 pass あたりの
+   step 数が Stage 1 と違う。Trainer の 100 step warmup だけで終わらないようにした。
+6. **ラウンドの採用判定は detector のスコアのまま**。Stage 2 の macro-F1 (高いほど良い) を
+   過去ラウンドの detector 損失 (低いほど良い) と比べないため。採用されるのは Stage 2 の
+   checkpoint (同じ detector + 行動ヘッド) で、行動の F1 は `rounds.json` に別に記録する。
+   Stage 2 が失敗しても detector は採用する。
+7. **`annotator.py` の行数上限 (5100) を守るため**、キーフレーム方式の画面ロジックは
+   `gui/keyframe_mode.py`、文脈ループは `gui/context_loop.py` に置いた。
+8. **実測 (2026-11-15)**: 実データ (`fruit_fly_copulation_01.mp4`, 640x480 / 30 fps / 1 時間) から
+   ランダムなキーフレームの 8×4 クリップを動画から直接デコードすると、1 クリップ中央値 110 ms
+   (単スレッド、最大 128 ms)。ラウンドは書き出した JPEG を読むのでこの値は本学習
+   (`datasets/release/` のようなラベル+動画パスのみのデータ) のもの。キーフレーム 200 枚なら
+   1 epoch あたりデコードだけで約 22 秒なので、本学習では `data.num_workers` を上げる。
+
+## 14. 次にやること
+
+* 実データでの検証: 20 本のうち数本でキーフレーム 100–200 枚 → ラウンド数回 → 残りの動画で
+  bout を出し、手作業の区間ラベル (あれば) と比較する。clip tube の有無 (`behavior.use_clip`)
+  と track 揃えの有無の ablation がそのまま論文の表になる。
+* 行動の pre-fill: Analyze でクリップ推論を走らせ、行動候補を Y/N で確認できるようにする
+  (今は箱候補だけが出て、行動は数字キーで付ける)。
+* Pick frames to label に「行動の不確実性」と「評価用ランダムキーフレーム」を足す。
+* final pass をキーフレーム方式の「解析結果の抜き取り検証」に組み替える。
+* ハブの解析ページに bout / エソグラム表示。
 
 ---
 

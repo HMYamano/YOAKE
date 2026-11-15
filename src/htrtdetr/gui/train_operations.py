@@ -5,6 +5,8 @@ The round is four phases and three places they run:
     Saving your labels        main thread, synchronous, sub-second
     Collecting the frames     worker thread (decodes video, writes JPEGs)
     Training the detector     child process (`yoake train stage=1`)
+    Training the behaviors    child process (`yoake train stage=2`), keyframe
+                              projects only: the clips around each keyframe
     Checking what it learned  main thread, reading two small files
 
 Nothing here touches dearpygui off the main thread. The export worker reports
@@ -32,6 +34,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from ..annotation import keyframes as keyframes_mod
 from ..annotation import round as round_mod
 from ..annotation.layout import ProjectLayout
 from ..annotation.storage import atomic_json
@@ -81,6 +84,22 @@ class RoundState:
         #: adopts a new checkpoint and the next Analyze overwrites the
         #: selection, so by the time the row is written the evidence is gone.
         self.agreement: Optional[float] = None
+        #: ``detector`` (stage 1) then, for a keyframe project with enough
+        #: behavior labels, ``behavior`` (stage 2 on the clips, warm-started
+        #: from the detector). ``run_dir`` always points at the running phase.
+        self.phase = "detector"
+        self.detector_dir: Path = self.run_dir
+        #: The detector's score, kept when the run folder moves to stage 2:
+        #: adoption compares detectors across rounds, never a behavior F1
+        #: against a detector loss.
+        self.detector_score: Tuple[Optional[float], str] = (None, "")
+        self.stage1_weights = ""
+        self.behavior_epochs = 0
+        #: Why the behavior phase did not run or did not finish, for the dialog.
+        self.behavior_note = ""
+        #: Set when the behavior phase starts, so a failed one that falls back
+        #: to the detector is never started a second time.
+        self.behavior_attempted = False
 
 
 class TrainRoundMixin:
@@ -323,7 +342,16 @@ class TrainRoundMixin:
     def round_plan_sentence(self, options: Dict[str, Any]) -> str:
         plan, _holdout = self.round_plan(options)
         rows = [r for r in (self._rounds_log().get("rounds") or []) if isinstance(r, dict)]
-        return round_mod.plan_sentence(plan, rows)
+        sentence = round_mod.plan_sentence(plan, rows)
+        clip = self._round_clip()
+        if clip is not None:
+            # Said before the user commits (P17): a keyframe round is two runs.
+            sentence += (
+                " Then the behaviors train on the clip before each keyframe ("
+                + keyframes_mod.describe_clip(clip)
+                + "), which takes about as long again."
+            )
+        return sentence
 
     # ── the round log ────────────────────────────────────────────────────
     def _rounds_log(self) -> Dict[str, Any]:
@@ -464,11 +492,19 @@ class TrainRoundMixin:
 
         self.round_dialog.advance_to_step(1, "")
         project = self._sync_project()
+        clip = self._round_clip()
         inputs = [
             round_export.ExportInput(
                 video_id=video.video_id,
                 path=video.path,
-                frames=tuple(sorted(video.annotations)),
+                # A keyframe project trains on the clip that ends at each
+                # keyframe, so the context frames are exported too (once - the
+                # export skips any JPEG an earlier round already wrote).
+                frames=tuple(
+                    keyframes_mod.context_frames(video.annotations, clip, video.num_frames)
+                    if clip is not None
+                    else sorted(video.annotations)
+                ),
             )
             for video in project.videos.values()
             if video.annotations
@@ -636,14 +672,20 @@ class TrainRoundMixin:
                 except OSError:
                     pass
         root = auto_label.repo_root_for(Path(__file__))
+        behavior = state.phase == "behavior"
+        if behavior and not batch_size:
+            # A clip is ``length`` frames through the detector: half the batch.
+            batch = max(1, plan.batch_size // 2)
         cmd = [sys.executable, "-u"] + commands.train_command(
-            1,
+            2 if behavior else 1,
             str(state.train_json),
             str(state.val_json),
             str(state.run_dir),
-            epochs=plan.epochs,
+            epochs=state.behavior_epochs if behavior else plan.epochs,
             batch_size=batch,
-            extra=round_mod.train_overrides(plan, init_weights=state.init_weights),
+            extra=round_mod.train_overrides(
+                plan, init_weights=state.stage1_weights if behavior else state.init_weights
+            ),
         )
         env = auto_label.device_env(plan.device, auto_label.child_env(root))
         try:
@@ -684,6 +726,17 @@ class TrainRoundMixin:
             state.last_epoch = epoch
             value = last.get("primary_metric_value") or last.get("val_loss") or ""
             best = last.get("best_so_far") or ""
+            if state.phase == "behavior":
+                detail = f"behaviors: pass {epoch + 1} of {state.behavior_epochs}"
+                if value:
+                    detail += f" - behavior F1 {float(value):.3f}"
+                self.round_dialog.set_step(2, "running", detail)
+                self.round_dialog.set_progress(
+                    min(1.0, (epoch + 1) / max(1, state.behavior_epochs)), ""
+                )
+                if code is not None:
+                    self._round_finished(state, code)
+                return
             detail = f"pass {epoch + 1} of {state.plan.epochs}"
             if value:
                 # Stage 1 selects on validation loss, lower being better. The
@@ -751,6 +804,15 @@ class TrainRoundMixin:
             )
             return
 
+        if code != 0 and state.phase == "behavior" and "out of memory" not in (
+            self._round_log_tail(state).lower()
+        ):
+            # The detector trained fine; only the behaviors failed. Keep the
+            # detector rather than throw the whole round away.
+            tail = self._round_log_tail(state, lines=4)
+            state.behavior_note = f"The behavior model stopped with an error (code {code}): {tail}"
+            state.run_dir, state.phase = state.detector_dir, "detector"
+            code = 0
         if code != 0:
             tail = self._round_log_tail(state)
             if "out of memory" in tail.lower() and not state.retried_small_batch:
@@ -779,9 +841,76 @@ class TrainRoundMixin:
             )
             return
 
+        if self._round_begin_behavior(state):
+            return
         self.round_dialog.set_step(2, "done", f"{state.last_epoch + 1} passes")
         self.round_dialog.advance_to_step(3, "")
         self._round_adopt(state)
+
+    # ── keyframe projects: the behavior phase ────────────────────────────
+    def _round_clip(self):
+        """The project's clip, or ``None`` for a track-labelled project."""
+        if not getattr(self, "keyframe_mode", False):
+            return None
+        settings = self._ensure_project().settings
+        return keyframes_mod.ClipSpec.from_dict(settings.get("clip") or {})
+
+    def _round_begin_behavior(self, state: "RoundState") -> bool:
+        """After the detector: train the behaviors on clips, if it is worth it.
+
+        Warm-started from the detector just trained, which stage 2 keeps
+        frozen, so the checkpoint it writes carries that same detector plus a
+        behavior head. Too few behavior labels and it is skipped, said so, and
+        the detector alone is adopted.
+        """
+        if state.phase != "detector" or state.behavior_attempted or self._round_clip() is None:
+            return False
+        weights = state.run_dir / "weights" / "best.pth"
+        if not weights.exists():
+            weights = state.run_dir / "weights" / "last.pth"
+        if not weights.exists() or state.train_json is None:
+            return False
+        try:
+            data = json.loads(Path(state.train_json).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        labelled = keyframes_mod.summarize(data, data.get("action_names") or []).with_behavior
+        if labelled < round_mod.MIN_BEHAVIOR_LABELS:
+            state.behavior_note = (
+                f"Only {labelled} box(es) have a behavior, so this round trained the "
+                f"detector only. The behavior model starts at {round_mod.MIN_BEHAVIOR_LABELS}."
+            )
+            return False
+        state.detector_score = self._round_score(state)
+        state.detector_dir = state.run_dir
+        state.stage1_weights = str(weights)
+        state.phase = "behavior"
+        state.behavior_attempted = True
+        state.run_dir = state.detector_dir.parent / "stage2"
+        # Budgeted in optimizer steps, like the detector (annotation/round.py):
+        # stage 2 skips keyframes with no behavior, and a clip takes half the
+        # batch, so the step count per pass is its own - and the trainer's
+        # 100-step warmup must not be the whole run.
+        clips = sum(
+            1 for video in data.get("videos") or [] for frame in video.get("frames") or []
+            if any(int(o.get("action_id", -1)) >= 0 for o in frame.get("objects") or [])
+        )
+        steps = max(1, math.ceil(clips / max(1, state.plan.batch_size // 2)))
+        state.behavior_epochs = min(
+            max(4, state.plan.epochs * 2),
+            max(4, state.plan.epochs // 2, math.ceil(round_mod.WARMUP_STEPS / steps)),
+        )
+        state.proc = None
+        state.retried_small_batch = False
+        self.round_dialog.set_step(
+            2, "running", f"detector done ({state.last_epoch + 1} passes) - now the behaviors"
+        )
+        self._round_note(
+            f"Round {state.number}: detector trained; training the behaviors on "
+            f"{labelled} labelled boxes. Log in {state.run_dir / 'round.log'}"
+        )
+        self._round_spawn(state)
+        return True
 
     def _round_adopt(self, state: RoundState) -> None:
         if state.project is not None and self._ensure_project() is not state.project:
@@ -799,7 +928,15 @@ class TrainRoundMixin:
         weights = state.run_dir / "weights" / "best.pth"
         fallback = state.run_dir / "weights" / "last.pth"
         chosen = weights if weights.exists() else (fallback if fallback.exists() else None)
-        score, metric = self._round_score(state)
+        behavior_score: Tuple[Optional[float], str] = (None, "")
+        if state.phase == "behavior":
+            behavior_score = self._round_score(state)
+            score, metric = state.detector_score
+            if chosen is None and state.stage1_weights:
+                chosen = Path(state.stage1_weights)
+                state.behavior_note = "The behavior model wrote no checkpoint; the detector was kept."
+        else:
+            score, metric = self._round_score(state)
         previous_score, previous_digest = self._last_adopted()
         adopt, sentence = round_mod.adoption(
             checkpoint=chosen is not None,
@@ -839,6 +976,9 @@ class TrainRoundMixin:
                 # it is not, which is what ``comparable`` above records - and
                 # therefore the one the series advice is read off.
                 "agreement": state.agreement,
+                "behavior_metric": behavior_score[1],
+                "behavior_score": behavior_score[0],
+                "behavior_note": state.behavior_note,
                 "at": time.time(),
             }
         )
@@ -847,6 +987,10 @@ class TrainRoundMixin:
         self._write_rounds_log(log)
 
         body = sentence
+        if behavior_score[0] is not None:
+            body += f"\nBehaviors: F1 {behavior_score[0]:.3f} on the held-out keyframes."
+        if state.behavior_note:
+            body += "\n" + state.behavior_note
         if not state.plan.comparable and score is not None:
             body += (
                 "\nThe score is measured on the frames it trained on, so it is "

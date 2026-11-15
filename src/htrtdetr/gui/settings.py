@@ -43,7 +43,11 @@ import dearpygui.dearpygui as dpg
 from ..annotation import quality
 from . import click_segment, theme, widgets
 
-__all__ = ["SettingsDialog", "TABS", "THRESHOLD_FIELDS"]
+__all__ = ["SettingsDialog", "TABS", "THRESHOLD_FIELDS", "LABEL_MODE_ITEMS"]
+
+#: The labelling-scheme combo. The text starts with the scheme name because
+#: that prefix is what the annotator reads (``set_label_mode``).
+LABEL_MODE_ITEMS: Tuple[str, ...] = ("Keyframes", "Tracks")
 
 TABS: Tuple[str, ...] = ("Project", "Labels", "Tracking", "Model", "Assistance", "Checks")
 
@@ -299,6 +303,21 @@ class SettingsDialog:
         with dpg.tab(label="Tracking", tag=self._t("tab_tracking")):
             widgets.gap(1)
             widgets.section_header(
+                "What do you label?",
+                "Keyframes: on chosen frames, a box and a behavior for every "
+                "animal - identity comes from tracking at analysis time, and "
+                "behaviors become bouts there. Tracks: track IDs on every box "
+                "and behaviors as intervals. Switching never rewrites saved labels.",
+            )
+            dpg.add_combo(
+                list(LABEL_MODE_ITEMS),
+                tag="label_mode_combo",
+                default_value=LABEL_MODE_ITEMS[1],
+                width=220,
+                callback=lambda s, a: self._on_label_mode(a),
+            )
+            widgets.gap(1)
+            widgets.section_header(
                 "Does this experiment follow individuals?",
                 "Decided once per project. Everything else on this tab depends "
                 "on it.",
@@ -373,6 +392,31 @@ class SettingsDialog:
                     height=28,
                     tag=self._t("reset_sel"),
                 )
+
+    def _on_label_mode(self, value: Any) -> None:
+        """Gate the track controls, then tell the annotator."""
+        self._gate_label_mode(str(value or "").startswith("Keyframe"))
+        self._call("label_mode", value)
+
+    def set_label_mode(self, mode: str) -> None:
+        """Mirror the annotator's scheme (``keyframe`` / ``tracks``) without a callback."""
+        keyframe = str(mode or "").startswith("keyframe")
+        self._set("label_mode_combo", LABEL_MODE_ITEMS[0] if keyframe else LABEL_MODE_ITEMS[1])
+        self._gate_label_mode(keyframe)
+
+    def _gate_label_mode(self, keyframe: bool) -> None:
+        """Keyframe labels carry no track ids, so the switch for them is locked (P4)."""
+        if not dpg.does_item_exist("use_track_ids_cb"):
+            return
+        if keyframe:
+            widgets.locked(
+                "use_track_ids_cb",
+                "Keyframe labelling never asks for track IDs: identity comes from "
+                "tracking at analysis time. Choose Tracks above to use them.",
+            )
+            self._gate_tracking(False)
+        else:
+            widgets.unlock("use_track_ids_cb")
 
     def _on_use_track_ids(self, value: Any) -> None:
         """Gate the rest of the tab, then tell the annotator."""
@@ -580,6 +624,7 @@ class SettingsDialog:
         use_track_ids: bool = True,
         weights: str = "",
         config_path: str = "",
+        label_mode: str = "tracks",
     ) -> None:
         """Fill every control from the annotator's current state."""
         if not self._built:
@@ -593,6 +638,7 @@ class SettingsDialog:
         self._set("sticky_draw_cb", bool(sticky_draw))
         self._set("use_track_ids_cb", bool(use_track_ids))
         self._gate_tracking(bool(use_track_ids))
+        self.set_label_mode(label_mode)
         for name, *_rest in THRESHOLD_FIELDS:
             self._set(self._t(f"q_{name}"), float(getattr(config, name)))
 

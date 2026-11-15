@@ -427,6 +427,11 @@ BINDINGS: tuple[Binding, ...] = (
     # worst possible moment to fat-finger Delete Box.
     _b("view.activity", "L", ("Ctrl",), "View",
        "Show what is running, and the log of this session"),
+    # P for Play. Keyframe labelling judges a behavior from motion, so the
+    # frames around the keyframe are one key away from the behavior numbers.
+    _b("view.context_loop", "P", (), "View",
+       "Play the motion around this frame in a loop - labels still go on this "
+       "frame. P again returns"),
 
     # ── Annotator / Navigation ──
     _b("nav.prev", "A", (), "Navigation",
@@ -557,6 +562,10 @@ CHANGED_IN_THIS_VERSION: tuple[tuple[str, str, str], ...] = (
     ("0-4 set actions 0-4",
      "0-9 set actions 0-9",
      "The panel already allowed more than five actions with no key for them"),
+    ("P was unbound",
+     "P plays the motion around the current frame",
+     "Keyframe labelling puts one behavior on one frame; P shows the motion "
+     "that decides it without leaving the frame"),
 )
 
 #: Bindings deliberately left alone, for the same help window.

@@ -57,6 +57,8 @@ try:  # GUI 補助モジュール (相対 import で失敗したら絶対 import
     from .gui import activity as activity_mod
     from .gui import chrome
     from .gui.final_operations import FinalPassMixin
+    from .gui.context_loop import ContextLoopMixin
+    from .gui.keyframe_mode import KeyframeModeMixin
     from .gui.round_work import RoundWorkMixin
     from .gui.train_operations import TrainRoundMixin
 
@@ -106,6 +108,8 @@ except ImportError:  # スクリプト直接実行時のフォールバック
     from htrtdetr.gui import activity as activity_mod
     from htrtdetr.gui import chrome
     from htrtdetr.gui.final_operations import FinalPassMixin
+    from htrtdetr.gui.context_loop import ContextLoopMixin
+    from htrtdetr.gui.keyframe_mode import KeyframeModeMixin
     from htrtdetr.gui.round_work import RoundWorkMixin
     from htrtdetr.gui.train_operations import TrainRoundMixin
 
@@ -348,7 +352,9 @@ from htrtdetr.gui.workspace import WorkspaceMixin
 class AnnotationApp(
     activity_mod.ActivityMixin,
     CanvasViewMixin,
+    ContextLoopMixin,
     EditHistoryMixin,
+    KeyframeModeMixin,
     FinalPassMixin,
     ReviewModeMixin,
     RoundWorkMixin,
@@ -667,23 +673,8 @@ class AnnotationApp(
                     )
                 dpg.add_spacer(height=8)
 
-                # ── does this experiment follow individuals? ──────────
-                # Asked here rather than buried in Settings because it is
-                # decided once, before the first box, and it changes what the
-                # annotator asks of the user on every frame after that.
-                dpg.add_checkbox(
-                    label="Follow each individual across frames (track IDs)",
-                    tag="setup_use_tracks",
-                    default_value=True,
-                )
-                dpg.add_text(
-                    "On: every box carries a track ID, and the checks look for "
-                    "ID switches and broken tracks. Off: boxes are per-frame "
-                    "detections - no track fields, no track-based checks, and "
-                    "nothing asks you for an ID.",
-                    color=theme.TEXT_DIM,
-                    wrap=w - 60,
-                )
+                # The labelling scheme: decided once, before the first box.
+                self._build_setup_label_mode(w - 60)
                 dpg.add_spacer(height=8)
 
                 # ── where the project lives ───────────────────────────
@@ -855,7 +846,7 @@ class AnnotationApp(
             and dpg.get_value("setup_end") == "Open next unfinished video"
             else "stay"
         )
-        self.project.settings["use_track_ids"] = bool(dpg.get_value("setup_use_tracks"))
+        self._apply_setup_label_mode(self.project.settings)
         copy_media = dpg.does_item_exist("setup_copy_media") and bool(
             dpg.get_value("setup_copy_media")
         )
@@ -1250,7 +1241,7 @@ class AnnotationApp(
                 annotations=self.annotations,
                 candidates=self._candidate_map(),
                 review_items=list(self._queue.items),
-                behavior_intervals=self._intervals.intervals,
+                behavior_intervals=self._behavior_lane(),
                 selection=self._selection,
                 confident_score=self.quality_config.confident_score,
             )
@@ -1351,6 +1342,7 @@ class AnnotationApp(
             "view.zoom_in": lambda: self.zoom_by(1.25),
             "view.zoom_out": lambda: self.zoom_by(0.8),
             "view.activity": self.toggle_activity,
+            "view.context_loop": self.toggle_context_loop,
             # navigation
             "nav.prev": lambda: self.goto_frame(self.current_frame_idx - 1),
             "nav.next": lambda: self.goto_frame(self.current_frame_idx + 1),
@@ -1526,6 +1518,8 @@ class AnnotationApp(
 
         # Last, so they sit over everything: the in-canvas tool feedback.
         self._draw_tool_overlay(cw, ch)
+        if self.context_loop_active:
+            self._draw_context_overlay(cw, ch)
 
     def _draw_empty_state(self, cw: int, ch: int) -> None:
         """Say what to do, not just that there is nothing here (§23).
@@ -1655,6 +1649,7 @@ class AnnotationApp(
         key = obj.track_id if self.use_track_ids else obj.class_id
         col = _track_color(key)
         col_fill = _track_color(key, alpha=50)
+        col, col_fill = self._keyframe_box_colors(obj, col, col_fill)
         thick = 3.0 if selected else 1.5
 
         if obj.has_obb:
@@ -1679,7 +1674,9 @@ class AnnotationApp(
         action_s = (
             self.action_names[obj.action_id] if 0 <= obj.action_id < len(self.action_names) else "?"
         )
-        if self.use_track_ids:
+        if self.keyframe_mode:
+            label = self._keyframe_box_label(obj, action_s)
+        elif self.use_track_ids:
             label = f"{'T' + str(obj.track_id) if obj.track_id >= 0 else 'T?'}|{action_s}"
         else:
             class_s = (
@@ -1801,6 +1798,8 @@ class AnnotationApp(
             return
         if not self._is_over_canvas() or self.cap is None:
             return
+        if self.context_loop_active:  # bring the labelled frame back, then click
+            self.stop_context_loop()
         cx, cy = self._get_canvas_mouse()
         ix, iy = self._c2i(cx, cy)
 
@@ -2274,8 +2273,10 @@ class AnnotationApp(
         experiment rather than the session: reopening a project that does not
         track must not silently start asking for track ids again. Absent from
         an older file it reads True, so nothing written before this existed
-        changes behaviour.
+        changes behaviour. Keyframe labelling reads False (the flag is kept).
         """
+        if self.keyframe_mode:
+            return False
         return bool(self._ensure_project().settings.get("use_track_ids", True))
 
     def set_use_track_ids(self, value: Any) -> None:
@@ -2668,8 +2669,12 @@ class AnnotationApp(
         """Esc: 描画ツールを抜けて選択も解除する。
 
         Every tool returns to Select, including the sticky ones - Delete in
-        particular, which otherwise keeps erasing on the next click.
+        particular, which otherwise keeps erasing on the next click. A running
+        context loop is ended first (the canvas is not showing this frame).
         """
+        if self.context_loop_active:
+            self.stop_context_loop()
+            return
         if self._mode in ("pan",):
             self._mode = "idle"
             self._pan_origin = None
@@ -3042,6 +3047,7 @@ class AnnotationApp(
             "add_action": self._add_action_label_dialog,
             "auto_track": self._set_auto_track,
             "use_track_ids": self.set_use_track_ids,
+            "label_mode": self.set_label_mode,
             "sticky_draw": self._set_sticky_draw,
             "click_backend": self.set_click_backend,
             "pick_weights": self._pick_model_checkpoint,
@@ -3063,6 +3069,7 @@ class AnnotationApp(
             use_track_ids=self.use_track_ids,
             weights=settings.get("weights", ""),
             config_path=settings.get("config", ""),
+            label_mode=self.label_mode,
         )
         self._refresh_model_ui()
         dpg.set_value(
@@ -3885,16 +3892,7 @@ class AnnotationApp(
         self._queue = review_queue_mod.ReviewQueue(items)
         self._queue.carry_over(carried)
 
-        human = [i for i in self._intervals.intervals if i.source == "human"]
-        derived = intervals_mod.merge_to_intervals(candidates)
-        self._intervals = intervals_mod.IntervalTrack(
-            human
-            + [
-                i
-                for i in derived
-                if not any(h.track_id == i.track_id and h.overlaps(i) for h in human)
-            ]
-        )
+        self._intervals = self._rebuilt_intervals(candidates)
 
         self.inbox.set_queue(self._queue, fps=self.fps)
         self._render_timeline()
@@ -4557,6 +4555,7 @@ class AnnotationApp(
             chosen_frame=self.current_frame_idx in (self._selection.frame_set()
                                                     if self._selection is not None else ()),
             checked=self.current_frame_idx in self.annotations,
+            keyframe_note=self._keyframe_note(),
         )
 
         if self._sel_issue is not None:
@@ -5026,6 +5025,7 @@ class AnnotationApp(
             while dpg.is_dearpygui_running():
                 self._pump_ui()
                 self._tick_review()
+                self._tick_context_loop()
                 self.tick_train_round()
                 self._tick_copilot()
                 self._tick_autosave()

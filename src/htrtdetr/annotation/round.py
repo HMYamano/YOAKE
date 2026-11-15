@@ -51,6 +51,7 @@ __all__ = [
     "RoundPlan",
     "FrameKey",
     "MIN_FRAMES",
+    "MIN_BEHAVIOR_LABELS",
     "count_labels",
     "frame_keys",
     "grow_holdout",
@@ -77,6 +78,12 @@ FrameKey = Tuple[str, int]
 #: Below this many labelled frames a round trains on noise. The dialog gates on
 #: it rather than refusing at the end, so the user is told before they wait.
 MIN_FRAMES = 10
+
+#: Below this many behavior-labelled boxes a keyframe round trains the detector
+#: only (``docs/KEYFRAME_BEHAVIOR.md``). Eight is a handful per behavior for a
+#: two- or three-behavior study - enough for the first proposals to be worth
+#: correcting, which is all a round's behavior model is for.
+MIN_BEHAVIOR_LABELS = 8
 
 #: Fraction of labelled frames held back to check the model against frames it
 #: never saw, and the floor under that fraction.
