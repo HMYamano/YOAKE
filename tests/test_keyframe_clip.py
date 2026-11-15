@@ -10,7 +10,6 @@ dataset exists to prevent is the right shape with the wrong frames in it.
 from __future__ import annotations
 
 import json
-import math
 import random
 from pathlib import Path
 

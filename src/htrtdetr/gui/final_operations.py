@@ -33,7 +33,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from ..annotation import finalpass
 from ..annotation.batch import BatchOptions, VideoInput, connect_detections, predict_video

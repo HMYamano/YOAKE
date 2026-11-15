@@ -90,7 +90,6 @@ try:  # GUI 補助モジュール (相対 import で失敗したら絶対 import
     from .annotation import propagation as propagation_mod
     from .annotation import quality as quality_mod
     from .annotation import review_queue as review_queue_mod
-    from .annotation import round as round_mod
     from .annotation import sampling as sampling_mod
     from .annotation import tracklet as tracklet_mod
 except ImportError:  # スクリプト直接実行時のフォールバック
@@ -141,7 +140,6 @@ except ImportError:  # スクリプト直接実行時のフォールバック
     from htrtdetr.annotation import propagation as propagation_mod
     from htrtdetr.annotation import quality as quality_mod
     from htrtdetr.annotation import review_queue as review_queue_mod
-    from htrtdetr.annotation import round as round_mod
     from htrtdetr.annotation import sampling as sampling_mod
     from htrtdetr.annotation import tracklet as tracklet_mod
 

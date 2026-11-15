@@ -619,6 +619,7 @@ class HTRTDETR(nn.Module):
                 if q_boxes is None:
                     entry["obb"] = out.pred_obb[b][idx]
                 else:
+                    assert gt is not None  # q_boxes は gt から作るので、ここでは必ずある
                     gt_obb = tgt.get("obb")
                     obb = (aabb_to_obb(gt) if gt_obb is None
                            else gt_obb.to(device=device, dtype=dtype).clone())
@@ -808,12 +809,11 @@ class HTRTDETR(nn.Module):
         clip_frames = None
         if getattr(self.behavior, "use_clip", False):
             outs = frame_outs if frame_outs else [last_out]
-            if any(not fo.encoder_features for fo in outs):
+            # 1 フレームでも特徴マップが無ければ tube は作れない。
+            maps = [fo.encoder_features[0] for fo in outs if fo.encoder_features]
+            if len(maps) != len(outs):
                 return None
-            clip_frames = [
-                self.behavior.clip_encoder.reduce_frame(fo.encoder_features[0])
-                for fo in outs
-            ]
+            clip_frames = [self.behavior.clip_encoder.reduce_frame(m) for m in maps]
 
         return self.behavior(
             obb_history=aligned.obb,

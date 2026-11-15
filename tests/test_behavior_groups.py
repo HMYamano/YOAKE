@@ -436,13 +436,17 @@ def test_validation_scores_each_group_and_averages_them(tmp_path):
             self.cfg = type("C", (), {"behavior": type("B", (), {"heads": GROUPS})()})()
 
         def forward(self, images, **_):
-            loco = torch.tensor([[0.0, 5.0, 0.0], [5.0, 0.0, 0.0]]) + self.w   # both right
-            social = torch.tensor([[0.0, 0.0, 5.0], [0.0, 5.0, 0.0]]) + self.w  # one right
-            return HTRTDETROutput(
-                pred_logits=torch.zeros(1, 2, 2) + self.w, pred_boxes=boxes[None],
-                query_features=torch.zeros(1, 2, 4),
+            # Like a real model, answer on the device the weights are on: the
+            # Trainer moves the model and the batch to cuda whenever it exists.
+            dev = self.w.device
+            loco = torch.tensor([[0.0, 5.0, 0.0], [5.0, 0.0, 0.0]], device=dev) + self.w
+            social = torch.tensor([[0.0, 0.0, 5.0], [0.0, 5.0, 0.0]], device=dev) + self.w
+            return HTRTDETROutput(                   # loco: both right; social: one right
+                pred_logits=torch.zeros(1, 2, 2, device=dev) + self.w,
+                pred_boxes=boxes.to(dev)[None],
+                query_features=torch.zeros(1, 2, 4, device=dev),
                 action_logits=torch.cat([loco, social], -1),
-                det_results=[{"boxes": boxes}],
+                det_results=[{"boxes": boxes.to(dev)}],
                 action_head_logits={"locomotion": loco, "social": social},
             )
 
