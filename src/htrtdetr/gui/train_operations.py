@@ -891,9 +891,15 @@ class TrainRoundMixin:
         # stage 2 skips keyframes with no behavior, and a clip takes half the
         # batch, so the step count per pass is its own - and the trainer's
         # 100-step warmup must not be the whole run.
+        from ..annotation import behaviors as behaviors_mod
+
+        try:
+            vocab = behaviors_mod.vocabulary_of(data)
+        except ValueError:
+            vocab = behaviors_mod.BehaviorVocabulary.single(data.get("action_names") or [])
         clips = sum(
             1 for video in data.get("videos") or [] for frame in video.get("frames") or []
-            if any(int(o.get("action_id", -1)) >= 0 for o in frame.get("objects") or [])
+            if any(behaviors_mod.has_behavior(o, vocab) for o in frame.get("objects") or [])
         )
         steps = max(1, math.ceil(clips / max(1, state.plan.batch_size // 2)))
         state.behavior_epochs = min(

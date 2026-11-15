@@ -72,7 +72,7 @@ def two_flies():
 # ══════════════════════════════════════════════════════════════════════════
 
 MODULES = ("status", "tracklet", "quality", "review_queue", "intervals", "keyframes",
-           "features", "sampling", "propagation", "cache", "release",
+           "behaviors", "features", "sampling", "propagation", "cache", "release",
            "finalpass")
 
 

@@ -43,6 +43,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from ..annotation import behaviors
 from ..annotation.keyframes import ClipSpec, clip_spec_of
 from .annotation import DatasetAnno, FrameAnno, VideoAnno, load_annotation
 
@@ -153,6 +154,11 @@ class KeyframeClipDataset(Dataset):
             or ``auto`` (the image if it is there, else the video).
         single_frame: return Stage 1 samples (one image) instead of clips.
         require_behavior: drop keyframes with no behavior label at all.
+
+    Multi-head behaviors (``meta.labeling.behaviors = "multi_head"``,
+    ``docs/KEYFRAME_BEHAVIOR.md`` §15) add ``head_action_ids`` to the targets:
+    ``(N, groups)``, each answer as a position inside its group, ``-1`` for a
+    group not judged. ``action_ids`` stays the first group's flat answer.
     """
 
     def __init__(
@@ -182,6 +188,9 @@ class KeyframeClipDataset(Dataset):
             raise ValueError(f"frame_source must be one of {FRAME_SOURCES}, got {frame_source!r}")
 
         self.anno = dataset
+        #: One behavior list, or groups. A malformed multi-head declaration
+        #: raises here, before a round spends minutes on it.
+        self.vocab = behaviors.vocabulary_of(dataset)
         self.clip = clip if clip is not None else clip_spec_of(dataset)
         if self.clip.anchor != "end" and not single_frame:
             # The model predicts for the last frame of its window, so a
@@ -206,7 +215,9 @@ class KeyframeClipDataset(Dataset):
         self.dropped: List[Tuple[str, int]] = []
         for video in dataset.videos:
             for frame in video.frames:
-                if require_behavior and not any(o.action_id >= 0 for o in frame.objects):
+                if require_behavior and not any(
+                    behaviors.has_behavior(o, self.vocab) for o in frame.objects
+                ):
                     continue
                 if self._reachable(video, frame):
                     self.samples.append((video, frame))
@@ -354,7 +365,7 @@ class KeyframeClipDataset(Dataset):
         n = len(objects)
         boxes = np.array([o.bbox for o in objects], dtype=np.float32).reshape(n, 4)
         obb = np.array([o.get_obb() for o in objects], dtype=np.float32).reshape(n, 5)
-        return {
+        out = {
             "boxes": boxes,
             "obb": obb,
             "obb_valid": np.array([o.has_obb for o in objects], dtype=bool),
@@ -362,6 +373,17 @@ class KeyframeClipDataset(Dataset):
             "action_ids": np.array([o.action_id for o in objects], dtype=np.int64),
             "is_crowd": np.array([o.is_crowd for o in objects], dtype=bool),
         }
+        if self.vocab.multi:
+            width = len(self.vocab.groups)
+            out["head_action_ids"] = np.array(
+                [behaviors.group_targets(o, self.vocab) for o in objects], dtype=np.int64
+            ).reshape(n, width)
+            # The flat number of the first group's answer, whatever the file
+            # stored in action_id: one source of truth for the answer.
+            out["action_ids"] = np.array(
+                [behaviors.labels_of(o, self.vocab)[0] for o in objects], dtype=np.int64
+            )
+        return out
 
     def _jitter(self) -> Tuple[float, float, float]:
         def draw(amount: float) -> float:
@@ -454,6 +476,8 @@ class KeyframeClipDataset(Dataset):
             "track_ids": torch.full((n,), -1, dtype=torch.long),
             "identity_ids": torch.full((n,), -1, dtype=torch.long),
         }
+        if "head_action_ids" in targets:
+            key_target["head_action_ids"] = torch.from_numpy(targets["head_action_ids"])
 
         if self.single_frame:
             return {
@@ -473,6 +497,10 @@ class KeyframeClipDataset(Dataset):
             "track_ids": torch.zeros(0, dtype=torch.long),
             "identity_ids": torch.zeros(0, dtype=torch.long),
         }
+        if "head_action_ids" in key_target:
+            empty["head_action_ids"] = torch.zeros(
+                (0, len(self.vocab.groups)), dtype=torch.long
+            )
         T = len(tensors)
         per_frame = [empty] * (T - 1) + [key_target]
         sample: Dict[str, Any] = {"images": torch.stack(tensors, dim=0)}
@@ -494,6 +522,12 @@ class KeyframeClipDataset(Dataset):
 
 _TARGET_KEYS = ("boxes", "obb", "obb_valid", "class_ids", "action_ids",
                 "track_ids", "identity_ids")
+#: Present only for multi-head behaviors; carried when the sample has it.
+_OPTIONAL_TARGET_KEYS = ("head_action_ids",)
+
+
+def _target_keys(item: Dict[str, Any]) -> Tuple[str, ...]:
+    return _TARGET_KEYS + tuple(k for k in _OPTIONAL_TARGET_KEYS if k in item)
 
 
 def collate_keyframe_clips(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -509,7 +543,8 @@ def collate_keyframe_clips(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     meta: List[Dict[str, Any]] = []
     for item in batch:
         T = len(item["boxes"])
-        targets.append([{k: item[k][t] for k in _TARGET_KEYS} for t in range(T)])
+        keys = _target_keys(item)
+        targets.append([{k: item[k][t] for k in keys} for t in range(T)])
         meta.append({
             "video_id": item["video_id"],
             "window_start": item["window_start"],
@@ -523,7 +558,7 @@ def collate_keyframe_clips(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 def collate_keyframe_single(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Single keyframes to ``images (B, 3, H, W)`` and ``targets`` of length B."""
     images = torch.stack([item["image"] for item in batch], dim=0)
-    targets = [{k: item[k] for k in _TARGET_KEYS} for item in batch]
+    targets = [{k: item[k] for k in _target_keys(item)} for item in batch]
     meta = [
         {"frame_index": item["frame_index"], "image_path": item["image_path"],
          "orig_size": item["orig_size"], "video_id": item["video_id"]}

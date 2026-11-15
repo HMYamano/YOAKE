@@ -17,6 +17,8 @@ Boxes                  Coloured by behavior; grey and unfilled until one is
 Timeline               The behavior lane shows one tick per labelled animal.
 Inspector              "3 animals - 1 still needs a behavior."
 Setup screen           The scheme is the first question after the labels.
+Behavior groups        Optional multi-head answers (one per group), in
+                       :mod:`htrtdetr.gui.behavior_groups`, inherited here.
 =====================  ==================================================
 
 The context loop (``P``) lives beside it in :mod:`htrtdetr.gui.context_loop`.
@@ -33,6 +35,7 @@ except ImportError:  # pragma: no cover - GUI なしの環境
 
 from ..annotation import intervals as intervals_mod
 from ..annotation import keyframes
+from .behavior_groups import BehaviorGroupsMixin
 
 __all__ = ["KeyframeModeMixin", "LABEL_MODE_CHOICES"]
 
@@ -44,7 +47,7 @@ LABEL_MODE_CHOICES: Tuple[str, ...] = (
 )
 
 
-class KeyframeModeMixin:
+class KeyframeModeMixin(BehaviorGroupsMixin):
     """Mixed into ``AnnotationApp``."""
 
     # ── the setting ──────────────────────────────────────────────────────
@@ -75,6 +78,9 @@ class KeyframeModeMixin:
         self.stop_context_loop()
         self._mark_dirty()
         self._refresh_track_ui()
+        # Groups only count in keyframe mode, and so do the behavior colours.
+        self._update_action_buttons()
+        self._refresh_labels_display()
         if hasattr(getattr(self, "settings", None), "set_label_mode"):
             self.settings.set_label_mode(mode)
         self.rebuild_copilot()
@@ -100,8 +106,11 @@ class KeyframeModeMixin:
         if self.keyframe_mode:
             from . import theme
 
-            col = theme.class_color(obj.action_id)
-            fill = theme.class_color(obj.action_id, 60 if obj.action_id >= 0 else 0)
+            # With behavior groups: the first group's colour, filled once all
+            # groups are answered (BehaviorGroupsMixin._behavior_box_style).
+            index, filled = self._behavior_box_style(obj)
+            col = theme.class_color(index)
+            fill = theme.class_color(index, 60 if filled else 0)
         if self.context_loop_active:
             fill = (0, 0, 0, 0)
         return col, fill
@@ -123,7 +132,9 @@ class KeyframeModeMixin:
             intervals_mod.BehaviorInterval(
                 track_id=-1, action_id=action, start=frame, end=frame, source="human"
             )
-            for frame, action in keyframes.keyframe_marks(self.annotations)
+            for frame, action in keyframes.keyframe_marks(
+                self.annotations, self.behavior_vocabulary
+            )
         ]
 
     def _behavior_lane(self) -> List[Any]:
@@ -152,7 +163,9 @@ class KeyframeModeMixin:
         """The Inspector's progress line for this keyframe, or ``""``."""
         if not self.keyframe_mode or self.current_frame_idx not in self.annotations:
             return ""
-        return keyframes.keyframe_sentence(self.annotations.get(self.current_frame_idx, []))
+        return keyframes.keyframe_sentence(
+            self.annotations.get(self.current_frame_idx, []), self.behavior_vocabulary
+        )
 
     # ── the setup screen ─────────────────────────────────────────────────
     def _build_setup_label_mode(self, wrap: int) -> None:

@@ -98,7 +98,7 @@ class StreamingResult:
     __slots__ = (
         "frame_index", "boxes_xyxy", "obb", "corners", "scores", "class_ids",
         "track_ids", "action_ids", "action_probs", "context_boxes",
-        "evidence", "gates", "head_predictions",
+        "evidence", "gates", "head_predictions", "head_action_ids",
     )
 
     def __init__(
@@ -116,6 +116,7 @@ class StreamingResult:
         evidence: Optional[List[Dict[str, float]]] = None,
         gates: Optional[List[Dict[str, float]]] = None,
         head_predictions: Optional[List[Dict[str, str]]] = None,
+        head_action_ids: Optional[np.ndarray] = None,
     ):
         n = len(boxes_xyxy)
         self.frame_index = frame_index
@@ -131,6 +132,9 @@ class StreamingResult:
         self.evidence = evidence or []
         self.gates = gates or []
         self.head_predictions = head_predictions or []
+        #: multi-head only: (n, groups) flat behavior numbers, one per group;
+        #: ``action_ids`` then holds the first group's (docs/KEYFRAME_BEHAVIOR.md §15).
+        self.head_action_ids = head_action_ids
 
     def __len__(self) -> int:
         return len(self.boxes_xyxy)
@@ -160,6 +164,8 @@ class StreamingResult:
             d["gates"] = self.gates
         if self.head_predictions:
             d["head_predictions"] = self.head_predictions
+        if self.head_action_ids is not None:
+            d["head_action_ids"] = np.asarray(self.head_action_ids).astype(int).tolist()
         return d
 
 
@@ -411,7 +417,8 @@ class StreamingInferencer:
 
         # --- Behavior ---
         with self.latency.measure("behavior"):
-            action_ids, action_probs, evidence, gates, heads, ctx_boxes = self._run_behavior(
+            (action_ids, action_probs, evidence, gates, heads, ctx_boxes,
+             head_ids) = self._run_behavior(
                 obb_hist, mask, det_out, temporal_last, hist, active_ids, track_ids, n,
                 det_keypoints=dets.get("keypoints"),
             )
@@ -447,6 +454,7 @@ class StreamingInferencer:
             evidence=evidence,
             gates=gates,
             head_predictions=heads,
+            head_action_ids=head_ids,
         )
 
     def _run_behavior(
@@ -454,8 +462,13 @@ class StreamingInferencer:
         track_ids: np.ndarray, n: int,
         det_keypoints: Optional[torch.Tensor] = None,
     ):
-        """行動認識を track 単位で走らせ、検出順に並べ直す。"""
-        empty = (np.full(n, -1, dtype=int), None, [], [], [], None)
+        """行動認識を track 単位で走らせ、検出順に並べ直す。
+
+        multi-head では head ごとに最尤の行動を選ぶ (平坦な確率の argmax は head を
+        跨いでしまう)。``action_ids`` は最初の head、``head_ids`` は (n, head 数) の
+        通し番号。single では ``head_ids`` は None。
+        """
+        empty = (np.full(n, -1, dtype=int), None, [], [], [], None, None)
         if not self.model.behavior_enabled or obb_hist.shape[0] == 0:
             return empty
 
@@ -501,18 +514,37 @@ class StreamingInferencer:
         evidence: List[Dict[str, float]] = []
         gates: List[Dict[str, float]] = []
         heads: List[Dict[str, str]] = []
+        head_ids: Optional[np.ndarray] = None
 
         if pred.logits is not None:
             probs = pred.probs.float().cpu().numpy()
             action_probs = np.zeros((n, probs.shape[1]), dtype=np.float32)
+            sizes = [int(s) for s in getattr(pred, "head_sizes", ()) or ()]
+            head_names = list(pred.head_logits) if sizes else []
+            offsets = [sum(sizes[:k]) for k in range(len(sizes))]
+            class_names = self.model.cfg.behavior.heads or {}
+            if sizes:
+                head_ids = np.full((n, len(sizes)), -1, dtype=int)
             for i in range(n):
                 row = row_of.get(int(track_ids[i]), -1)
                 if row < 0:
                     evidence.append({})
                     gates.append({})
+                    if sizes:
+                        heads.append({})
                     continue
                 action_probs[i] = probs[row]
-                action_ids[i] = int(probs[row].argmax())
+                if sizes:
+                    named: Dict[str, str] = {}
+                    for k, (head, off, size) in enumerate(zip(head_names, offsets, sizes)):
+                        local = int(probs[row, off:off + size].argmax())
+                        head_ids[i, k] = off + local
+                        options = class_names.get(head, [])
+                        named[head] = str(options[local]) if local < len(options) else str(local)
+                    action_ids[i] = int(head_ids[i, 0])
+                    heads.append(named)
+                else:
+                    action_ids[i] = int(probs[row].argmax())
                 evidence.append(pred.explain(row))
                 gates.append(pred.gate_weights(row))
         elif pred.head_logits:
@@ -547,7 +579,7 @@ class StreamingInferencer:
                     if row >= 0:
                         ctx[i] = ctx_np[row]
 
-        return action_ids, action_probs, evidence, gates, heads, ctx
+        return action_ids, action_probs, evidence, gates, heads, ctx, head_ids
 
     # ------------------------------------------------------------------ #
     # 動画全体

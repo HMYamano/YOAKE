@@ -198,6 +198,9 @@ class Trainer:
         self.no_improve_count = 0
         self._last_act_eval: Optional[Dict[str, Any]] = None
         self._last_trk_eval: Optional[Dict[str, Any]] = None
+        #: multi-head behaviors: head name -> ActionEvaluator.compute() of the
+        #: last validation. Empty for a single head (docs/KEYFRAME_BEHAVIOR.md §15).
+        self._last_head_evals: Dict[str, Dict[str, Any]] = {}
 
         # resume
         if train_cfg.resume:
@@ -469,6 +472,22 @@ class Trainer:
                 except Exception:
                     pass
 
+            # --- Stage 2, multi-head: one confusion matrix per behavior group ---
+            if val_metrics and self._last_head_evals:
+                from .plots import save_confusion_matrix
+                (_out / "plots").mkdir(exist_ok=True)
+                for _head, _am in self._last_head_evals.items():
+                    _cm = _am.get("confusion_matrix", [])
+                    if not _cm:
+                        continue
+                    _safe = "".join(c if c.isalnum() else "_" for c in str(_head))
+                    save_confusion_matrix(
+                        _cm, list(_am.get("per_class_f1", {}).keys()) or
+                        [str(i) for i in range(len(_cm))],
+                        str(_out / "plots" / f"confusion_matrix_{_safe}_latest.png"),
+                        title=f"{_head} - Stage {self.cfg.stage} epoch {epoch}",
+                    )
+
             # --- Stage 2: confusion matrix + per-class metrics ---
             if val_metrics and self._last_act_eval is not None:
                 from .plots import save_confusion_matrix, save_per_class_metrics
@@ -701,6 +720,9 @@ class Trainer:
         det_eval = DetectionEvaluator(iou_thresholds=[0.5]) if stage in (1, 4) else None
         act_eval = ActionEvaluator(num_actions=self.num_actions) if stage in (2, 4) else None
         trk_eval = SimpleTrackingEvaluator() if stage in (3, 4) else None
+        # multi-head behaviors: one evaluator per group, made on the first batch
+        # that has group logits (their widths come from the model's output).
+        head_evals: Optional[Dict[str, ActionEvaluator]] = None
         action_loss = getattr(self.criterion, "action_loss", None)
         disable_class_weights_for_val = (
             stage in (2, 4) and hasattr(action_loss, "temporarily_disable_class_weights")
@@ -768,6 +790,21 @@ class Trainer:
                     if output.det_results is not None
                     else [None] * bs
                 )
+                head_logits = (
+                    getattr(output, "action_head_logits", None) if act_eval is not None else None
+                )
+                head_batches = (
+                    {h: output.split_flattened_tensor(v) for h, v in head_logits.items()}
+                    if head_logits and output.det_results is not None else {}
+                )
+                if head_batches and head_evals is None:
+                    head_evals = {
+                        h: ActionEvaluator(
+                            num_actions=int(v.shape[-1]),
+                            action_names=self._head_class_names(eval_model, h, int(v.shape[-1])),
+                        )
+                        for h, v in head_logits.items()
+                    }
 
                 for b in range(bs):
                     det_b = det_results[b] if b < len(det_results) else {"boxes": images.new_zeros((0, 4))}
@@ -779,8 +816,23 @@ class Trainer:
                     matched = asgn["matched_gt_idx"] >= 0
                     n_det = int(pred_boxes_b.shape[0])
 
-                    # Action
-                    if act_eval is not None and b < len(action_batches):
+                    # Action — multi-head: each group against its own answers
+                    if head_batches and head_evals is not None:
+                        gt_rows = asgn.get("matched_head_action_ids")
+                        if gt_rows is not None and gt_rows.dim() == 2:
+                            for k, head in enumerate(head_batches):
+                                chunks = head_batches[head]
+                                hl = chunks[b] if b < len(chunks) else None
+                                if hl is None or k >= gt_rows.shape[1]:
+                                    continue
+                                gt_h = gt_rows[:, k].to(hl.device)
+                                valid = matched.to(hl.device) & (gt_h >= 0)
+                                if valid.any():
+                                    head_evals[head].update(
+                                        hl.argmax(dim=-1)[valid].cpu().tolist(),
+                                        gt_h[valid].cpu().tolist(),
+                                    )
+                    elif act_eval is not None and b < len(action_batches):
                         al = action_batches[b]
                         if al is not None:
                             pred_acts = al.argmax(dim=-1)
@@ -823,7 +875,23 @@ class Trainer:
         if det_eval is not None:
             dm = det_eval.compute()
             result["val_AP50"] = dm.get("AP50", 0.0)
-        if act_eval is not None:
+        self._last_head_evals = {}
+        if head_evals:
+            # multi-head: macro-F1 per group, and their mean as *the* macro_f1 -
+            # the number rounds and best.pth selection read (§15.4). A group
+            # with no answer in the validation set is left out of the mean.
+            scores, accuracies = [], []
+            for head, evaluator in head_evals.items():
+                am = evaluator.compute()
+                self._last_head_evals[head] = am
+                result[f"macro_f1_{head}"] = am.get("macro_f1", 0.0)
+                if am.get("confusion_matrix"):
+                    scores.append(am.get("macro_f1", 0.0))
+                    accuracies.append(am.get("accuracy", 0.0))
+            result["macro_f1"] = float(sum(scores) / len(scores)) if scores else 0.0
+            result["val_accuracy"] = float(sum(accuracies) / len(accuracies)) if accuracies else 0.0
+            self._last_act_eval = None
+        elif act_eval is not None:
             am = act_eval.compute()
             result["macro_f1"] = am.get("macro_f1", 0.0)
             result["val_accuracy"] = am.get("accuracy", 0.0)
@@ -841,6 +909,14 @@ class Trainer:
         else:
             self._last_trk_eval = None
         return result
+
+    @staticmethod
+    def _head_class_names(model, head: str, width: int) -> List[str]:
+        """Class names of one multi-head group, from the model config; numbers if absent."""
+        cfg = getattr(getattr(model, "module", model), "cfg", None)
+        heads = getattr(getattr(cfg, "behavior", None), "heads", None) or {}
+        names = [str(n) for n in heads.get(head, [])]
+        return names if len(names) == width else [str(i) for i in range(width)]
 
     # ------------------------------------------------------------------
     # Class imbalance helpers

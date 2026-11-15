@@ -25,6 +25,26 @@ _SCALAR_GT_KEYS = (
     "class_ids", "track_ids", "identity_ids", "action_ids", "polarity",
 )
 
+#: 1 個体につき複数の整数ラベルを持つ GT (N_gt, K)。行ごと検出に写す。
+#: ``head_action_ids`` は multi-head 行動の答え (グループごとのグループ内番号、
+#: -1 = 未判断。docs/KEYFRAME_BEHAVIOR.md §15)。
+_ROW_GT_KEYS = ("head_action_ids",)
+
+
+def _scalar_keys(target: Dict) -> tuple:
+    """写すスカラー属性: 決め打ちのキーと、旧 multi-head 形式の ``action_<head>``。
+
+    ``action_<head>`` を ``MultiHeadActionLoss`` が読むのに、ここに無かったため
+    常に -1 が返り、multi-head の行動損失は一度も学習されていなかった。
+    """
+    extra = tuple(
+        k for k, v in target.items()
+        if k.startswith("action_") and k not in _SCALAR_GT_KEYS
+        and k not in _ROW_GT_KEYS
+        and isinstance(v, torch.Tensor) and v.dim() == 1
+    )
+    return _SCALAR_GT_KEYS + extra
+
 
 def assign_gt_to_detections(
     pred_boxes: torch.Tensor,   # (N_pred, 4) cxcywh normalized
@@ -56,10 +76,16 @@ def assign_gt_to_detections(
 
     gt_boxes = target.get("boxes", None)
     if gt_boxes is None or gt_boxes.shape[0] == 0 or N_pred == 0:
-        for key in _SCALAR_GT_KEYS:
+        for key in _scalar_keys(target):
             if key in target:
                 result[f"matched_{key}"] = torch.full(
                     (N_pred,), -1, dtype=torch.long, device=device
+                )
+        for key in _ROW_GT_KEYS:
+            if key in target:
+                width = int(target[key].shape[-1]) if target[key].dim() == 2 else 0
+                result[f"matched_{key}"] = torch.full(
+                    (N_pred, width), -1, dtype=torch.long, device=device
                 )
         return result
 
@@ -90,14 +116,21 @@ def assign_gt_to_detections(
     result["matched_gt_idx"] = matched_gt_idx
 
     # 各種 GT 属性を割り当て
-    for attr_key in _SCALAR_GT_KEYS:
+    safe_idx = matched_gt_idx.clamp(min=0)
+    for attr_key in _scalar_keys(target):
         if attr_key not in target:
             continue
         gt_attr = target[attr_key].to(device)  # (N_gt,)
-        safe_idx = matched_gt_idx.clamp(min=0)
         matched_attr = gt_attr[safe_idx]
         matched_attr[matched_gt_idx < 0] = -1
         result[f"matched_{attr_key}"] = matched_attr
+    for attr_key in _ROW_GT_KEYS:
+        if attr_key not in target or target[attr_key].dim() != 2:
+            continue
+        gt_rows = target[attr_key].to(device)  # (N_gt, K)
+        matched_rows = gt_rows[safe_idx].clone()
+        matched_rows[matched_gt_idx < 0] = -1
+        result[f"matched_{attr_key}"] = matched_rows
 
     return result
 

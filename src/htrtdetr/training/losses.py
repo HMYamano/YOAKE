@@ -986,16 +986,18 @@ class CombinedLoss(nn.Module):
         # ----- Stage 2: Action -----
         if s in (2, 4):
             frame_targets = last_frame_targets(targets)
-            behavior = getattr(model_output, "behavior", None)
+            head_logits = getattr(model_output, "action_head_logits", None)
 
-            if behavior is not None and behavior.head_logits:
-                # multi-head: head ごとの GT を targets から引く
+            if head_logits:
+                # multi-head: head ごとの GT を targets から引く。logit は検出順
+                # (``action_head_logits``)。``behavior.head_logits`` は track 行の順で
+                # GT と行が合わないので使わない (docs/KEYFRAME_BEHAVIOR.md §15.6)。
                 head_targets = self._collect_multi_head_targets(
-                    frame_targets, model_output, list(behavior.head_logits)
+                    frame_targets, model_output, list(head_logits)
                 )
                 if head_targets:
                     losses.update(
-                        self.multi_head_action_loss(behavior.head_logits, head_targets)
+                        self.multi_head_action_loss(head_logits, head_targets)
                     )
             elif model_output.action_logits is not None:
                 # single / hierarchical: どちらも (N, num_actions) の logit
@@ -1093,10 +1095,34 @@ class CombinedLoss(nn.Module):
         """
         multi-head 用の GT を targets から集める。
 
-        targets の各 dict が ``action_<head名>`` というキーを持つことを期待する。
-        欠けている head は学習対象から外れる (部分アノテーション対応)。
+        ``head_action_ids`` (N_gt × head 数、head 内の番号、-1 = 未判断) があれば
+        それを使う (キーフレームのデータセットが出す形)。無ければ旧形式の
+        ``action_<head名>`` を head ごとに読む。欠けている head は学習対象から外れる
+        (部分アノテーション対応)。
         """
-        from .matching import collect_matched_gt
+        from .matching import assign_gt_to_detections, collect_matched_gt
+
+        if model_output.det_results is None:
+            return {}
+        if any("head_action_ids" in t for t in targets):
+            width = len(head_names)
+            rows = []
+            for det, tgt in zip(model_output.det_results, targets):
+                boxes = det.get("boxes")
+                n = int(boxes.shape[0]) if boxes is not None else 0
+                device = boxes.device if boxes is not None else torch.device("cpu")
+                matched = None
+                if boxes is not None:
+                    matched = assign_gt_to_detections(boxes, tgt).get("matched_head_action_ids")
+                if matched is None or matched.dim() != 2 or matched.shape[1] < width:
+                    matched = torch.full((n, width), -1, dtype=torch.long, device=device)
+                rows.append(matched[:, :width])
+            if not rows:
+                return {}
+            gt = torch.cat(rows, dim=0)
+            if gt.numel() == 0:
+                return {}
+            return {name: gt[:, h] for h, name in enumerate(head_names)}
 
         out: Dict[str, torch.Tensor] = {}
         for name in head_names:

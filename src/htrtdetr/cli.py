@@ -226,11 +226,14 @@ def _resolve_label_mode(cfg, train_ann: Path, stage: int, overrides: Dict[str, A
         behavior.temporal_window = clip.length
         if getattr(behavior, "use_clip", None) is None:
             behavior.use_clip = True
-    if anno is not None and anno.action_names:
+    names_from_data = list(anno.action_names) if anno is not None else []
+    if anno is not None:
+        names_from_data = _resolve_behavior_heads(cfg, anno, overrides, logger)
+    if anno is not None and names_from_data:
         # The behaviors are the dataset's, not the config default's five. A
         # mismatch is the num_classes trap again (annotation/round.py): a
         # behavior numbered past the head's width cannot be learned at all.
-        names = [str(n) for n in anno.action_names]
+        names = [str(n) for n in names_from_data]
         explicit = ((overrides.get("model") or {}).get("action_head") or {})
         if "num_actions" not in explicit and cfg.model.action_head.num_actions != len(names):
             logger.info(
@@ -245,10 +248,55 @@ def _resolve_label_mode(cfg, train_ann: Path, stage: int, overrides: Dict[str, A
         kf.describe_clip(clip),
     )
     if anno is not None:
-        logger.info("  %s", kf.summarize(anno, anno.action_names).sentence(anno.action_names))
-        for warning in kf.check(anno, anno.action_names, clip):
+        flat = [str(n) for n in (names_from_data or anno.action_names)]
+        logger.info("  %s", kf.summarize(anno, flat).sentence(flat))
+        for warning in kf.check(anno, flat, clip):
             logger.warning("  %s", warning)
     return mode
+
+
+def _resolve_behavior_heads(cfg, anno, overrides: Dict[str, Any], logger) -> list:
+    """One behavior per animal, or one per group: the dataset decides (§15).
+
+    A file that declares ``meta.labeling.behaviors = "multi_head"`` trains the
+    behavior branch as ``classifier_type = multi_head`` with the file's groups;
+    any other file trains a single softmax. The choice is written into ``cfg``
+    so it travels inside the checkpoint and ``predict`` builds the same heads.
+    A config that names a classifier the labels contradict stops the run: a
+    multi-head model on single labels (or the reverse) would train nothing.
+    Returns the flat behavior names.
+    """
+    from .annotation import behaviors
+
+    try:
+        vocab = behaviors.vocabulary_of(anno)
+    except ValueError as exc:
+        logger.error("%s See docs/KEYFRAME_BEHAVIOR.md §15.", exc)
+        sys.exit(2)
+    behavior = getattr(cfg.model, "behavior", None)
+    explicit = ((overrides.get("model") or {}).get("behavior") or {}).get("classifier_type")
+    wanted = "multi_head" if vocab.multi else "single"
+    if explicit and explicit != wanted and explicit != "hierarchical":
+        logger.error(
+            "model.behavior.classifier_type=%s, but the labels have %s. Remove the "
+            "override, or relabel. See docs/KEYFRAME_BEHAVIOR.md §15.",
+            explicit,
+            "one behavior per group (multi-head)" if vocab.multi else "one behavior per animal",
+        )
+        sys.exit(2)
+    if behavior is not None and not explicit:
+        if vocab.multi:
+            behavior.classifier_type = "multi_head"
+            behavior.heads = vocab.as_groups()
+        elif behavior.classifier_type == "multi_head":
+            behavior.classifier_type = "single"
+            behavior.heads = {}
+    if vocab.multi:
+        logger.info(
+            "behaviors: multi-head - %s",
+            "; ".join(f"{h}: {', '.join(b)}" for h, b in vocab.groups),
+        )
+    return list(vocab.names)
 
 
 def _build_keyframe_dataloaders(cfg, stage: int, img_size, loader_kwargs):
@@ -735,6 +783,13 @@ def _run_predict_streaming(
         "clip_stride": int(clip_stride),
         "fps": None,
     }}
+    behavior_cfg = getattr(cfg.model, "behavior", None)
+    if getattr(behavior_cfg, "classifier_type", "") == "multi_head" and behavior_cfg.heads:
+        # Groups decode separately (analysis/bouts.py): each one's slice of
+        # ``action_probs`` sums to 1. docs/KEYFRAME_BEHAVIOR.md §15.5.
+        results["_meta"]["action_groups"] = {
+            str(h): [str(n) for n in names] for h, names in behavior_cfg.heads.items()
+        }
 
     for frame_idx, frame_rgb, fps in frame_gen:
         if results["_meta"]["fps"] is None and fps:

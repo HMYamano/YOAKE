@@ -375,3 +375,31 @@ from htrtdetr.annotation.keyframes import to_keyframes
 keyframe_data = to_keyframes(old_data_dict, every=15)   # one keyframe per 15 frames, track ids dropped
 ```
 
+
+### Multi-head behaviors (`meta.labeling.behaviors`)
+
+By default every box has one behavior. A keyframe file may instead group its
+behaviors — exclusive inside a group, simultaneous across groups — so a fly can
+be walking *and* courting. Design: [KEYFRAME_BEHAVIOR.md §15](KEYFRAME_BEHAVIOR.md).
+
+```json
+"meta": {"labeling": {"mode": "keyframe", "clip": {...}, "behaviors": "multi_head"}},
+"action_names": ["still", "walk", "run", "none", "courtship", "copulation"],
+"action_groups": {"locomotion": ["still", "walk", "run"],
+                  "social": ["none", "courtship", "copulation"]},
+...
+{"object_id": 1, "bbox": [...], "track_id": -1, "action_id": 1, "action_ids": [1, 4]}
+```
+
+| Field | Meaning |
+|---|---|
+| `behaviors` | `"multi_head"` turns groups on. Absent (or `"single"`) means one behavior per box. `action_groups` alone does **not** — older files used it for hierarchies. |
+| `action_groups` | Group name → its behaviors, in order. The vocabulary. |
+| `action_names` | The groups concatenated: behavior numbers run through all groups (here `courtship` is 4). A name repeated in two groups is written `group:name`. |
+| `action_ids` | One answer per group, in group order, as that flat number. `-1` = this group was not judged (skipped by that group's loss only). |
+| `action_id` | Copy of the first group's answer, so a reader that knows one behavior per box still reads something true. |
+
+Training builds `model.behavior.classifier_type = multi_head` from the file,
+reports `macro_f1_<group>` and their mean as `macro_f1`, and `yoake predict`
+writes `head_action_ids` per detection and `_meta.action_groups`, which
+`yoake analyze mode=bouts` decodes one group at a time.

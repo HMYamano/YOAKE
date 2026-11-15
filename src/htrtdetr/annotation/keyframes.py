@@ -23,7 +23,10 @@ What a keyframe *means* is the whole contract, so it is stated once, here:
   a box is background, and a keyframe with no boxes says "nothing here".
 * ``action_id`` is what this animal is doing at this instant, judged with the
   motion around it in view. ``-1`` means the behavior was not judged: the box
-  still teaches the detector, and the behavior loss skips it.
+  still teaches the detector, and the behavior loss skips it. A multi-head
+  project answers once per behavior group instead (``action_ids``, see
+  :mod:`htrtdetr.annotation.behaviors`); every count here takes a vocabulary
+  so it can tell "one group still open" from "done".
 * ``track_id`` is not a label. Identity comes from tracking at analysis time.
 
 Purity: no dearpygui, no torch, no cv2, no numpy - like the rest of
@@ -223,14 +226,23 @@ def clip_spec_of(dataset: Any, default: Optional[ClipSpec] = None) -> ClipSpec:
     return ClipSpec.from_dict(raw)
 
 
-def labeling_meta(clip: Optional[ClipSpec] = None) -> Dict[str, Any]:
-    """The ``meta.labeling`` value that declares a keyframe dataset."""
-    return {"mode": KEYFRAME, "clip": (clip or ClipSpec()).to_dict()}
+def labeling_meta(clip: Optional[ClipSpec] = None, behaviors: str = "single") -> Dict[str, Any]:
+    """The ``meta.labeling`` value that declares a keyframe dataset.
+
+    ``behaviors`` is written only when it is ``multi_head``: a single-behavior
+    file stays exactly what it was before groups existed.
+    """
+    out: Dict[str, Any] = {"mode": KEYFRAME, "clip": (clip or ClipSpec()).to_dict()}
+    if behaviors == "multi_head":
+        out["behaviors"] = "multi_head"
+    return out
 
 
-def set_labeling(meta: Dict[str, Any], clip: Optional[ClipSpec] = None) -> Dict[str, Any]:
+def set_labeling(
+    meta: Dict[str, Any], clip: Optional[ClipSpec] = None, behaviors: str = "single"
+) -> Dict[str, Any]:
     """Declare ``meta`` keyframe-labelled, in place. Returns it for chaining."""
-    meta["labeling"] = labeling_meta(clip)
+    meta["labeling"] = labeling_meta(clip, behaviors)
     return meta
 
 
@@ -301,6 +313,27 @@ def _field(obj: Any, name: str, default: int) -> int:
         return default
 
 
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _vocabulary(dataset: Any, action_names: Sequence[str], vocab: Any = None) -> Any:
+    """The vocabulary to count with: given, else the file's, else the names as one list."""
+    from . import behaviors
+
+    if vocab is not None:
+        return vocab
+    if dataset is not None and behaviors.behavior_mode_of(dataset) == behaviors.MULTI_HEAD:
+        try:
+            return behaviors.vocabulary_of(dataset)
+        except ValueError:
+            pass
+    return behaviors.BehaviorVocabulary.single(action_names)
+
+
 @dataclass(frozen=True)
 class KeyframeSummary:
     """How much keyframe labelling a dataset holds."""
@@ -309,9 +342,14 @@ class KeyframeSummary:
     keyframes: int = 0
     empty_keyframes: int = 0
     instances: int = 0
+    #: Boxes with at least one behavior answered (single: with a behavior).
     with_behavior: int = 0
-    #: Instances per action id, ``len(action_names)`` long.
+    #: Answers per flat behavior number, ``len(action_names)`` long. With
+    #: groups, one box contributes once per group it has an answer for.
     per_action: Tuple[int, ...] = ()
+    #: Boxes with every group answered. Equal to ``with_behavior`` when there
+    #: is one group.
+    complete: int = 0
     #: Boxes that still carry a track id. Harmless - training ignores it -
     #: but worth saying, because it means the file came from the old scheme.
     with_track_ids: int = 0
@@ -339,11 +377,21 @@ class KeyframeSummary:
         return text + "."
 
 
-def summarize(dataset: Any, action_names: Sequence[str] = ()) -> KeyframeSummary:
-    """Count keyframes, animals and behavior labels."""
-    n_actions = len(action_names)
+def summarize(
+    dataset: Any, action_names: Sequence[str] = (), vocab: Any = None
+) -> KeyframeSummary:
+    """Count keyframes, animals and behavior labels.
+
+    ``vocab`` (a :class:`~htrtdetr.annotation.behaviors.BehaviorVocabulary`)
+    defaults to the file's own: groups if it declares them, else
+    ``action_names`` as one list.
+    """
+    from . import behaviors
+
+    vocab = _vocabulary(dataset, action_names, vocab)
+    n_actions = max(len(action_names), len(vocab))
     per_action = [0] * n_actions
-    videos = keyframes = empty = instances = with_behavior = tracked = 0
+    videos = keyframes = empty = instances = with_behavior = tracked = complete = 0
     for video in _videos(dataset):
         frames = list(video.get("frames") or [])
         if not frames:
@@ -356,9 +404,13 @@ def summarize(dataset: Any, action_names: Sequence[str] = ()) -> KeyframeSummary
                 empty += 1
             for obj in objects:
                 instances += 1
-                action = _field(obj, "action_id", -1)
-                if action >= 0:
+                labels = behaviors.labels_of(obj, vocab)
+                answered = [a for a in labels if a >= 0]
+                if answered:
                     with_behavior += 1
+                    if len(answered) == len(labels):
+                        complete += 1
+                for action in answered:
                     if action < n_actions:
                         per_action[action] += 1
                 if _field(obj, "track_id", -1) >= 0:
@@ -370,6 +422,7 @@ def summarize(dataset: Any, action_names: Sequence[str] = ()) -> KeyframeSummary
         instances=instances,
         with_behavior=with_behavior,
         per_action=tuple(per_action),
+        complete=complete,
         with_track_ids=tracked,
     )
 
@@ -378,12 +431,16 @@ def check(
     dataset: Any,
     action_names: Sequence[str] = (),
     clip: Optional[ClipSpec] = None,
+    vocab: Any = None,
 ) -> List[str]:
     """Plain-language warnings for a keyframe dataset. Empty means none.
 
     Warnings, not errors: every item here still trains. They are the things a
     person would want to know before spending a round on it.
     """
+    vocab = _vocabulary(dataset, action_names, vocab)
+    if vocab.multi:
+        action_names = list(vocab.names)
     clip = clip or clip_spec_of(dataset)
     out: List[str] = []
     duplicates = 0
@@ -404,19 +461,35 @@ def check(
             if not all(valid):
                 clipped_start += 1
             for obj in frame.get("objects") or []:
+                if vocab.multi:
+                    stored = (obj.get("action_ids") if isinstance(obj, Mapping)
+                              else getattr(obj, "action_ids", None)) or ()
+                    wrong_group = any(
+                        _as_int(a) >= 0 and vocab.group_of(a) != h
+                        for h, a in enumerate(stored)
+                    )
+                    if wrong_group or len(stored) > len(vocab.groups):
+                        bad_action += 1
+                    continue
                 action = _field(obj, "action_id", -1)
                 if action_names and action >= len(action_names):
                     bad_action += 1
 
-    summary = summarize(dataset, action_names)
+    summary = summarize(dataset, action_names, vocab)
     if duplicates:
         out.append(f"{duplicates} keyframe(s) appear twice in the same video; "
                    "only one copy of each should be kept.")
     if past_end:
         out.append(f"{past_end} keyframe(s) lie past the end of their video.")
-    if bad_action:
+    if bad_action and vocab.multi:
+        out.append(f"{bad_action} box(es) have a behavior answer that does not belong "
+                   "to its group; those answers are ignored.")
+    elif bad_action:
         out.append(f"{bad_action} box(es) have a behavior number with no name "
                    f"(there are {len(action_names)} behaviors).")
+    if vocab.multi and summary.with_behavior > summary.complete:
+        out.append(f"{summary.with_behavior - summary.complete:,} box(es) have some behavior "
+                   "groups unanswered; each group trains on the answers it has.")
     if clipped_start:
         out.append(f"{clipped_start} keyframe(s) are closer to the start of the "
                    "video than one clip; their clips repeat the first frame.")
@@ -487,36 +560,62 @@ def to_keyframes(
 # For the annotator
 # ══════════════════════════════════════════════════════════════════════════
 
-def keyframe_marks(annotations: Mapping[int, Sequence[Any]]) -> List[Tuple[int, int]]:
-    """``(frame, action_id)`` for every box with a behavior, frame order.
+def _single_vocabulary(vocab: Any) -> Any:
+    from . import behaviors
+
+    return vocab if vocab is not None else behaviors.BehaviorVocabulary.single(())
+
+
+def keyframe_marks(
+    annotations: Mapping[int, Sequence[Any]], vocab: Any = None
+) -> List[Tuple[int, int]]:
+    """``(frame, action_id)`` for every behavior answer, frame order.
 
     The timeline's behavior lane in keyframe mode: one tick per labelled
-    animal, coloured by what it is doing, instead of interval bars.
+    animal, coloured by what it is doing, instead of interval bars. With
+    groups, one tick per group answered.
     """
+    from . import behaviors
+
+    vocab = _single_vocabulary(vocab)
     marks: List[Tuple[int, int]] = []
     for frame in sorted(annotations):
         for obj in annotations.get(frame) or ():
-            action = _field(obj, "action_id", -1)
-            if action >= 0:
-                marks.append((int(frame), action))
+            for action in behaviors.labels_of(obj, vocab):
+                if action >= 0:
+                    marks.append((int(frame), int(action)))
     return marks
 
 
-def frame_status(objects: Sequence[Any]) -> Tuple[int, int]:
-    """``(boxes, boxes without a behavior)`` on one keyframe."""
+def frame_status(objects: Sequence[Any], vocab: Any = None) -> Tuple[int, int]:
+    """``(boxes, boxes still missing an answer)`` on one keyframe."""
+    from . import behaviors
+
+    vocab = _single_vocabulary(vocab)
     boxes = len(objects)
-    missing = sum(1 for obj in objects if _field(obj, "action_id", -1) < 0)
+    missing = sum(1 for obj in objects if not behaviors.is_complete(obj, vocab))
     return boxes, missing
 
 
-def keyframe_sentence(objects: Sequence[Any]) -> str:
-    """``3 animals - 1 still needs a behavior.`` for the Inspector."""
-    boxes, missing = frame_status(objects)
+def keyframe_sentence(objects: Sequence[Any], vocab: Any = None) -> str:
+    """``3 animals - 1 still needs a behavior.`` for the Inspector.
+
+    With groups the open ones are named: ``... (social).``
+    """
+    from . import behaviors
+
+    vocab = _single_vocabulary(vocab)
+    boxes, missing = frame_status(objects, vocab)
     if boxes == 0:
         return "No animals boxed on this frame."
     text = f"{boxes} animal{'s' if boxes != 1 else ''}"
     if missing:
-        return text + f" - {missing} still need{'s' if missing == 1 else ''} a behavior."
+        text += f" - {missing} still need{'s' if missing == 1 else ''} a behavior"
+        if vocab.multi:
+            open_groups = sorted({h for obj in objects
+                                  for h in behaviors.missing_groups(obj, vocab)})
+            text += " (" + ", ".join(vocab.heads[h] for h in open_groups) + ")"
+        return text + "."
     return text + " - every one has a behavior."
 
 

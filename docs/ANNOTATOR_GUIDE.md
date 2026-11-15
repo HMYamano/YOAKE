@@ -60,7 +60,7 @@ Timelineは動画ごとに切り替わります。全動画をつないだ一本
 | 操作 | 内容 |
 |---|---|
 | 箱 | いつもどおり `C` / `W` / `E`。そのフレームの**全個体**を囲みます（囲まない場所は背景として学習されます） |
-| 行動 | 箱を選んで数字キー `1`〜`9`（Inspectorの Behavior でも可）。判断できない個体は付けなくて構いません — 箱は検出の学習に使われ、行動の学習からは外れます |
+| 行動 | 箱を選んで数字キー `0`〜`9`（Inspectorの Behavior でも可）。判断できない個体は付けなくて構いません — 箱は検出の学習に使われ、行動の学習からは外れます |
 | **`P` 文脈ループ** | そのフレームの **1.0秒前〜0.5秒後** を繰り返し再生します。キーフレームの箱は輪郭だけ重なり、ループ中に数字キーを押してもラベルはキーフレームに付きます。`P` / `Esc` / キャンバスのクリック / フレーム移動で戻ります |
 | 箱の色 | 行動の色（Timelineと同じ）。行動未判定は灰色・塗りなし |
 | Inspector | 「3 animals - 1 still needs a behavior.」のように、そのキーフレームの残りを表示 |
@@ -70,6 +70,25 @@ Timelineは動画ごとに切り替わります。全動画をつないだ一本
 Settings > Tracking > **What do you label?** でいつでも切り替えられます。**切り替えても保存済みのTrack IDや区間は書き換えません。** 既存Project（この設定が無いもの）は **Tracks** として開きます。`meta.labeling.mode = "keyframe"` を持つ `annotations.json` を開くと Keyframes のProjectになります。
 
 学習後の解析は `yoake predict` → `yoake analyze mode=bouts predictions=... output_dir=...` です（bouts.csv / summary.json / population.csv / proximity.csv）。
+
+### 行動をグループに分ける（multi-head、オプション）
+
+既定は **1個体1行動** です。「歩きながら求愛する」のように同時に成り立つ行動を付けたいときだけ、Create Project の Behaviors で **Several behavior groups (multi-head)** を選び、1行に1グループずつ書きます（あとから Settings > Labels > **Edit behaviors...** でも変えられます）。
+
+```
+locomotion: still, walk, run
+social: none, courtship, copulation
+```
+
+| 操作 | 内容 |
+|---|---|
+| 数字キー | 全グループ通しの番号（上の例では `0`〜`2` が locomotion、`3`〜`5` が social）。押した行動は**そのグループの答えだけ**を置き換え、ほかのグループの答えは残ります |
+| Set behavior / Inspector | グループごとに見出しとメニュー（Not set で取り消し） |
+| 箱 | 最初のグループの行動の色。**全グループに答えが付くまで塗りません**。ラベルは `walk + courtship`、未回答は `?` |
+| Inspector の進捗 | 「3 animals - 1 still needs a behavior (social).」のように、足りないグループ名を出します |
+| 語彙の編集 | 付けた答えは**名前で**付け直されます。途中に行動を足しても後ろのグループの答えはずれません（名前を変えた行動の答えは未回答に戻ります） |
+
+グループの中では1つを選ぶので、「していない」も答えとして残せるように各グループに `none` を入れておくのがおすすめです。multi-head は Keyframes 方式でだけ選べます。学習・推論・bout 解析はグループごとに行われます（bouts.csv に `group` 列が付きます）。
 
 ## Track IDを使うか使わないか
 

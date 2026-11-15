@@ -664,13 +664,8 @@ class AnnotationApp(
                     tag="setup_actions_fold",
                     default_open=False,
                 ):
-                    dpg.add_text("Comma-separated, in display order")
-                    dpg.add_input_text(
-                        tag="setup_actions",
-                        default_value=", ".join(_DEFAULT_ACTIONS),
-                        width=-1,
-                        multiline=False,
-                    )
+                    # One behavior per animal, or groups (gui/behavior_groups.py).
+                    self._build_setup_behaviors(", ".join(_DEFAULT_ACTIONS), w - 80)
                 dpg.add_spacer(height=8)
 
                 # The labelling scheme: decided once, before the first box.
@@ -817,6 +812,9 @@ class AnnotationApp(
             self.open_project(Path(raw_dir) / PROJECT_FILE)
             return
 
+        vocab = self._read_setup_behaviors(_DEFAULT_ACTIONS)
+        if vocab is None:
+            return
         self._preserve_project_to_recovery()
         from .annotation.project import ProjectSession
         from .annotation.session import VideoSession
@@ -828,13 +826,10 @@ class AnnotationApp(
         self._video_session = VideoSession()
         self.project_name = dpg.get_value("setup_proj_name").strip() or "untitled"
         raw_cls = dpg.get_value("setup_classes")
-        raw_act = dpg.get_value("setup_actions")
         self.class_names = [s.strip() for s in raw_cls.split(",") if s.strip()]
-        self.action_names = [s.strip() for s in raw_act.split(",") if s.strip()]
         if not self.class_names:
             self.class_names = ["fly"]
-        if not self.action_names:
-            self.action_names = list(_DEFAULT_ACTIONS)
+        self._apply_setup_behaviors(vocab)
         self.project_dir = Path(raw_dir).expanduser() if raw_dir else None
         # "At video end" is not asked on this screen any more: it is a question
         # about finishing video 1 put to someone who has not opened it, and it
@@ -1062,40 +1057,7 @@ class AnnotationApp(
         "tool_mode_text": "topbar",
     }
 
-    def _update_action_buttons(self) -> None:
-        if not dpg.does_item_exist("action_buttons_group"):
-            return
-        dpg.delete_item("action_buttons_group", children_only=True)
-        action_colors = [
-            (85, 85, 85, 255),
-            (21, 101, 192, 255),
-            (46, 125, 50, 255),
-            (230, 81, 0, 255),
-            (183, 27, 28, 255),
-        ]
-        for i, name in enumerate(self.action_names):
-            col = action_colors[i % len(action_colors)]
-            label = f"[{i}] {name.capitalize()}"
-            with dpg.theme() as btn_theme:
-                with dpg.theme_component(dpg.mvButton):
-                    dpg.add_theme_color(dpg.mvThemeCol_Button, col)
-                    dpg.add_theme_color(
-                        dpg.mvThemeCol_ButtonHovered,
-                        (min(col[0] + 30, 255), min(col[1] + 30, 255), min(col[2] + 30, 255), 255),
-                    )
-            btn = dpg.add_button(
-                label=label,
-                width=-1,
-                height=28,
-                parent="action_buttons_group",
-                callback=lambda s, a, u: self.set_action(u),
-                user_data=i,
-            )
-            dpg.bind_item_theme(btn, btn_theme)
-
-        # Update action combo
-        if dpg.does_item_exist("sel_action"):
-            dpg.configure_item("sel_action", items=["(none)"] + list(self.action_names))
+    # _update_action_buttons lives in gui/behavior_groups.py (groups get headings).
 
     # ─── Navigation bar ──────────────────────────────────────────────
 
@@ -1671,9 +1633,7 @@ class AnnotationApp(
             self._draw_dashed_rect(c1, c2, col, thickness=thick)
 
         # Label
-        action_s = (
-            self.action_names[obj.action_id] if 0 <= obj.action_id < len(self.action_names) else "?"
-        )
+        action_s = self._behavior_text(obj)
         if self.keyframe_mode:
             label = self._keyframe_box_label(obj, action_s)
         elif self.use_track_ids:
@@ -2826,15 +2786,13 @@ class AnnotationApp(
         if self._selected is None:
             self._status(f"No box selected. Action [{action_id}] was ignored.")
             return
-        if self._selected.action_id == action_id:
+        if not self._behavior_would_change(self._selected, action_id):
             return
         self._push_undo()
         self._mark_dirty()
-        self._selected.action_id = action_id
-        name = (
-            self.action_names[action_id] if action_id < len(self.action_names) else str(action_id)
-        )
-        self._status(f"Action set to {name}")
+        # One behavior, or this group's answer only (gui/behavior_groups.py).
+        self._apply_behavior(self._selected, action_id)
+        self._status(self._behavior_status(self._selected))
         self._refresh_sidebar()
         self._render_canvas()
 
@@ -2972,10 +2930,7 @@ class AnnotationApp(
                 "classes_display", "\n".join(f"  [{i}] {n}" for i, n in enumerate(self.class_names))
             )
         if dpg.does_item_exist("actions_display"):
-            dpg.set_value(
-                "actions_display",
-                "\n".join(f"  [{i}] {n}" for i, n in enumerate(self.action_names)),
-            )
+            dpg.set_value("actions_display", self._behavior_display_text())
 
     # ═══════════════════════════════════════════════════════════════════
     # Sidebar Refresh
@@ -3002,11 +2957,7 @@ class AnnotationApp(
             objects = self.annotations.get(self.current_frame_idx, [])
             rows, selected_row = [], None
             for obj in objects:
-                action = (
-                    self.action_names[obj.action_id]
-                    if 0 <= obj.action_id < len(self.action_names)
-                    else "-"
-                )
+                action = self._behavior_text(obj, "-")
                 mark = "*" if obj.track_id in self._trackers else " "
                 flags = " [occluded]" if obj.occluded else ""
                 name = (
@@ -3044,7 +2995,8 @@ class AnnotationApp(
             "guided_help": self.show_onboarding,
             "set_project_dir": self._set_project_dir_dialog,
             "add_class": self._add_class_label_dialog,
-            "add_action": self._add_action_label_dialog,
+            "add_action": self.add_behavior_dialog,
+            "edit_behaviors": self.open_behavior_editor,
             "auto_track": self._set_auto_track,
             "use_track_ids": self.set_use_track_ids,
             "label_mode": self.set_label_mode,
@@ -4497,6 +4449,7 @@ class AnnotationApp(
             "set_class": self._insp_set_class,
             "set_track": self._insp_set_track,
             "set_action_name": self._insp_set_action,
+            "set_group_behavior": self._insp_set_group_behavior,
             "set_occluded": lambda v: self._insp_set_flag("occluded", v),
             "set_crowd": lambda v: self._insp_set_flag("is_crowd", v),
             "toggle_obb": self._insp_toggle_obb,
@@ -4621,6 +4574,7 @@ class AnnotationApp(
                 track_id=obj.track_id,
                 class_id=obj.class_id,
                 action_id=obj.action_id,
+                **self._inspector_behavior_fields(obj),
                 score=obj.score,
                 occluded=obj.occluded,
                 is_crowd=obj.is_crowd,

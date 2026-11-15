@@ -325,12 +325,35 @@ class ProjectSession:
         if self.settings.get("label_mode") == "keyframe":
             # The file says what its frames mean, so training reads them as
             # keyframes (docs/KEYFRAME_BEHAVIOR.md) without being told again.
+            from .behaviors import MULTI_HEAD, SINGLE
             from .keyframes import ClipSpec, set_labeling
 
-            set_labeling(data.meta, ClipSpec.from_dict(self.settings.get("clip") or {}))
+            vocab = self.behavior_vocabulary()
+            if vocab.multi:
+                # The groups are the vocabulary; the flat list is derived from
+                # them, so the two can never disagree in a file we wrote (§15).
+                data.action_groups = vocab.as_groups()
+                data.action_names = list(vocab.names)
+            set_labeling(
+                data.meta,
+                ClipSpec.from_dict(self.settings.get("clip") or {}),
+                MULTI_HEAD if vocab.multi else SINGLE,
+            )
         else:
             data.meta.pop("labeling", None)
         return data
+
+    def behavior_vocabulary(self):
+        """The behaviors this project labels: one list, or groups (multi-head).
+
+        Groups only count in a keyframe project (docs/KEYFRAME_BEHAVIOR.md
+        §15); the tracks scheme edits behaviors as intervals, one at a time.
+        """
+        from .behaviors import BehaviorVocabulary, project_vocabulary
+
+        if self.settings.get("label_mode") != "keyframe":
+            return BehaviorVocabulary.single(self.action_names)
+        return project_vocabulary(self.settings, self.action_names, self.action_groups)
 
     @classmethod
     def from_annotation(cls, path: Path) -> ProjectSession:
@@ -381,6 +404,13 @@ class ProjectSession:
             project.settings["label_mode"] = KEYFRAME
             project.settings["use_track_ids"] = False
             project.settings["clip"] = clip_spec_of(data).to_dict()
+            from .behaviors import MULTI_HEAD, behavior_mode_of, vocabulary_of
+
+            if behavior_mode_of(data) == MULTI_HEAD:
+                vocab = vocabulary_of(data)
+                project.settings["behaviors"] = MULTI_HEAD
+                project.action_groups = vocab.as_groups()
+                project.action_names = list(vocab.names)
         return project
 
     def snapshot(

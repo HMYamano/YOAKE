@@ -290,12 +290,27 @@ class SettingsDialog:
                 "Behaviors", "Keys 0-9 set the selected box's behavior in this order."
             )
             dpg.add_text("", tag="actions_display", color=theme.TEXT, wrap=self.WIDTH - 60)
-            widgets.secondary_button(
-                "Add behavior...",
-                self._cb("add_action"),
-                width=200,
-                height=28,
-                tag=self._t("add_action"),
+            with dpg.group(horizontal=True):
+                widgets.secondary_button(
+                    "Add behavior...",
+                    self._cb("add_action"),
+                    width=200,
+                    height=28,
+                    tag=self._t("add_action"),
+                )
+                # One list, or groups (multi-head) - docs/KEYFRAME_BEHAVIOR.md §15.
+                widgets.secondary_button(
+                    "Edit behaviors...",
+                    self._cb("edit_behaviors"),
+                    width=200,
+                    height=28,
+                    tag=self._t("edit_behaviors"),
+                )
+            widgets.attach_tooltip(
+                self._t("edit_behaviors"),
+                "Rename, reorder or group the behaviors. In a keyframe project you "
+                "can split them into groups - one answer per group, so a fly can "
+                "walk and court at once. Answers already given follow their names.",
             )
 
     # -- Tracking ---------------------------------------------------------

@@ -43,7 +43,23 @@ __all__ = [
     "HierarchicalClassifier",
     "MultiHeadClassifier",
     "BehaviorPrediction",
+    "segmented_softmax",
 ]
+
+
+def segmented_softmax(logits: torch.Tensor, sizes: Sequence[int]) -> torch.Tensor:
+    """softmax inside each consecutive block of ``sizes`` columns.
+
+    multi-head の平坦な logit (head を順に連結したもの) を確率にする。各 head の
+    区間の和が 1 になる。全体を 1 つの softmax に通すと head 同士が確率を奪い合い、
+    「walk かつ courtship」を表せなくなる (docs/KEYFRAME_BEHAVIOR.md §15)。
+    """
+    sizes = [int(s) for s in sizes]
+    if not sizes or sum(sizes) != logits.shape[-1]:
+        raise ValueError(
+            f"segmented_softmax: head sizes {sizes} do not add up to {logits.shape[-1]} columns"
+        )
+    return torch.cat([F.softmax(p, dim=-1) for p in logits.split(sizes, dim=-1)], dim=-1)
 
 
 class FeatureGating(nn.Module):
@@ -239,9 +255,14 @@ class BehaviorPrediction:
         gates: group 名 → (N,) の gate 重み
         head_logits: multi_head 時の head 名 → (N, C_head)
         node_logits: hierarchical 時の内部ノード logit
+        head_sizes: multi_head 時の各 head のクラス数 (head_logits と同じ順)。
+            multi_head でも ``logits`` / ``probs`` は埋まる: logits は head の logit を
+            順に連結したもの、probs は head ごとの softmax の連結 (各区間の和が 1)。
     """
 
-    __slots__ = ("logits", "probs", "evidence", "gates", "head_logits", "node_logits")
+    __slots__ = (
+        "logits", "probs", "evidence", "gates", "head_logits", "node_logits", "head_sizes",
+    )
 
     def __init__(
         self,
@@ -258,6 +279,15 @@ class BehaviorPrediction:
         self.gates = gates or {}
         self.head_logits = head_logits or {}
         self.node_logits = node_logits or {}
+        self.head_sizes: Tuple[int, ...] = tuple(
+            int(v.shape[-1]) for v in self.head_logits.values()
+        )
+        if self.head_logits and self.logits is None:
+            # multi_head: 平坦な形も持たせる (検出順への並べ替え・保存・説明が
+            # single と同じ経路で済む)。
+            self.logits = torch.cat(list(self.head_logits.values()), dim=-1)
+        if self.head_logits and self.probs is None and self.logits is not None:
+            self.probs = segmented_softmax(self.logits, self.head_sizes)
 
     def explain(
         self,
@@ -277,7 +307,13 @@ class BehaviorPrediction:
         """
         if self.logits is None or not self.evidence:
             return {}
-        aid = action_id if action_id is not None else int(self.logits[index].argmax())
+        if action_id is not None:
+            aid = action_id
+        elif self.head_sizes:
+            # multi_head: 既定は最初の head の最尤クラス (平坦な argmax は head を跨ぐ)
+            aid = int(self.logits[index, : self.head_sizes[0]].argmax())
+        else:
+            aid = int(self.logits[index].argmax())
         return {
             group: float(contrib[index, aid].detach())
             for group, contrib in self.evidence.items()

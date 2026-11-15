@@ -74,7 +74,8 @@ def save_confusion_matrix(
     arr = np.array(cm, dtype=float)
     if normalize:
         row_sum = arr.sum(axis=1, keepdims=True)
-        arr = np.where(row_sum > 0, arr / row_sum, 0.0)
+        # rows with no examples stay 0 (no divide-by-zero warning per epoch)
+        arr = np.divide(arr, row_sum, out=np.zeros_like(arr), where=row_sum > 0)
 
     n = len(class_names)
     figsize = max(6, n * 0.8)

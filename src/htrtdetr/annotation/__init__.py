@@ -15,6 +15,7 @@ draws it does. The modules answer, in order:
                      per-frame ``action_id`` the file format already stores.
 :mod:`keyframes`     The keyframe scheme: label one image (boxes and
                      behaviors, no track ids), take the time from the video.
+:mod:`behaviors`     One behavior per animal, or one per group (multi-head).
 :mod:`features`      Cheap per-frame descriptors — motion, difference, focus.
 :mod:`sampling`      Given a budget, which frames and clips should a human
                      spend it on?
@@ -40,5 +41,5 @@ from __future__ import annotations
 
 __all__ = [
     "status", "tracklet", "quality", "review_queue", "intervals", "keyframes",
-    "features", "sampling", "propagation", "cache",
+    "behaviors", "features", "sampling", "propagation", "cache",
 ]

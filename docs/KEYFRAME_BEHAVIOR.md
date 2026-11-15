@@ -1,7 +1,7 @@
 # キーフレーム行動ラベリング — YOWO 型の再設計計画
 
 > ブランチ: `keyframe-behavior`。この文書は実装の**前に**書いた計画であり、実装はこれに従う。
-> 末尾の §11 が進捗チェックリスト、§12 が利用者に確認したい未決事項。
+> 末尾の §11 が進捗チェックリスト、§12 が利用者に確認した決定事項、§15 が multi-head 行動 (オプション) の設計。
 
 ---
 
@@ -343,26 +343,30 @@ ID が入れ替わると個体別の統計は混ざるが、bout の検出その
 - [x] P6 アノテーター — `tests/test_keyframe_mode_gui.py`
 - [x] P7 ラウンド — `tests/test_keyframe_round.py` (trainer は既存テストと同じく偽装)
 - [x] P8 文書 — `DATASET_FORMAT.md` §8、`ANNOTATOR_GUIDE.md`「キーフレームで付ける」
+- [x] P9 multi-head 行動 (§15、2026-11-15 の決定事項 1) — `tests/test_behavior_groups.py` (語彙・保存・データセット・GT 対応付け・損失・モデルの出力順・検証・CLI・streaming・bout)、`tests/test_behavior_groups_gui.py` (キー、箱の塗り、Inspector のグループ別メニュー、語彙の編集、Create Project)
 
 合成データでの end-to-end (CPU, 2 epoch): `train stage=1` → `train stage=2` (クリップ) →
 `predict` (checkpoint から keyframe / window / stride を復元) → `analyze mode=bouts` が通ることを確認。
 **実データ (20 本 × 1 時間のハエ動画) での学習・精度評価はまだ行っていない。**
 
+multi-head でも同じ流れを合成データ (2 匹、locomotion 3 クラス + social 2 クラス、キーフレーム 25 枚、CPU)
+で確認: `train stage=1` → `train stage=2` (3 epoch で `loss_action` 0.35 → 0.17、`macro_f1_locomotion`
+1.00 / `macro_f1_social` 0.50、平均 0.75) → `predict` (`head_action_ids`、グループごとに和 1 の
+`action_probs`、`_meta.action_groups`) → `analyze mode=bouts` (グループ別の bout、`group` 列)。
+
 ---
 
-## 12. 未決事項 (確認したい点)
+## 12. 決定事項 (2026-11-15 に確認)
 
-既定値を置いて先に進め、確認後に変える。
+§12 で既定値を置いて先に進めていた 5 点に回答をもらった。
 
-1. **行動の語彙と排他性。** 既定は「1 個体 1 行動 (排他)」+ 未判定 `-1`。歩きながら求愛する等の同時成立を
-   扱うなら multi-head (`locomotion` / `social` …、既存の `classifier_type: multi_head`) にする。
-2. **クリップの長さと間隔。** 既定 8 フレーム × 4 おき ≒ 1.0 秒 @30 fps。グルーミングの速い脚の動きを
-   捉えるなら間隔を詰める (16 × 2 など。学習コストは T に比例)。
-3. **キーフレームの位置。** 既定は末尾 (因果的 = streaming と同じ)。オフライン解析専用なら中央に置く方が
-   精度は上がるはずだが、streaming と学習の形が変わる。
-4. **交尾中の重なり。** 2 匹が 1 塊に見える場面を「2 つの箱 (各々 copulation)」とするか、
-   「1 つの箱 (ペア)」とするか。既定は 2 つの箱。
-5. **既存の区間ラベル。** 変換してキーフレームとして使う / 破棄する。
+| # | 問い | 決定 | 実装への影響 |
+|---|---|---|---|
+| 1 | 行動の語彙と排他性 | **1 個体 1 行動 (排他) が既定。multi-head をオプションで選べる** | §15 で設計・実装 |
+| 2 | クリップの長さと間隔 | 回答なし → 既定 8 × 4 (≒ 1.0 秒 @30 fps) のまま | 変更なし (`settings["clip"]` / `data.clip_length` で変えられる) |
+| 3 | キーフレームの位置 | **末尾** (因果的、streaming と同じ形) | 変更なし。`anchor: center` は学習で拒否したまま |
+| 4 | 交尾中の重なり | **個体ごとに囲む** (2 匹なら箱 2 つ) | 変更なし |
+| 5 | 既存の区間ラベル | **使わない** | 変換経路 (`to_keyframes()`) は残すが、ラウンドや文書の手順には入れない |
 
 ---
 
@@ -399,6 +403,13 @@ ID が入れ替わると個体別の統計は混ざるが、bout の検出その
    (`datasets/release/` のようなラベル+動画パスのみのデータ) のもの。キーフレーム 200 枚なら
    1 epoch あたりデコードだけで約 22 秒なので、本学習では `data.num_workers` を上げる。
 
+9. **multi-head の実装で変えた点 (§15)。** `BehaviorPrediction` は multi_head でも平坦な
+   `logits` (head の連結) と `probs` (head ごとの softmax の連結) を持つようにした。検出順への
+   並べ替え・保存・説明 (evidence) が single と同じ経路で済み、旧 ActionHead に落ちる分岐
+   (§15.6 の 3) も自然に消える。GUI の区切りは `·` ではなく ` + ` (DearPyGui の既定フォントに
+   無い文字を避ける)。グループまわりの画面は `gui/behavior_groups.py` に置き、`KeyframeModeMixin`
+   が継承する。`_update_action_buttons` をそこへ移したので `annotator.py` は 5091 → 5045 行。
+
 ## 14. 次にやること
 
 * 実データでの検証: 20 本のうち数本でキーフレーム 100–200 枚 → ラウンド数回 → 残りの動画で
@@ -407,8 +418,124 @@ ID が入れ替わると個体別の統計は混ざるが、bout の検出その
 * 行動の pre-fill: Analyze でクリップ推論を走らせ、行動候補を Y/N で確認できるようにする
   (今は箱候補だけが出て、行動は数字キーで付ける)。
 * Pick frames to label に「行動の不確実性」と「評価用ランダムキーフレーム」を足す。
-* final pass をキーフレーム方式の「解析結果の抜き取り検証」に組み替える。
+* final pass をキーフレーム方式の「解析結果の抜き取り検証」に組み替える。その際、release
+  (`annotation/release.py`) に multi-head の宣言と `action_groups` も書く (今は箱の `action_ids`
+  は残るが、グループの定義は書かれない)。
 * ハブの解析ページに bout / エソグラム表示。
+
+---
+
+## 15. multi-head 行動 (オプション)
+
+§12-1 の決定: **既定は 1 個体 1 行動 (排他)**。「歩きながら求愛する」のように同時に成り立つ
+行動を扱いたいときだけ、プロジェクトで **multi-head** を選ぶ。multi-head では行動を
+いくつかの**グループ**に分け、各グループの中では排他、グループ同士は同時に成り立つ。
+
+```
+locomotion: still, walk, run
+social:     none, courtship, copulation
+```
+
+この例では、1 匹につき locomotion から 1 つ、social から 1 つを選ぶ。単一の softmax では
+「walk かつ courtship」を表せないが、グループごとの softmax なら表せる。グループを 1 つしか
+作らなければ、従来の排他な 1 行動と同じになる。
+
+### 15.1 なぜグループ (head) で、multi-label (行動ごとの sigmoid) ではないのか
+
+* **欠けた答えと「していない」を区別できる。** multi-label では、チェックの付いていない行動が
+  「していない」なのか「見ていない」なのか分からない。グループなら、各グループに `none` を置けば
+  「していない」は明示的な答えになり、未回答 (`-1`) と区別できる。
+* **ラベル付けの手間が 1 行動の場合と同じ形になる。** 1 グループにつきキーを 1 回押すだけで、
+  行動ごとに on/off を判断する必要がない。
+* **bout 解析がそのまま使える。** グループの中は排他なので、§7.2 の sticky-HMM をグループごとに
+  回せばよい (状態がグループ内の行動)。
+* **モデル側に部品がある。** `EvidenceBehaviorHead(classifier_type="multi_head")` と
+  `MultiHeadActionLoss` は既に実装されている (ただし学習経路は §15.6 のとおり壊れていた)。
+
+### 15.2 ラベル形式
+
+```json
+{
+  "meta": {"labeling": {"mode": "keyframe", "clip": {...}, "behaviors": "multi_head"}},
+  "action_names": ["still", "walk", "run", "none", "courtship", "copulation"],
+  "action_groups": {"locomotion": ["still", "walk", "run"],
+                    "social": ["none", "courtship", "copulation"]},
+  "videos": [{"frames": [{"objects": [
+    {"bbox": [..], "track_id": -1, "action_id": 1, "action_ids": [1, 4]}
+  ]}]}]
+}
+```
+
+| 項目 | 意味 |
+|---|---|
+| `meta.labeling.behaviors` | `"single"` (既定、無ければこちら) か `"multi_head"`。**宣言が無い限り multi-head として扱わない。** 既存の `action_groups` は階層分類の定義にも使われてきたため、それがあるだけでは multi-head にしない。 |
+| `action_groups` | グループ名 → 行動名 (順序つき)。multi-head の語彙の**唯一の正**。 |
+| `action_names` | グループを順に連結した平坦な一覧 (`action_groups` から機械的に作る)。行動番号 (色、キー 0-9、CSV) は全グループ通しの番号。別グループに同じ名前があるときは `social:none` のようにグループ名を付けて区別する。 |
+| `action_ids` | 1 個体の答え。**グループの順に 1 つずつ**、通し番号で書く。`-1` はそのグループを判断しなかった (そのグループの損失から外す)。 |
+| `action_id` | `action_ids[0]` (最初のグループの答え) の写し。multi-head を知らない読み手が、最初のグループだけの単一ラベルとして読めるように残す。 |
+
+### 15.3 ラベリングツール
+
+* **Create Project** の Behaviors 欄で「One behavior per animal (recommended)」か
+  「Several behavior groups (multi-head)」を選ぶ。multi-head では 1 行に 1 グループ
+  (`group: a, b, c`) を書く。**Settings > Labels** でも同じ書式で編集できる。
+* キー 0-9 は全グループ通しの番号。押した行動は**そのグループの答えだけ**を置き換え、
+  ほかのグループの答えは残る。Inspector の「Set behavior」はグループごとに見出しを付けて並べる。
+* 箱は最初のグループの行動の色で描き、全グループに答えが付くまでは塗らない (枠だけ)。
+  「塗られている = 終わった」は単一行動のときと同じ。ラベルは `walk + courtship` のように
+  並べ、未回答のグループは `?` で示す。
+* Inspector の進捗文は「3 animals - 1 still needs a behavior (social).」のように、
+  答えの足りないグループ名を出す。
+* 語彙を変えたら、既存の答えは**グループ名と行動名で付け直す**。グループの途中に行動を足しても、
+  後ろのグループの答えがずれない。消した行動の答えは未回答 (`-1`) に戻る。
+* multi-head は keyframe 方式でだけ選べる。tracks 方式の区間ラベルは単一行動のまま。
+
+### 15.4 学習
+
+* CLI はデータの宣言を読み、`model.behavior.classifier_type = multi_head`、
+  `model.behavior.heads = action_groups`、`num_actions = len(action_names)` を設定する
+  (`model.behavior.classifier_type` を明示したときはそちらを優先し、データと食い違えば止める)。
+  決定は checkpoint の config に入るので、`predict` は同じ形のモデルを組み立てる。
+* `KeyframeClipDataset` は `head_action_ids` (N × グループ数、グループ内番号、`-1` は未回答) を
+  targets に加える。Stage 2 の「行動ラベルの無いキーフレームは飛ばす」は、どれか 1 グループでも
+  答えがあれば残す。
+* モデルは各グループの logit を**検出順に並べ直してから**損失に渡す (`action_head_logits`)。
+  平坦な `action_logits` はグループの logit の連結、`action_probs` はグループごとの softmax の連結
+  (各グループの区間の和が 1)。
+* 損失はグループごとの focal cross-entropy の平均 (`MultiHeadActionLoss`)。答えの無いグループは飛ばす。
+* 検証はグループごとの macro-F1 を出し (`macro_f1_<group>`)、その平均を `macro_f1` とする。
+  ラウンドの記録 (`rounds.json` の behavior_score) もこの平均。
+* ラウンドの「行動ラベルが 8 個以上」は、どれか 1 グループに答えのある箱を 1 個と数える。
+
+### 15.5 推論と解析
+
+* `predictions.json`: 検出ごとに `action_ids` (最初のグループ、互換のため)、`head_action_ids`
+  (グループごとの通し番号)、`action_probs` (平坦、グループごとに和 1)、`head_predictions`
+  (グループ名 → 行動名) を書く。`_meta` に `action_groups` を書く。
+* bout 解析 (`analyze mode=bouts`) は**グループごとに独立に**復号する。1 匹が同時に
+  「walk の bout」と「courtship の bout」を持てる。`bouts.csv` に `group` 列を足し、
+  `summary.json` は `groups.<名前>` にグループごとの時間配分・遷移・潜時を入れる。
+  `population.csv` の列は平坦な行動名で、各個体はグループごとに 1 匹分ずつ寄与する。
+
+### 15.6 既存の multi_head 経路で見つかった不具合 (修正する)
+
+既存の `classifier_type: multi_head` は、forward の形を確かめるテストはあったが、
+学習が一度も通っていなかった。
+
+1. `assign_gt_to_detections` が決め打ちのキー (`action_ids` など) しか検出に写さず、
+   `MultiHeadActionLoss` が読む `action_<head>` は常に `-1` だった。つまり**損失が常に 0** で、
+   multi-head の行動は学習されなかった。
+2. `behavior.head_logits` は track 行の順で、GT は検出順。並べ直さずに損失を計算していた。
+3. multi-head では `BehaviorPrediction.logits` が None なので、モデルは `action_logits` に旧
+   ActionHead の出力を入れていた。検証の macro-F1 は、学習していない別のヘッドを測っていた。
+
+### 15.7 互換性
+
+* 既定は single。`behaviors` の宣言が無いファイル、`settings["behaviors"]` の無いプロジェクトは
+  すべて従来どおり。
+* single のファイルは `action_ids` を書かないので、保存結果は従来とバイト単位で同じ。
+* 単一行動で付けたプロジェクトを後から multi-head にしても、既存の答えは最初のグループの答えとして
+  残る (最初のグループの行動を元の一覧と同じにしておけば番号も変わらない)。
 
 ---
 

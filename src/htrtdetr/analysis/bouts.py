@@ -27,6 +27,13 @@ everything detected in a time bin - so it is the number to trust when the
 tracks have swapped. Per-animal statistics are only as good as identity
 continuity; :func:`summarize` reports each track's coverage so that is visible.
 
+Multi-head behaviors (``docs/KEYFRAME_BEHAVIOR.md`` §15): when the file's
+``_meta`` carries ``action_groups``, every group is decoded **on its own** - a
+fly can be in a walk bout and a courtship bout at once - from its own slice of
+``action_probs`` (each slice sums to 1). ``bouts.csv`` gains a ``group``
+column and ``summary.json`` a ``groups`` section; the flat behavior numbers
+and names stay the ones the model and the labels use.
+
 numpy only, no torch: it runs wherever the predictions file can be read.
 """
 
@@ -46,6 +53,7 @@ __all__ = [
     "TrackSequence",
     "load_predictions",
     "track_sequences",
+    "group_sequences",
     "split_on_gaps",
     "viterbi",
     "enforce_min_bout",
@@ -84,6 +92,8 @@ class Bout:
     start: int
     end: int
     mean_prob: float
+    #: The behavior group (multi-head); empty for a single behavior list.
+    group: str = ""
 
     @property
     def frames(self) -> int:
@@ -141,38 +151,75 @@ def _num_actions(frames: Mapping[int, Mapping[str, Any]]) -> int:
     return max(width, 1)
 
 
+def _blocks(A: int, head_sizes: Optional[Sequence[int]]) -> List[Tuple[int, int]]:
+    """``[(offset, size)]`` of each group; one block of ``A`` without groups."""
+    sizes = [int(s) for s in (head_sizes or ()) if int(s) > 0]
+    if not sizes or sum(sizes) != A:
+        return [(0, A)]
+    return [(sum(sizes[:k]), size) for k, size in enumerate(sizes)]
+
+
+def _normalise_blocks(p: np.ndarray, blocks: Sequence[Tuple[int, int]]) -> np.ndarray:
+    """Each group's slice made to sum to 1 (uniform where it summed to 0)."""
+    out = np.array(p, dtype=np.float64, copy=True)
+    for off, size in blocks:
+        part = out[off:off + size]
+        total = float(part.sum())
+        out[off:off + size] = part / total if total > 0 else 1.0 / size
+    return out
+
+
+def _detection_probs(
+    payload: Mapping[str, Any], i: int, A: int, blocks: Sequence[Tuple[int, int]]
+) -> np.ndarray:
+    """One detection's probabilities: ``action_probs``, else one-hot answers.
+
+    Without probabilities, a group's answer comes from ``head_action_ids``
+    (multi-head) or ``action_ids`` (the first group); a group with neither is
+    uniform - nothing is known about it.
+    """
+    probs = payload.get("action_probs") or []
+    if i < len(probs) and probs[i] is not None and len(probs[i]) == A:
+        return _normalise_blocks(np.asarray(probs[i], dtype=np.float64), blocks)
+    p = np.zeros(A)
+    heads = payload.get("head_action_ids") or []
+    answers = list(heads[i]) if i < len(heads) and heads[i] is not None else []
+    if not answers:
+        aids = payload.get("action_ids") or []
+        answers = [int(aids[i])] if i < len(aids) and aids[i] is not None else []
+    for k, (off, size) in enumerate(blocks):
+        a = int(answers[k]) if k < len(answers) else -1
+        if off <= a < off + size:
+            p[a] = 1.0
+        else:
+            p[off:off + size] = 1.0 / size
+    return p
+
+
 def track_sequences(
     frames: Mapping[int, Mapping[str, Any]],
     num_actions: Optional[int] = None,
+    head_sizes: Optional[Sequence[int]] = None,
 ) -> Dict[int, TrackSequence]:
     """Group detections by ``track_id``. Untracked detections (``-1``) are skipped.
 
     ``action_probs`` is used when present. An older file without it falls back
     to a one-hot of ``action_ids`` - decoding still works, it just cannot weigh
-    a confident frame above an unsure one.
+    a confident frame above an unsure one. With ``head_sizes`` (multi-head),
+    each group's slice of a row sums to 1; without, the whole row does.
     """
     A = int(num_actions) if num_actions else _num_actions(frames)
+    blocks = _blocks(A, head_sizes)
     rows: Dict[int, List[Tuple[int, np.ndarray, Tuple[float, float], float]]] = {}
     for frame in sorted(frames):
         payload = frames[frame]
         boxes = payload.get("boxes") or []
         tids = payload.get("track_ids") or []
-        aids = payload.get("action_ids") or []
-        probs = payload.get("action_probs") or []
         for i, box in enumerate(boxes):
             tid = int(tids[i]) if i < len(tids) else -1
             if tid < 0:
                 continue
-            if i < len(probs) and probs[i] is not None and len(probs[i]) == A:
-                p = np.asarray(probs[i], dtype=np.float64)
-            else:
-                p = np.full(A, 1.0 / A)
-                a = int(aids[i]) if i < len(aids) else -1
-                if 0 <= a < A:
-                    p = np.zeros(A)
-                    p[a] = 1.0
-            total = float(p.sum())
-            p = p / total if total > 0 else np.full(A, 1.0 / A)
+            p = _detection_probs(payload, i, A, blocks)
             x1, y1, x2, y2 = (float(v) for v in box[:4])
             rows.setdefault(tid, []).append(
                 (int(frame), p, ((x1 + x2) / 2, (y1 + y2) / 2), max(x2 - x1, y2 - y1))
@@ -187,6 +234,17 @@ def track_sequences(
             sizes=np.array([r[3] for r in items], dtype=np.float64),
         )
     return out
+
+
+def group_sequences(
+    sequences: Mapping[int, TrackSequence], offset: int, size: int
+) -> Dict[int, TrackSequence]:
+    """The same tracks, keeping only one behavior group's probabilities."""
+    return {
+        tid: TrackSequence(seq.track_id, seq.frames, seq.probs[:, offset:offset + size],
+                           seq.centers, seq.sizes)
+        for tid, seq in sequences.items()
+    }
 
 
 def split_on_gaps(seq: TrackSequence, max_gap: int = DEFAULT_MAX_GAP) -> List[TrackSequence]:
@@ -423,14 +481,17 @@ def population_timeline(
     fps: float,
     bin_s: float = 60.0,
     num_actions: Optional[int] = None,
+    head_sizes: Optional[Sequence[int]] = None,
 ) -> List[Dict[str, float]]:
     """Expected number of animals in each behavior, per time bin. No identity used.
 
     Each detection contributes its probability vector, so an animal 70% likely
     courting adds 0.7 to courtship. Averaged over the frames of the bin, this
-    is "how many animals were doing X", robust to every identity error.
+    is "how many animals were doing X", robust to every identity error. With
+    behavior groups, every animal counts once *per group*.
     """
     A = int(num_actions) if num_actions else _num_actions(frames)
+    blocks = _blocks(A, head_sizes)
     rate = float(fps) if fps and fps > 0 else 1.0
     width = max(1, int(round(float(bin_s) * rate)))
     bins: Dict[int, Dict[str, Any]] = {}
@@ -442,12 +503,16 @@ def population_timeline(
         boxes = payload.get("boxes") or []
         probs = payload.get("action_probs") or []
         aids = payload.get("action_ids") or []
+        heads = payload.get("head_action_ids") or []
         row["animals"] += len(boxes)
         for i in range(len(boxes)):
             if i < len(probs) and probs[i] is not None and len(probs[i]) == A:
-                p = np.asarray(probs[i], dtype=np.float64)
-                total = float(p.sum())
-                row["expected"] += p / total if total > 0 else 0.0
+                row["expected"] += _normalise_blocks(np.asarray(probs[i], dtype=np.float64),
+                                                     blocks)
+            elif len(blocks) > 1 and i < len(heads) and heads[i] is not None:
+                for a in heads[i]:
+                    if 0 <= int(a) < A:
+                        row["expected"][int(a)] += 1.0
             elif i < len(aids) and 0 <= int(aids[i]) < A:
                 row["expected"][int(aids[i])] += 1.0
     out: List[Dict[str, float]] = []
@@ -521,15 +586,18 @@ def write_outputs(
     paths = {name: str(out / name) for name in
              ("bouts.csv", "summary.json", "population.csv", "proximity.csv")}
 
+    grouped = any(b.group for track_bouts in bouts.values() for b in track_bouts)
     with open(paths["bouts.csv"], "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["track_id", "action", "action_name", "start_frame", "end_frame",
-                         "start_s", "duration_s", "mean_prob"])
+        writer.writerow(["track_id"] + (["group"] if grouped else [])
+                        + ["action", "action_name", "start_frame", "end_frame",
+                           "start_s", "duration_s", "mean_prob"])
         for tid in sorted(bouts):
             for bout in bouts[tid]:
-                writer.writerow([bout.track_id, bout.action, _name(action_names, bout.action),
-                                 bout.start, bout.end, round(bout.start / rate, 3),
-                                 round(bout.duration(rate), 3), bout.mean_prob])
+                writer.writerow([bout.track_id] + ([bout.group] if grouped else [])
+                                + [bout.action, _name(action_names, bout.action),
+                                   bout.start, bout.end, round(bout.start / rate, 3),
+                                   round(bout.duration(rate), 3), bout.mean_prob])
 
     with open(paths["summary.json"], "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
@@ -572,6 +640,11 @@ def analyze_predictions(
     frames, meta = load_predictions(predictions)
     rate = float(fps or meta.get("fps") or 30.0)
     names = list(action_names or meta.get("action_names") or [])
+    if meta.get("action_groups"):
+        return _analyze_groups(
+            frames, meta, predictions, output_dir, rate=rate, names=names, stay=stay,
+            min_bout_s=min_bout_s, max_gap=max_gap, bin_s=bin_s,
+        )
     A = max(len(names), _num_actions(frames)) if frames else max(len(names), 1)
     sequences = track_sequences(frames, A)
     bouts = decode_tracks(sequences, fps=rate, stay=stay, min_bout_s=min_bout_s, max_gap=max_gap)
@@ -579,6 +652,78 @@ def analyze_predictions(
     summary["settings"] = {"stay": stay, "min_bout_s": min_bout_s, "max_gap": max_gap,
                            "bin_s": bin_s, "source": str(predictions)}
     population = population_timeline(frames, fps=rate, bin_s=bin_s, num_actions=A)
+    pairs = proximity(sequences, fps=rate)
+    summary["pairs"] = pairs
+    summary["files"] = write_outputs(output_dir, bouts, summary, population, pairs,
+                                     fps=rate, action_names=names)
+    return summary
+
+
+def _analyze_groups(
+    frames: Mapping[int, Mapping[str, Any]],
+    meta: Mapping[str, Any],
+    predictions: str,
+    output_dir: str,
+    *,
+    rate: float,
+    names: List[str],
+    stay: float,
+    min_bout_s: float,
+    max_gap: int,
+    bin_s: float,
+) -> Dict[str, Any]:
+    """Multi-head: decode each behavior group separately, report them together."""
+    from ..annotation.behaviors import BehaviorVocabulary
+
+    vocab = BehaviorVocabulary.from_groups(meta["action_groups"])
+    A = len(vocab)
+    if len(names) != A:
+        names = list(vocab.names)
+    sequences = track_sequences(frames, A, head_sizes=vocab.sizes)
+    per_group: Dict[str, Any] = {}
+    bouts: Dict[int, List[Bout]] = {tid: [] for tid in sequences}
+    budget: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    tracked_seconds = 0.0
+    for k, (group, behaviors) in enumerate(vocab.groups):
+        offset, size = vocab.offsets[k], vocab.sizes[k]
+        local_seqs = group_sequences(sequences, offset, size)
+        local = decode_tracks(local_seqs, fps=rate, stay=stay, min_bout_s=min_bout_s,
+                              max_gap=max_gap)
+        part = summarize(local, local_seqs, fps=rate, action_names=list(behaviors))
+        per_group[group] = part
+        tracked_seconds = max(tracked_seconds, part["overall"]["tracked_seconds"])
+        for local_index in range(size):
+            flat = names[offset + local_index]
+            short = behaviors[local_index]
+            budget[flat] = part["overall"]["time_budget"].get(short, 0.0)
+            counts[flat] = part["overall"]["bouts"].get(short, 0)
+        for tid, track_bouts in local.items():
+            bouts.setdefault(tid, []).extend(
+                Bout(track_id=b.track_id, action=offset + b.action, start=b.start,
+                     end=b.end, mean_prob=b.mean_prob, group=group)
+                for b in track_bouts
+            )
+    for tid in bouts:
+        bouts[tid].sort(key=lambda b: (b.start, b.action))
+    summary: Dict[str, Any] = {
+        "fps": rate,
+        "action_names": names,
+        "action_groups": vocab.as_groups(),
+        "groups": per_group,
+        "overall": {
+            "tracks": len([s for s in sequences.values() if len(s)]),
+            "tracked_seconds": tracked_seconds,
+            # Each group's shares sum to 1 on their own: a fly is somewhere in
+            # every group at every tracked moment.
+            "time_budget": budget,
+            "bouts": counts,
+        },
+    }
+    summary["settings"] = {"stay": stay, "min_bout_s": min_bout_s, "max_gap": max_gap,
+                           "bin_s": bin_s, "source": str(predictions)}
+    population = population_timeline(frames, fps=rate, bin_s=bin_s, num_actions=A,
+                                     head_sizes=vocab.sizes)
     pairs = proximity(sequences, fps=rate)
     summary["pairs"] = pairs
     summary["files"] = write_outputs(output_dir, bouts, summary, population, pairs,

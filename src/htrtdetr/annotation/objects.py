@@ -35,6 +35,7 @@ class AnnObject:
         obb_source: str | None = None,
         provenance: dict | None = None,
         keypoints=None,
+        action_ids: list[int] | None = None,
     ) -> None:
         global _gid
         _gid += 1
@@ -46,6 +47,9 @@ class AnnObject:
         self.keypoints = keypoints
         self.track_id = track_id
         self.action_id = action_id
+        # multi-head behaviors: one answer per group, flat numbers, -1 = not
+        # judged (annotation/behaviors.py). Empty in single-behavior projects.
+        self.action_ids = [int(a) for a in (action_ids or [])]
         self.occluded = occluded
         self.is_crowd = is_crowd
         # keyframe: True = 手動で置いた box (補間のアンカー)、False = 補間/自動生成 box。
@@ -131,6 +135,7 @@ class AnnObject:
             source=self.source,
             score=self.score,
             provenance=dict(self.provenance),
+            action_ids=list(getattr(self, "action_ids", None) or []),
         )
 
     @staticmethod
@@ -144,6 +149,7 @@ class AnnObject:
             keypoints=d.get("keypoints"),
             track_id=d.get("track_id", -1),
             action_id=d.get("action_id", -1),
+            action_ids=d.get("action_ids") or None,
             occluded=d.get("occluded", False),
             is_crowd=d.get("is_crowd", False),
             keyframe=d.get("keyframe", True),  # 読み込んだ box はキーフレーム扱い

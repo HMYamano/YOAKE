@@ -121,6 +121,8 @@ class HTRTDETROutput:
         # track-aligned な行動予測を検出順へ戻すための対応表
         track_ids: Optional[List[int]] = None,
         behavior_rows: Optional[List[List[int]]] = None,
+        # multi-head 行動: head 名 → (B*N_det, C_head)。検出順 (action_logits と同じ行)。
+        action_head_logits: Optional[Dict[str, torch.Tensor]] = None,
     ):
         self.pred_logits = pred_logits
         self.pred_boxes = pred_boxes
@@ -139,6 +141,7 @@ class HTRTDETROutput:
         self.behavior = behavior
         self.track_ids = track_ids
         self.behavior_rows = behavior_rows
+        self.action_head_logits = action_head_logits
 
     @property
     def has_obb(self) -> bool:
@@ -500,6 +503,7 @@ class HTRTDETR(nn.Module):
         # ---------------------------------------------------------------- #
         action_logits: Optional[torch.Tensor] = None
         action_probs: Optional[torch.Tensor] = None
+        action_head_logits: Optional[Dict[str, torch.Tensor]] = None
         behavior_pred: Optional[BehaviorPrediction] = None
 
         if self.training_stage in (2, 4):
@@ -513,7 +517,18 @@ class HTRTDETR(nn.Module):
                     action_logits = self._gather_by_rows(
                         behavior_pred.logits, aligned.current_rows, det_results
                     )
-                    action_probs = F.softmax(action_logits, dim=-1)
+                    if behavior_pred.head_logits:
+                        # multi-head: 平坦な logit を並べ直してから head に切り分ける。
+                        # head_logits は track 行の順なので、そのまま損失に渡すと
+                        # 検出順の GT と行がずれる (docs/KEYFRAME_BEHAVIOR.md §15.6)。
+                        names = list(behavior_pred.head_logits)
+                        parts = action_logits.split(list(behavior_pred.head_sizes), dim=-1)
+                        action_head_logits = dict(zip(names, parts))
+                        action_probs = torch.cat(
+                            [F.softmax(p, dim=-1) for p in parts], dim=-1
+                        )
+                    else:
+                        action_probs = F.softmax(action_logits, dim=-1)
 
             if action_logits is None:
                 # 旧 ActionHead 経路 (behavior 無効 / query-aligned 時)
@@ -552,6 +567,7 @@ class HTRTDETR(nn.Module):
             behavior=behavior_pred,
             track_ids=track_ids_out,
             behavior_rows=behavior_rows,
+            action_head_logits=action_head_logits,
         )
 
     # ------------------------------------------------------------------ #

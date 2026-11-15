@@ -187,6 +187,12 @@ class InspectorContext:
     #: sentence ("3 animals - 1 still needs a behavior."). Empty otherwise.
     keyframe_note: str = ""
 
+    #: Multi-head behaviors only (docs/KEYFRAME_BEHAVIOR.md §15): the groups as
+    #: ``((name, (behavior, ...)), ...)`` and the box's answer in each, as a
+    #: position inside the group (-1 = not set). Empty: one Behavior menu.
+    behavior_groups: Sequence[Any] = ()
+    group_labels: Sequence[int] = ()
+
     @property
     def state(self) -> str:
         """VERIFIED / PREDICTED / PENDING for the selected box."""
@@ -507,6 +513,8 @@ class Inspector:
                 width=150,
                 callback=lambda s, a: self._call("set_action_name", a),
             )
+            # Behavior groups: one menu per group, built by _fill_behavior_groups.
+            dpg.add_group(tag=self._t("b_groups"), show=False)
 
             widgets.gap(1)
             dpg.add_text("", tag=self._t("b_geometry"), color=theme.TEXT_DIM, wrap=self.WIDTH - 20)
@@ -952,6 +960,34 @@ class Inspector:
             f"between frames. {self._key('file.save')} saves."
         )
 
+    def _fill_behavior_groups(self, ctx: InspectorContext) -> None:
+        """One menu per behavior group. Rebuilt only when the groups change."""
+        tag = self._t("b_groups")
+        if not dpg.does_item_exist(tag):
+            return
+        groups = tuple((str(n), tuple(o)) for n, o in (ctx.behavior_groups or ()))
+        dpg.configure_item(tag, show=bool(groups))
+        if not groups:
+            return
+        if getattr(self, "_groups_signature", None) != groups:
+            dpg.delete_item(tag, children_only=True)
+            for g, (name, choices) in enumerate(groups):
+                dpg.add_combo(
+                    ["Not set"] + list(choices),
+                    tag=self._t(f"b_group_{g}"),
+                    label=name,
+                    width=150,
+                    parent=tag,
+                    callback=lambda s, a, u: self._call("set_group_behavior", (u, a)),
+                    user_data=g,
+                )
+            self._groups_signature = groups
+        labels = list(ctx.group_labels or ())
+        for g, (_name, choices) in enumerate(groups):
+            local = int(labels[g]) if g < len(labels) else -1
+            self._set(self._t(f"b_group_{g}"),
+                      choices[local] if 0 <= local < len(choices) else "Not set")
+
     def _fill_box(self, ctx: InspectorContext) -> None:
         state = ctx.state
         widgets.status_pill(
@@ -968,8 +1004,11 @@ class Inspector:
 
         options = ["Not set"] + list(ctx.action_names)
         if dpg.does_item_exist(self._t("b_action")):
-            dpg.configure_item(self._t("b_action"), items=options)
+            dpg.configure_item(
+                self._t("b_action"), items=options, show=not tuple(ctx.behavior_groups or ())
+            )
         self._set(self._t("b_action"), ctx.action_label())
+        self._fill_behavior_groups(ctx)
 
         self._set(self._t("b_geometry"), "Rotated box" if ctx.has_obb else "Upright box")
         self._label(self._t("b_obb"), "Make upright" if ctx.has_obb else "Make rotated")

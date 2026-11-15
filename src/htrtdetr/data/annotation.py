@@ -99,6 +99,10 @@ class ObjectAnno:
                     角度損失から除外され migration 時に警告される。
         keypoints: [[x, y, v], ...] pixel。v は 0=未ラベル, 1=隠れ, 2=可視。
                    None なら pose アノテーションなし (pose_enabled=False で動作)。
+        action_ids: multi-head 行動 (``meta.labeling.behaviors = "multi_head"``)
+                   のときだけ使う。行動グループごとに 1 つ、全グループ通しの行動番号
+                   (-1 = そのグループは未判断)。``action_id`` は最初のグループの写し。
+                   単一行動では空のまま書き出さない。docs/KEYFRAME_BEHAVIOR.md §15。
     """
 
     object_id: int
@@ -115,6 +119,7 @@ class ObjectAnno:
     source: str = "human"
     score: Optional[float] = None
     provenance: Dict[str, Any] = field(default_factory=dict)
+    action_ids: List[int] = field(default_factory=list)
 
     @property
     def has_obb(self) -> bool:
@@ -367,7 +372,21 @@ def _parse_object(obj: Dict[str, Any], index: int) -> ObjectAnno:
         source=obj.get("source", "human"),
         score=obj.get("score"),
         provenance=dict(obj.get("provenance", {})),
+        action_ids=_parse_action_ids(obj.get("action_ids")),
     )
+
+
+def _parse_action_ids(raw: Any) -> List[int]:
+    """``action_ids`` (multi-head) → ints. Anything unreadable counts as not judged."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: List[int] = []
+    for value in raw:
+        try:
+            out.append(int(value))
+        except (TypeError, ValueError):
+            out.append(-1)
+    return out
 
 
 def load_annotation(path: str) -> DatasetAnno:
@@ -660,6 +679,9 @@ def _object_to_dict(obj: ObjectAnno, *, preserve_derived: bool = False) -> Dict[
         "track_id": obj.track_id,
         "action_id": obj.action_id,
     }
+    if obj.action_ids:
+        # multi-head only: one answer per behavior group (docs/KEYFRAME_BEHAVIOR.md §15)
+        d["action_ids"] = [int(a) for a in obj.action_ids]
     if obj.occluded:
         d["occluded"] = obj.occluded
     if obj.is_crowd:
@@ -884,6 +906,24 @@ def validate_annotation(anno: DatasetAnno) -> ValidationResult:
     num_actions = len(anno.action_names)
     num_keypoints = len(anno.keypoint_names)
 
+    # multi-head behaviors: the groups are the vocabulary (docs/KEYFRAME_BEHAVIOR.md §15).
+    from ..annotation import behaviors as _behaviors
+
+    vocab = None
+    if _behaviors.behavior_mode_of(anno) == _behaviors.MULTI_HEAD:
+        try:
+            vocab = _behaviors.vocabulary_of(anno)
+        except ValueError as exc:
+            result.errors.append(str(exc))
+            result.valid = False
+        else:
+            num_actions = len(vocab)
+            if list(anno.action_names) != list(vocab.names):
+                result.warnings.append(
+                    "action_names does not match action_groups; the groups are used "
+                    f"({', '.join(vocab.names)})."
+                )
+
     for v in anno.videos:
         if v.width <= 0 or v.height <= 0:
             result.warnings.append(
@@ -934,6 +974,19 @@ def validate_annotation(anno: DatasetAnno) -> ValidationResult:
                         f"action_id {obj.action_id} out of range [0, {num_actions-1}]"
                     )
                     result.valid = False
+
+                if vocab is not None and obj.action_ids:
+                    wrong = [
+                        a for h, a in enumerate(obj.action_ids)
+                        if a != -1 and (h >= len(vocab.groups) or vocab.group_of(a) != h)
+                    ]
+                    if wrong or len(obj.action_ids) > len(vocab.groups):
+                        result.errors.append(
+                            f"Video {v.video_id} Frame {fr.frame_index} Obj {obj.object_id}: "
+                            f"action_ids {obj.action_ids} do not fit the behavior groups "
+                            f"{list(vocab.heads)} (one answer per group, in group order)"
+                        )
+                        result.valid = False
 
                 # --- v2.0: OBB ---
                 if obj.obb is not None:
