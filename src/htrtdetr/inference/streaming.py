@@ -49,10 +49,40 @@ from ..tracking import OnlineTracker
 from ..utils.logging import get_logger
 from ..utils.misc import cxcywh_to_xyxy, get_device
 
-__all__ = ["StreamingInferencer", "StreamingResult", "LatencyBreakdown"]
+__all__ = ["StreamingInferencer", "StreamingResult", "LatencyBreakdown", "prepare_input"]
 
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def prepare_input(
+    frame_rgb: np.ndarray,
+    image_size: Tuple[int, int],
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """detector 入力の CPU 側: (H0, W0, 3) RGB uint8 → (H, W, 3) 正規化 float32。
+
+    ``StreamingInferencer.preprocess`` の numpy 部分そのもの。realtime の capture
+    プロセスはこれを別プロセスで走らせて共有メモリへ書き (``out``)、main は
+    ``process_prepared`` でテンソル化だけを行う。同じ関数なので、逐次実行と
+    ビット単位で同じ入力になる。
+    """
+    H, W = image_size
+    try:
+        from PIL import Image
+        img = np.asarray(
+            Image.fromarray(frame_rgb).resize((W, H), Image.BILINEAR),
+            dtype=np.float32,
+        ) / 255.0
+    except ImportError:  # pragma: no cover
+        import cv2
+        img = cv2.resize(frame_rgb, (W, H)).astype(np.float32) / 255.0
+
+    if out is None:
+        return (img - _MEAN) / _STD
+    np.subtract(img, _MEAN, out=out)
+    np.divide(out, _STD, out=out)
+    return out
 
 
 class LatencyBreakdown:
@@ -290,18 +320,10 @@ class StreamingInferencer:
 
     def preprocess(self, frame_rgb: np.ndarray) -> torch.Tensor:
         """np.ndarray (H, W, 3) RGB → 正規化テンソル (1, 3, H, W)。"""
-        H, W = self.image_size
-        try:
-            from PIL import Image
-            img = np.asarray(
-                Image.fromarray(frame_rgb).resize((W, H), Image.BILINEAR),
-                dtype=np.float32,
-            ) / 255.0
-        except ImportError:  # pragma: no cover
-            import cv2
-            img = cv2.resize(frame_rgb, (W, H)).astype(np.float32) / 255.0
+        return self._to_device(prepare_input(frame_rgb, self.image_size))
 
-        img = (img - _MEAN) / _STD
+    def _to_device(self, img: np.ndarray) -> torch.Tensor:
+        """``prepare_input`` の出力 (H, W, 3) float32 → デバイス上の (1, 3, H, W)。"""
         t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
         # pin_memory + non_blocking で CPU→GPU コピーを計算と重ねる
         if self.device.type == "cuda":
@@ -316,7 +338,6 @@ class StreamingInferencer:
     # 1 フレーム処理 (本体)
     # ------------------------------------------------------------------ #
 
-    @torch.inference_mode()
     def process_frame(
         self,
         frame_rgb: np.ndarray,
@@ -331,13 +352,46 @@ class StreamingInferencer:
         Returns:
             StreamingResult
         """
+        return self._process(frame_rgb.shape, frame_index, frame_rgb=frame_rgb)
+
+    def process_prepared(
+        self,
+        prepared: np.ndarray,
+        frame_shape: Tuple[int, ...],
+        frame_index: Optional[int] = None,
+    ) -> StreamingResult:
+        """``prepare_input`` 済みのフレームを処理する (realtime の main プロセス用)。
+
+        前処理を別プロセスに任せた場合の入口で、それ以外は ``process_frame`` と同じ。
+        ``prepared`` は処理中だけ参照し、戻った後は持たない (共有メモリのスロットを
+        呼び出し側が再利用してよい)。
+
+        Args:
+            prepared: (H, W, 3) float32 — ``prepare_input(frame, self.image_size)``
+            frame_shape: 元フレームの (H0, W0[, 3])。箱を画素座標へ戻すのに使う
+            frame_index: フレーム番号 (None なら内部カウンタ)
+        """
+        return self._process(frame_shape, frame_index, prepared=prepared)
+
+    @torch.inference_mode()
+    def _process(
+        self,
+        frame_shape: Tuple[int, ...],
+        frame_index: Optional[int],
+        frame_rgb: Optional[np.ndarray] = None,
+        prepared: Optional[np.ndarray] = None,
+    ) -> StreamingResult:
         t_start = time.perf_counter()
         fi = self._frame_index + 1 if frame_index is None else int(frame_index)
         self._frame_index = fi
-        H0, W0 = frame_rgb.shape[:2]
+        H0, W0 = int(frame_shape[0]), int(frame_shape[1])
 
         with self.latency.measure("preprocess"):
-            tensor = self.preprocess(frame_rgb)
+            if prepared is not None:
+                tensor = self._to_device(prepared)
+            else:
+                assert frame_rgb is not None  # process_frame が必ず渡す
+                tensor = self.preprocess(frame_rgb)
 
         # --- Detector: 1 フレーム 1 回だけ ---
         with self.latency.measure("detector", sync=True), self._autocast():

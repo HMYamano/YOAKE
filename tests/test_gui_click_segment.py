@@ -310,6 +310,46 @@ def test_mask_to_obb_keeps_one_animal_with_a_speck_beside_it():
     assert why == "" and obb is not None
 
 
+@needs_cv2
+@pytest.mark.parametrize("angle_deg", [0.0, 25.0, 100.0])
+def test_reduce_mask_is_what_mask_to_obb_returns(angle_deg):
+    """``analysis/silhouette.py`` measures from the same reduction the click uses,
+    so the two can never disagree about where an animal's axis is."""
+    mask = _add_legs(_ellipse_mask(angle_deg=angle_deg), angle_deg=angle_deg)
+    obb, why = cs.mask_to_obb(mask, (100, 100))
+    parts, why_parts = cs.reduce_mask(mask, (100, 100))
+    assert why == why_parts == "" and parts is not None
+    assert parts.obb == obb
+    assert parts.blob.shape == parts.core.shape == parts.body.shape == mask.shape
+    assert parts.body.sum() <= parts.blob.sum()          # the legs are gone from the body
+    assert math.hypot(*parts.axis) == pytest.approx(1.0)
+    assert not parts.twin_core
+
+
+@needs_cv2
+def test_reduce_mask_can_measure_two_animals_instead_of_refusing():
+    """The click refuses joined animals (a box over both would poison a training
+    set); a measurement may instead keep the nearer one and say there were two."""
+    import cv2
+    m = np.zeros((240, 240), np.uint8)
+    cv2.ellipse(m, (90, 120), (30, 8), 0.0, 0, 360, 255, -1)
+    cv2.ellipse(m, (150, 120), (30, 8), 0.0, 0, 360, 255, -1)
+    assert cs.reduce_mask(m, (120, 120)) == (None, cs.TWO_ANIMALS)
+    parts, why = cs.reduce_mask(m, (100, 120), allow_twins=True)
+    assert why == "" and parts is not None and parts.twin_core
+    assert parts.centre[0] < 120                         # the axis is the nearer core's
+    assert _angle_diff(parts.obb[4], 0.0) < math.radians(2)
+    assert parts.obb[2] > 100                            # the extent is the pair's
+
+
+@needs_cv2
+def test_threshold_gray_is_the_bgr_path_without_the_conversion():
+    import cv2
+    frame = _frame_with(_ellipse_mask())
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    assert np.array_equal(cs.threshold_gray(gray, (100, 100)), cs._otsu_mask(frame, (100, 100)))
+
+
 # --------------------------------------------------------------------------- #
 # The local backend, end to end
 # --------------------------------------------------------------------------- #

@@ -623,6 +623,28 @@ class InferenceConfig:
     # Memory reset
     reset_memory_on_scene_change: bool = True
     scene_change_threshold: float = 0.5
+    # --- シルエット幾何 (docs/SILHOUETTE_GEOMETRY.md) ---
+    # 検出ごとに ROI を二値化して体軸・頭尾 (2π の向き)・形状・残差運動を測る後処理。
+    # 学習もラベルも不要で、モデルの出力は変えない。predictions.json の各フレームに
+    # ``geometry`` 行を、出力先に geometry.csv を足す。CLI では ``geometry=true``。
+    geometry: bool = False
+    # analysis/silhouette.SilhouetteParams の上書き (例: {"min_speed": 0.5})
+    geometry_params: Dict[str, Any] = field(default_factory=dict)
+    # --- リアルタイム (multiprocessing, docs/REALTIME.md) ---
+    # capture / main (GPU) / geometry / writer を別プロセスで並走させる。カメラや
+    # ストリーム (source=0, rtsp://...) はこのモードでだけ読める。CLI では ``realtime=true``。
+    realtime: bool = False
+    # 共有メモリのフレームスロット数 (= パイプラインの深さ、遅延の上限)。
+    # 0 = 自動 (カメラ / ストリームは 4、ファイルは 8)
+    realtime_slots: int = 0
+    # "auto" (カメラ / ストリームは "when_full"、ファイルは "never") | "never" | "when_full"
+    realtime_drop_frames: str = "auto"
+    # 注釈付きの映像をウィンドウに出す (q / Esc で停止)
+    realtime_display: bool = False
+    # output.mp4 を書くか
+    realtime_write_video: bool = True
+    # この秒数で止める (0 = 入力が尽きるか停止されるまで)
+    realtime_max_seconds: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +984,16 @@ def validate_config(cfg: "HTRTDETRConfig") -> None:
     if cfg.inference.mode not in ("batch", "streaming"):
         errors.append(
             f"inference.mode must be 'batch' or 'streaming', got {cfg.inference.mode!r}"
+        )
+    if cfg.inference.realtime_slots != 0 and cfg.inference.realtime_slots < 2:
+        errors.append(
+            "inference.realtime_slots must be 0 (auto) or >= 2, "
+            f"got {cfg.inference.realtime_slots}"
+        )
+    if cfg.inference.realtime_drop_frames not in ("auto", "never", "when_full"):
+        errors.append(
+            "inference.realtime_drop_frames must be 'auto', 'never' or 'when_full', "
+            f"got {cfg.inference.realtime_drop_frames!r}"
         )
     if m.behavior.temporal_window < 1:
         errors.append(

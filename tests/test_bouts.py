@@ -118,6 +118,55 @@ def test_proximity_reports_contact_between_tracks_seen_together():
     assert pairs[0]["together_s"] == pytest.approx(2.0)
 
 
+def _with_geometry(frames, rows_by_frame, fields=("valid", "length", "heading")):
+    """Attach ``geometry`` rows (one per detection) to a predictions payload."""
+    for frame, rows in rows_by_frame.items():
+        frames[frame]["geometry"] = [list(r) for r in rows]
+    return frames, {"fields": list(fields)}
+
+
+def test_proximity_uses_silhouette_length_and_directed_facing():
+    """With geometry, body length comes from the silhouette and facing is directed:
+    the follower (track 0, heading towards track 1) faces; the followed does not."""
+    rows = {f: [_det(0, [1.0], x=0.0), _det(1, [1.0], x=40.0)] for f in range(10)}
+    frames, meta = _with_geometry(
+        _frames(rows),
+        {f: [(1, 30.0, 0.0), (1, 30.0, 0.0 if f < 8 else None)] for f in range(10)},
+    )
+    sequences = B.track_sequences(frames, geometry_fields=meta["fields"])
+    pair = B.proximity(sequences, fps=10.0)[0]
+    assert pair["body_length_px"] == pytest.approx(30.0)
+    assert pair["a_faces_b"] == pytest.approx(1.0)       # 0 points at 1
+    assert pair["b_faces_a"] == pytest.approx(0.0)       # 1 points away from 0
+
+
+def test_proximity_without_geometry_keeps_the_old_columns(tmp_path):
+    rows = {f: [_det(0, [1.0]), _det(1, [1.0], x=15.0)] for f in range(5)}
+    pairs = B.proximity(B.track_sequences(_frames(rows)), fps=10.0)
+    assert "a_faces_b" not in pairs[0]
+    paths = B.write_outputs(str(tmp_path), {}, {}, [], pairs, fps=10.0)
+    with open(paths["proximity.csv"], encoding="utf-8") as handle:
+        assert next(csv.reader(handle)) == ["track_a", "track_b", "together_s",
+                                            "mean_distance_px", "contact_fraction",
+                                            "body_length_px"]
+
+
+def test_analyze_predictions_reads_geometry_from_the_file(tmp_path):
+    rows = {f: [_det(0, [1.0], x=0.0), _det(1, [1.0], x=40.0)] for f in range(10)}
+    frames, geometry = _with_geometry(
+        _frames(rows), {f: [(1, 30.0, 0.0), (1, 30.0, 3.1416)] for f in range(10)}
+    )
+    payload = {str(k): v for k, v in frames.items()}
+    payload["_meta"] = {"fps": 10.0, "action_names": ["still"], "geometry": geometry}
+    path = tmp_path / "predictions.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    summary = B.analyze_predictions(str(path), str(tmp_path / "out"))
+    assert summary["pairs"][0]["a_faces_b"] == pytest.approx(1.0)
+    assert summary["pairs"][0]["b_faces_a"] == pytest.approx(1.0)     # face to face
+    with open(tmp_path / "out" / "proximity.csv", encoding="utf-8") as handle:
+        assert next(csv.reader(handle))[-2:] == ["a_faces_b", "b_faces_a"]
+
+
 def test_analyze_predictions_writes_every_file_and_reads_meta(tmp_path):
     payload = _frames(_flickery_track())
     payload = {str(k): v for k, v in payload.items()}

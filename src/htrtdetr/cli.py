@@ -655,6 +655,27 @@ def run_predict(argv: list) -> None:
     if "score_threshold" in overrides:
         cfg.model.detector.score_threshold = float(overrides["score_threshold"])
     cfg.model.detector.backbone.pretrained = False
+    # シルエット幾何とリアルタイムは後処理と実行方式の切り替えで、モデルは変えない。
+    # ``geometry=true`` / ``realtime=true`` / ``geometry_params.<name>=v`` は
+    # ``inference.*`` の短縮形 (merge は未知の最上位キーを捨てるのでここで写す)。
+    if "geometry" in overrides:
+        cfg.inference.geometry = bool(overrides["geometry"])
+    if "realtime" in overrides:
+        cfg.inference.realtime = bool(overrides["realtime"])
+    if isinstance(overrides.get("geometry_params"), dict):
+        cfg.inference.geometry_params = {
+            **(cfg.inference.geometry_params or {}), **overrides["geometry_params"]
+        }
+    _check_geometry_params(cfg.inference.geometry_params)
+
+    from .inference.realtime import is_live_source
+
+    if is_live_source(source) and not cfg.inference.realtime:
+        print(
+            f"Error: source={source} is a camera or stream, which only the realtime "
+            "pipeline can read. Add realtime=true."
+        )
+        sys.exit(1)
 
     model = build_model(cfg.model)
     model.set_stage(4)
@@ -710,6 +731,18 @@ def run_predict(argv: list) -> None:
             max_frames=max_frames,
             use_amp=cfg.inference.use_amp,
             use_channels_last=cfg.inference.use_channels_last,
+        )
+        return
+
+    if cfg.inference.realtime:
+        # streaming と同じ推論を、capture / geometry / writer を別プロセスにして回す。
+        if cfg.inference.mode != "streaming":
+            print("[INFO] realtime=true runs the streaming inferencer; "
+                  f"inference.mode={cfg.inference.mode} is ignored")
+        _run_predict_realtime(
+            cfg, model, source, output_dir, img_size,
+            action_names, class_names, window_size, max_frames,
+            clip_stride=clip_stride,
         )
         return
 
@@ -771,45 +804,55 @@ def _run_predict_streaming(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     writer: Optional[VideoWriter] = None
-    # ``_meta`` is not a frame: every reader skips keys that are not integers.
-    # It is what the bout analysis needs to turn frames into seconds and ids
-    # into names without being told again.
-    results: Dict[str, Any] = {"_meta": {
-        "source": str(src),
-        "action_names": list(action_names),
-        "class_names": list(class_names),
-        "label_mode": str(getattr(cfg.data, "label_mode", "") or "dense"),
-        "window": int(window_size),
-        "clip_stride": int(clip_stride),
-        "fps": None,
-    }}
-    behavior_cfg = getattr(cfg.model, "behavior", None)
-    if getattr(behavior_cfg, "classifier_type", "") == "multi_head" and behavior_cfg.heads:
-        # Groups decode separately (analysis/bouts.py): each one's slice of
-        # ``action_probs`` sums to 1. docs/KEYFRAME_BEHAVIOR.md §15.5.
-        results["_meta"]["action_groups"] = {
-            str(h): [str(n) for n in names] for h, names in behavior_cfg.heads.items()
-        }
+    results: Dict[str, Any] = {
+        "_meta": _predict_meta(cfg, str(src), action_names, class_names, window_size, clip_stride)
+    }
+    draw_kw = _draw_options(cfg)
 
-    for frame_idx, frame_rgb, fps in frame_gen:
-        if results["_meta"]["fps"] is None and fps:
-            results["_meta"]["fps"] = float(fps)
-        res = si.process_frame(frame_rgb, frame_index=frame_idx)
-        results[str(frame_idx)] = res.to_json()
+    # シルエット幾何 (docs/SILHOUETTE_GEOMETRY.md): 箱と元解像度のフレームから測る後処理。
+    analyzer = None
+    table = None
+    if cfg.inference.geometry:
+        from .analysis.silhouette import (
+            GeometryCSV, SilhouetteAnalyzer, SilhouetteParams, draw_geometry, geometry_meta,
+        )
 
-        if writer is None:
-            h, w = frame_rgb.shape[:2]
-            writer = VideoWriter(str(out_dir / "output.mp4"), fps, (w, h))
-        writer.write(draw_detections(
-            frame_rgb, res.boxes_xyxy, res.scores, res.class_ids,
-            res.track_ids, res.action_ids, action_names, class_names,
-            show_bbox=cfg.inference.show_bbox,
-            show_id=cfg.inference.show_id,
-            show_action=cfg.inference.show_action,
-            show_confidence=cfg.inference.show_confidence,
-            thickness=cfg.inference.bbox_thickness,
-            font_scale=cfg.inference.font_scale,
-        ))
+        params = SilhouetteParams(**(cfg.inference.geometry_params or {}))
+        analyzer = SilhouetteAnalyzer(params)
+        table = GeometryCSV(str(out_dir / "geometry.csv"))
+        results["_meta"]["geometry"] = geometry_meta(params)
+
+    try:
+        for frame_idx, frame_rgb, fps in frame_gen:
+            if results["_meta"]["fps"] is None and fps:
+                results["_meta"]["fps"] = float(fps)
+            res = si.process_frame(frame_rgb, frame_index=frame_idx)
+            entry = res.to_json()
+            rows = None
+            if analyzer is not None and table is not None:
+                if analyzer.fps is None and fps:
+                    analyzer.fps = float(fps)
+                rows = analyzer.update(
+                    frame_rgb, frame_idx, res.boxes_xyxy,
+                    corners=res.corners, track_ids=res.track_ids,
+                )
+                entry["geometry"] = rows
+                table.write(frame_idx, res.track_ids, rows)
+            results[str(frame_idx)] = entry
+
+            if writer is None:
+                h, w = frame_rgb.shape[:2]
+                writer = VideoWriter(str(out_dir / "output.mp4"), fps, (w, h))
+            vis = draw_detections(
+                frame_rgb, res.boxes_xyxy, res.scores, res.class_ids,
+                res.track_ids, res.action_ids, action_names, class_names, **draw_kw,
+            )
+            if rows:
+                draw_geometry(vis, rows)
+            writer.write(vis)
+    finally:
+        if table is not None:
+            table.close()
 
     if writer is not None:
         writer.release()
@@ -828,7 +871,128 @@ def _run_predict_streaming(
         f"temporal {stats.get('temporal_ms', 0):.1f}ms / "
         f"behavior {stats.get('behavior_ms', 0):.1f}ms per frame)"
     )
+    if analyzer is not None:
+        print(f"Silhouette geometry: {analyzer.timing()['ms_per_frame']:.2f}ms per frame "
+              f"-> {out_dir / 'geometry.csv'}")
     print(f"Results: {out_dir / 'predictions.json'}")
+
+
+def _run_predict_realtime(
+    cfg, model, source: str, output_dir: str, img_size,
+    action_names: list, class_names: list, window_size: int,
+    max_frames: Optional[int],
+    clip_stride: int = 1,
+) -> None:
+    """streaming 推論を multiprocessing のパイプラインで回す (docs/REALTIME.md)。"""
+    from .inference import StreamingInferencer
+    from .inference.realtime import RealtimeOptions, is_live_source, run_realtime
+
+    if not is_live_source(source) and not Path(source).exists():
+        raise FileNotFoundError(f"Input not found: {source}")
+    inf = cfg.inference
+    options = RealtimeOptions(
+        slots=int(inf.realtime_slots),
+        drop_frames=str(inf.realtime_drop_frames),
+        display=bool(inf.realtime_display),
+        write_video=bool(inf.realtime_write_video),
+        max_frames=max_frames,
+        max_seconds=float(inf.realtime_max_seconds),
+        geometry=bool(inf.geometry),
+        geometry_params=dict(inf.geometry_params or {}),
+        draw=_draw_options(cfg),
+    )
+    si = StreamingInferencer(
+        model=model,
+        cfg=inf,
+        action_names=action_names,
+        class_names=class_names,
+        window_size=window_size,
+        image_size=img_size,
+        clip_stride=clip_stride,
+    )
+    print(f"Realtime pipeline: source={source} "
+          f"slots={options.slot_count(is_live_source(source))} "
+          f"geometry={'on' if options.geometry else 'off'} (Ctrl+C to stop)")
+    stats = run_realtime(
+        si, source, output_dir,
+        image_size=img_size,
+        action_names=action_names,
+        class_names=class_names,
+        meta=_predict_meta(cfg, str(source), action_names, class_names, window_size, clip_stride),
+        options=options,
+    )
+    latency = stats.get("latency_ms", {})
+    print(
+        f"Realtime inference complete. frames={stats['frames_processed']} "
+        f"dropped={stats['frames_dropped']} FPS={stats['fps']:.1f} "
+        f"latency p50={latency.get('p50', 0):.0f}ms p95={latency.get('p95', 0):.0f}ms"
+        + (" (interrupted)" if stats.get("interrupted") else "")
+    )
+    for warning in stats.get("warnings", []):
+        print(f"[WARN] {warning}")
+    print(f"Results: {Path(output_dir) / 'predictions.json'}")
+
+
+def _predict_meta(
+    cfg, source: str, action_names: list, class_names: list, window_size: int,
+    clip_stride: int,
+) -> Dict[str, Any]:
+    """predictions.json の ``_meta`` (逐次・リアルタイム共通)。
+
+    ``_meta`` is not a frame: every reader skips keys that are not integers.
+    It is what the bout analysis needs to turn frames into seconds and ids
+    into names without being told again.
+    """
+    meta: Dict[str, Any] = {
+        "source": str(source),
+        "action_names": list(action_names),
+        "class_names": list(class_names),
+        "label_mode": str(getattr(cfg.data, "label_mode", "") or "dense"),
+        "window": int(window_size),
+        "clip_stride": int(clip_stride),
+        "fps": None,
+    }
+    behavior_cfg = getattr(cfg.model, "behavior", None)
+    if getattr(behavior_cfg, "classifier_type", "") == "multi_head" and behavior_cfg.heads:
+        # Groups decode separately (analysis/bouts.py): each one's slice of
+        # ``action_probs`` sums to 1. docs/KEYFRAME_BEHAVIOR.md §15.5.
+        meta["action_groups"] = {
+            str(h): [str(n) for n in names] for h, names in behavior_cfg.heads.items()
+        }
+    return meta
+
+
+def _draw_options(cfg) -> Dict[str, Any]:
+    """``draw_detections`` のキーワード引数 (逐次・リアルタイム共通)。"""
+    inf = cfg.inference
+    return {
+        "show_bbox": inf.show_bbox,
+        "show_id": inf.show_id,
+        "show_action": inf.show_action,
+        "show_confidence": inf.show_confidence,
+        "thickness": inf.bbox_thickness,
+        "font_scale": inf.font_scale,
+    }
+
+
+def _check_geometry_params(params: Optional[Dict[str, Any]]) -> None:
+    """``geometry_params.<name>`` の名前と値を、モデルを読む前に確かめる。"""
+    if not params:
+        return
+    from dataclasses import fields
+
+    from .analysis.silhouette import SilhouetteParams
+
+    known = {f.name for f in fields(SilhouetteParams)}
+    unknown = sorted(set(params) - known)
+    if unknown:
+        print(f"Error: unknown geometry_params {unknown}. Known: {sorted(known)}")
+        sys.exit(1)
+    try:
+        SilhouetteParams(**params)
+    except (TypeError, ValueError) as exc:
+        print(f"Error: geometry_params: {exc}")
+        sys.exit(1)
 
 
 def run_pipeline(argv: list) -> None:
@@ -987,11 +1151,20 @@ Examples:
   yoake train stage=1 config=configs/stage1_small.yaml
   yoake val stage=2 checkpoint=runs/train/stage2/weights/best.pth
   yoake predict source=data/videos/video.mp4 weights=runs/train/stage4/weights/best.pth
+  yoake predict source=video.mp4 weights=best.pth geometry=true      体軸・頭尾・形状を追加で測る
+  yoake predict source=0 weights=best.pth realtime=true geometry=true inference.realtime_display=true
   yoake analyze mode=timeline predictions=runs/predict/predictions.json
   yoake analyze mode=bouts predictions=runs/predict/predictions.json output_dir=runs/bouts
   yoake pipeline config=configs/pipeline/full_offline.yaml source=data/videos/video.mp4
   yoake project new dir="D:/studies" name="courtship 2026" videos=D:/captures
   yoake project info path="D:/studies/courtship 2026"
+
+predict options (docs/SILHOUETTE_GEOMETRY.md, docs/REALTIME.md):
+  geometry=true          検出ごとのシルエット幾何 (学習不要の後処理) → geometry.csv
+  realtime=true          capture / GPU / geometry / writer を別プロセスで並走。
+                         source=<カメラ番号 | rtsp://...> もこのモードで読める
+  inference.realtime_slots=0(auto) / inference.realtime_drop_frames=auto|never|when_full
+  inference.realtime_display=true / inference.realtime_max_seconds=600
 
 Layered pipeline (configs/pipeline/*.yaml):
   detect_only | temporal_detect | detect_track | full_offline | yolo_bytetrack

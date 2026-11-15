@@ -2,6 +2,8 @@
 
 This guide covers running inference on video files, interpreting the output format, loading predictions for downstream analysis, exporting to ONNX, and tuning inference performance.
 
+> `yoake predict` also has two options not covered below: `geometry=true` (label-free body axis, head direction, shape and residual motion per detection — [SILHOUETTE_GEOMETRY.md](SILHOUETTE_GEOMETRY.md)) and `realtime=true` (a multiprocessing pipeline that also reads cameras and streams — [REALTIME.md](REALTIME.md)).
+
 ---
 
 ## Table of Contents

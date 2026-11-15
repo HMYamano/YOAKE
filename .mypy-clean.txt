@@ -45,6 +45,7 @@
 src/htrtdetr/__init__.py
 src/htrtdetr/analysis/__init__.py
 src/htrtdetr/analysis/analyzer.py
+src/htrtdetr/analysis/silhouette.py
 src/htrtdetr/annotation/__init__.py
 src/htrtdetr/annotation/batch.py
 src/htrtdetr/annotation/cache.py
@@ -91,6 +92,7 @@ src/htrtdetr/gui/video_source.py
 src/htrtdetr/gui/workspace_help.py
 src/htrtdetr/gui_cli.py
 src/htrtdetr/inference/__init__.py
+src/htrtdetr/inference/realtime.py
 src/htrtdetr/models/__init__.py
 src/htrtdetr/models/action_head/__init__.py
 src/htrtdetr/models/action_head/action_head.py

@@ -27,6 +27,12 @@ everything detected in a time bin - so it is the number to trust when the
 tracks have swapped. Per-animal statistics are only as good as identity
 continuity; :func:`summarize` reports each track's coverage so that is visible.
 
+Silhouette geometry (``docs/SILHOUETTE_GEOMETRY.md``): when ``yoake predict``
+ran with ``geometry=true`` the file carries a ``geometry`` row per detection.
+:func:`proximity` then measures body length on the silhouette instead of the
+box, and adds how often each animal of a pair faces the other - which needs
+the resolved head direction, something no box can give.
+
 Multi-head behaviors (``docs/KEYFRAME_BEHAVIOR.md`` §15): when the file's
 ``_meta`` carries ``action_groups``, every group is decoded **on its own** - a
 fly can be in a walk bout and a courtship bout at once - from its own slice of
@@ -112,13 +118,19 @@ class TrackSequence:
     probs: np.ndarray           # (n, A) float, rows sum to 1
     centers: np.ndarray         # (n, 2) float, pixels
     sizes: np.ndarray           # (n,) float, longer box side in pixels
+    # From the silhouette geometry, when the file has it; NaN where it was not
+    # measured (no silhouette, or a heading not resolved yet).
+    lengths: Optional[np.ndarray] = None    # (n,) body length in pixels
+    headings: Optional[np.ndarray] = None   # (n,) head direction, radians
 
     def __len__(self) -> int:
         return int(self.frames.shape[0])
 
     def take(self, sl: slice) -> "TrackSequence":
         return TrackSequence(self.track_id, self.frames[sl], self.probs[sl],
-                             self.centers[sl], self.sizes[sl])
+                             self.centers[sl], self.sizes[sl],
+                             None if self.lengths is None else self.lengths[sl],
+                             None if self.headings is None else self.headings[sl])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -200,6 +212,7 @@ def track_sequences(
     frames: Mapping[int, Mapping[str, Any]],
     num_actions: Optional[int] = None,
     head_sizes: Optional[Sequence[int]] = None,
+    geometry_fields: Optional[Sequence[str]] = None,
 ) -> Dict[int, TrackSequence]:
     """Group detections by ``track_id``. Untracked detections (``-1``) are skipped.
 
@@ -207,22 +220,35 @@ def track_sequences(
     to a one-hot of ``action_ids`` - decoding still works, it just cannot weigh
     a confident frame above an unsure one. With ``head_sizes`` (multi-head),
     each group's slice of a row sums to 1; without, the whole row does.
+    ``geometry_fields`` (``_meta["geometry"]["fields"]``) names the columns of
+    the per-detection ``geometry`` rows; with it, each sequence also carries
+    the silhouette's body length and head direction.
     """
     A = int(num_actions) if num_actions else _num_actions(frames)
     blocks = _blocks(A, head_sizes)
-    rows: Dict[int, List[Tuple[int, np.ndarray, Tuple[float, float], float]]] = {}
+    columns = list(geometry_fields or [])
+    want = "length" in columns and "heading" in columns
+    at_length = columns.index("length") if want else -1
+    at_heading = columns.index("heading") if want else -1
+    rows: Dict[int, List[Tuple[int, np.ndarray, Tuple[float, float], float, float, float]]] = {}
     for frame in sorted(frames):
         payload = frames[frame]
         boxes = payload.get("boxes") or []
         tids = payload.get("track_ids") or []
+        geometry = (payload.get("geometry") or []) if want else []
         for i, box in enumerate(boxes):
             tid = int(tids[i]) if i < len(tids) else -1
             if tid < 0:
                 continue
             p = _detection_probs(payload, i, A, blocks)
             x1, y1, x2, y2 = (float(v) for v in box[:4])
+            length = heading = math.nan
+            if i < len(geometry) and geometry[i]:
+                length = _number(geometry[i][at_length])
+                heading = _number(geometry[i][at_heading])
             rows.setdefault(tid, []).append(
-                (int(frame), p, ((x1 + x2) / 2, (y1 + y2) / 2), max(x2 - x1, y2 - y1))
+                (int(frame), p, ((x1 + x2) / 2, (y1 + y2) / 2), max(x2 - x1, y2 - y1),
+                 length, heading)
             )
     out: Dict[int, TrackSequence] = {}
     for tid, items in rows.items():
@@ -232,8 +258,15 @@ def track_sequences(
             probs=np.stack([r[1] for r in items]),
             centers=np.array([r[2] for r in items], dtype=np.float64),
             sizes=np.array([r[3] for r in items], dtype=np.float64),
+            lengths=np.array([r[4] for r in items], dtype=np.float64) if want else None,
+            headings=np.array([r[5] for r in items], dtype=np.float64) if want else None,
         )
     return out
+
+
+def _number(value: Any) -> float:
+    """A geometry cell as a float; ``None`` (not measured) becomes NaN."""
+    return math.nan if value is None else float(value)
 
 
 def group_sequences(
@@ -242,7 +275,7 @@ def group_sequences(
     """The same tracks, keeping only one behavior group's probabilities."""
     return {
         tid: TrackSequence(seq.track_id, seq.frames, seq.probs[:, offset:offset + size],
-                           seq.centers, seq.sizes)
+                           seq.centers, seq.sizes, seq.lengths, seq.headings)
         for tid, seq in sequences.items()
     }
 
@@ -535,13 +568,22 @@ def proximity(
     *,
     fps: float,
     contact_lengths: float = 1.5,
+    facing_deg: float = 45.0,
 ) -> List[Dict[str, Any]]:
     """For every pair of tracks seen together: how close, and how often in contact.
 
     Distance is between box centres; "contact" is closer than
-    ``contact_lengths`` body lengths (the median longer box side of the pair).
+    ``contact_lengths`` body lengths (the median longer box side of the pair,
+    or the median silhouette length when the file has geometry).
+
+    With silhouette headings, two more columns: ``a_faces_b`` / ``b_faces_a``,
+    the fraction of the frames where that animal's head direction was known in
+    which it pointed within ``facing_deg`` of the other. Facing is directed -
+    a male following a female faces her, she does not face him - which is the
+    asymmetry courtship and chasing are defined by.
     """
     rate = float(fps) if fps and fps > 0 else 1.0
+    cone = math.radians(facing_deg)
     ids = sorted(t for t, s in sequences.items() if len(s))
     out: List[Dict[str, Any]] = []
     for i, a in enumerate(ids):
@@ -553,16 +595,44 @@ def proximity(
                 continue
             dist = np.linalg.norm(sa.centers[ia] - sb.centers[ib], axis=1)
             body = float(np.median(np.concatenate([sa.sizes[ia], sb.sizes[ib]])))
+            silhouette = _finite(sa.lengths, ia, sb.lengths, ib)
+            if silhouette.size:
+                body = float(np.median(silhouette))
             contact = dist < contact_lengths * max(body, _EPS)
-            out.append({
+            row: Dict[str, Any] = {
                 "track_a": int(a),
                 "track_b": int(b),
                 "together_s": round(len(common) / rate, 3),
                 "mean_distance_px": round(float(dist.mean()), 3),
                 "contact_fraction": round(float(contact.mean()), 4),
                 "body_length_px": round(body, 3),
-            })
+            }
+            if sa.headings is not None and sb.headings is not None:
+                offset = sb.centers[ib] - sa.centers[ia]
+                row["a_faces_b"] = _facing_fraction(sa.headings[ia], offset, cone)
+                row["b_faces_a"] = _facing_fraction(sb.headings[ib], -offset, cone)
+            out.append(row)
     return out
+
+
+def _finite(
+    a: Optional[np.ndarray], ia: np.ndarray, b: Optional[np.ndarray], ib: np.ndarray
+) -> np.ndarray:
+    """The measured (non-NaN) values of two optional per-frame arrays, joined."""
+    if a is None or b is None:
+        return np.zeros(0)
+    values = np.concatenate([a[ia], b[ib]])
+    return values[np.isfinite(values)]
+
+
+def _facing_fraction(headings: np.ndarray, offset: np.ndarray, cone: float) -> Optional[float]:
+    """Of the frames with a known heading, the share pointing within ``cone`` of ``offset``."""
+    known = np.isfinite(headings)
+    if not known.any():
+        return None
+    toward = np.arctan2(offset[known, 1], offset[known, 0])
+    gap = np.abs((headings[known] - toward + math.pi) % (2 * math.pi) - math.pi)
+    return round(float((gap <= cone).mean()), 4)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -615,9 +685,11 @@ def write_outputs(
         writer = csv.writer(handle)
         fields = ["track_a", "track_b", "together_s", "mean_distance_px",
                   "contact_fraction", "body_length_px"]
+        if any("a_faces_b" in row for row in pairs):
+            fields += ["a_faces_b", "b_faces_a"]
         writer.writerow(fields)
         for row in pairs:
-            writer.writerow([row[f] for f in fields])
+            writer.writerow(["" if row.get(f) is None else row[f] for f in fields])
     return paths
 
 
@@ -646,7 +718,7 @@ def analyze_predictions(
             min_bout_s=min_bout_s, max_gap=max_gap, bin_s=bin_s,
         )
     A = max(len(names), _num_actions(frames)) if frames else max(len(names), 1)
-    sequences = track_sequences(frames, A)
+    sequences = track_sequences(frames, A, geometry_fields=_geometry_fields(meta))
     bouts = decode_tracks(sequences, fps=rate, stay=stay, min_bout_s=min_bout_s, max_gap=max_gap)
     summary = summarize(bouts, sequences, fps=rate, action_names=names)
     summary["settings"] = {"stay": stay, "min_bout_s": min_bout_s, "max_gap": max_gap,
@@ -679,7 +751,8 @@ def _analyze_groups(
     A = len(vocab)
     if len(names) != A:
         names = list(vocab.names)
-    sequences = track_sequences(frames, A, head_sizes=vocab.sizes)
+    sequences = track_sequences(frames, A, head_sizes=vocab.sizes,
+                                geometry_fields=_geometry_fields(meta))
     per_group: Dict[str, Any] = {}
     bouts: Dict[int, List[Bout]] = {tid: [] for tid in sequences}
     budget: Dict[str, float] = {}
@@ -729,6 +802,14 @@ def _analyze_groups(
     summary["files"] = write_outputs(output_dir, bouts, summary, population, pairs,
                                      fps=rate, action_names=names)
     return summary
+
+
+def _geometry_fields(meta: Mapping[str, Any]) -> Optional[List[str]]:
+    """The column names of the ``geometry`` rows, if ``yoake predict`` wrote any."""
+    geometry = meta.get("geometry")
+    if isinstance(geometry, Mapping) and isinstance(geometry.get("fields"), list):
+        return [str(f) for f in geometry["fields"]]
+    return None
 
 
 def bouts_as_dicts(bouts: Mapping[int, List[Bout]]) -> List[Dict[str, Any]]:

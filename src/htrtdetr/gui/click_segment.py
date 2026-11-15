@@ -67,7 +67,10 @@ __all__ = [
     "obb_to_aabb",
     "point_in_obb",
     # segmentation
+    "MaskParts",
     "mask_to_obb",
+    "reduce_mask",
+    "threshold_gray",
     "segment_local",
     "segment",
     "pick_candidate",
@@ -286,13 +289,45 @@ def obb_to_aabb(
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class MaskParts:
+    """What :func:`reduce_mask` derives from one mask on the way to an OBB.
+
+    Everything is in the mask's own pixel coordinates. The three masks are
+    ``uint8`` 0/1 arrays of the mask's shape:
+
+    * ``blob`` — the connected component under the point (appendages included)
+    * ``core`` — the distance-transform core the axis was taken from
+    * ``body`` — the opened blob the extent was measured on
+
+    ``axis`` is the body axis as a unit vector. Its sign is whatever the
+    eigenvector came out as: head and tail are as unresolved here as in
+    :func:`mask_to_obb`. ``extent`` is ``(u0, u1, v0, v1)``, where the body ends
+    along ``axis`` and across it, measured from ``centre`` (the core's mean).
+    ``thickness`` is the blob's largest distance to the background, i.e. its
+    half-thickness. ``twin_core`` is only ever ``True`` when the caller asked
+    for ``allow_twins``.
+    """
+
+    blob: Any
+    core: Any
+    body: Any
+    centre: Tuple[float, float]
+    axis: Tuple[float, float]
+    extent: Tuple[float, float, float, float]
+    thickness: float
+    obb: Tuple[float, float, float, float, float]
+    twin_core: bool = False
+
+
 def mask_to_obb(
     mask: Any, at: Tuple[float, float]
 ) -> Tuple[Optional[Tuple[float, float, float, float, float]], str]:
     """Reduce a binary mask to a body-axis OBB.
 
     Returns ``(obb, "")`` on success and ``(None, diagnosis)`` otherwise, where
-    ``diagnosis`` is a key of :data:`DIAGNOSES`.
+    ``diagnosis`` is a key of :data:`DIAGNOSES`. The work is done by
+    :func:`reduce_mask`; this is its OBB, for callers that want nothing else.
 
     Four steps, in this order and for these reasons:
 
@@ -317,6 +352,28 @@ def mask_to_obb(
     The head/tail direction is *not* resolved. Under the double-angle encoding
     the model uses, orientation lives mod pi and a head-tail flip is not
     representable, so guessing one would be inventing information.
+    """
+    parts, why = reduce_mask(mask, at)
+    if parts is None:
+        return None, why
+    return parts.obb, ""
+
+
+def reduce_mask(
+    mask: Any, at: Tuple[float, float], allow_twins: bool = False
+) -> Tuple[Optional[MaskParts], str]:
+    """The four steps of :func:`mask_to_obb`, keeping what each one produced.
+
+    Returns ``(parts, "")`` on success and ``(None, diagnosis)`` otherwise.
+
+    With ``allow_twins=False`` (what :func:`mask_to_obb` uses) two cores of
+    comparable size are refused as :data:`TWO_ANIMALS`, exactly as before:
+    a box over both would be wrong in a training set. A measuring caller
+    (``analysis/silhouette.py``) can instead pass ``allow_twins=True``: the
+    axis is taken from the core nearest the point, the extent is still the
+    blob's — so for two animals under one detection the box is the pair's —
+    and ``parts.twin_core`` reports that the blob was really two animals,
+    which, for animals in copula, is the measurement.
     """
     import cv2
     import numpy as np
@@ -378,6 +435,7 @@ def mask_to_obb(
 
     # Two cores of comparable size are two animals that touch. One core with a
     # small satellite is one animal, so the ratio - not the count - decides.
+    twin = False
     nc, clabels, cstats, ccents = cv2.connectedComponentsWithStats(core, 8)
     if nc > 2:
         areas = sorted(
@@ -385,7 +443,9 @@ def mask_to_obb(
             reverse=True,
         )
         if areas[0] > 0 and areas[1] >= TWIN_CORE_RATIO * areas[0]:
-            return None, TWO_ANIMALS
+            if not allow_twins:
+                return None, TWO_ANIMALS
+            twin = True
         # Otherwise keep the core nearest the click and drop the specks.
         pick, best_d = 1, None
         for i in range(1, nc):
@@ -449,7 +509,17 @@ def mask_to_obb(
 
     # ── 4. canonical angle, body axis stays in w ─────────────────────────
     theta = normalize_angle(math.atan2(float(u[1]), float(u[0])))
-    return (cx, cy, float(length), float(breadth), theta), ""
+    return MaskParts(
+        blob=comp,
+        core=core,
+        body=body,
+        centre=(float(mean[0]), float(mean[1])),
+        axis=(float(u[0]), float(u[1])),
+        extent=(u0, u1, v0, v1),
+        thickness=dmax,
+        obb=(cx, cy, float(length), float(breadth), theta),
+        twin_core=twin,
+    ), ""
 
 
 # --------------------------------------------------------------------------- #
@@ -477,9 +547,19 @@ def _otsu_mask(roi_bgr: Any, at_local: Tuple[float, float]) -> Any:
     a pale larva on a dark plate, with nothing for the user to configure.
     """
     import cv2
+
+    return threshold_gray(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY), at_local)
+
+
+def threshold_gray(gray: Any, at_local: Tuple[float, float]) -> Any:
+    """:func:`_otsu_mask` for a ROI that is already grey (``uint8``, 2-D).
+
+    The silhouette measurement (``analysis/silhouette.py``) converts each frame
+    to grey once and thresholds many ROIs of it, so it enters here.
+    """
+    import cv2
     import numpy as np
 
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
     px, py = int(round(at_local[0])), int(round(at_local[1]))

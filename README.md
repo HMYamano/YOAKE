@@ -87,6 +87,8 @@ Two planes coexist and remain independent:
 - **Track-aligned temporal modeling**: the HTM consumes per-**track** history, not per-**query** history. DETR query indices do not identify the same individual across frames, so query-aligned sequences silently mix different animals.
 - **True streaming inference**: every frame passes the detector exactly **once**. Past frames are served from per-track ring buffers instead of being re-fed, so cost no longer scales with window size (**~4.5–6.2× faster**, detector calls 78 → 12 at window=16).
 - **Two-stream behavior recognition**: a rotated, orientation-normalized *actor* crop for fine appearance and pose, plus a wider axis-aligned *context* crop for neighbours and surroundings.
+- **Label-free silhouette geometry** (`geometry=true`): a post-processing step that thresholds each detection's ROI and measures what no box can — the body axis, the head direction (resolved from motion and continuity, so a full 2π heading), wing-like lateral extension, a two-animals-in-one-blob flag, and body-aligned residual motion. No labels, no training, model outputs unchanged. [docs/SILHOUETTE_GEOMETRY.md](docs/SILHOUETTE_GEOMETRY.md).
+- **Realtime pipeline** (`realtime=true`): capture, GPU inference, geometry and writing run as separate processes over a shared-memory frame ring; cameras and streams are read in this mode. File results are identical to the sequential run. [docs/REALTIME.md](docs/REALTIME.md).
 - **Explainability built into the model**: behavior logits are an additive decomposition, `logits = Σ_g gate_g · head_g(feature_g)`, so per-group contributions *are* the prediction rather than a post-hoc approximation.
 - **Hierarchical / multi-head behavior classification**: `single` (backward compatible), `hierarchical` (coarse → fine), or `multi_head` (locomotion / social / self-directed simultaneously).
 - **OBB-aware tracking**: association mixes rotated IoU, appearance embedding, motion prediction, and orientation consistency — each weight independently ablatable.
@@ -486,6 +488,19 @@ window=  4: batch 120.20 ms/f | streaming 26.85 ms/f | speedup 4.48x | detector 
 window=  8: batch 148.38 ms/f | streaming 25.24 ms/f | speedup 5.88x | detector calls 68 -> 12
 window= 16: batch 173.23 ms/f | streaming 27.98 ms/f | speedup 6.19x | detector calls 78 -> 12
 ```
+
+### Silhouette geometry and the realtime pipeline
+
+```bash
+# add body axis / head direction / shape / residual motion per detection (geometry.csv)
+yoake predict source=video.mp4 weights=best.pth geometry=true
+
+# multiprocessing pipeline: same results on files, and it reads cameras and streams
+yoake predict source=video.mp4 weights=best.pth realtime=true
+yoake predict source=0 weights=best.pth realtime=true geometry=true inference.realtime_display=true
+```
+
+See [docs/SILHOUETTE_GEOMETRY.md](docs/SILHOUETTE_GEOMETRY.md) and [docs/REALTIME.md](docs/REALTIME.md).
 
 ### Explaining a prediction
 

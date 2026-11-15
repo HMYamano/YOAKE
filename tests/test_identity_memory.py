@@ -170,7 +170,8 @@ class TestStreamingUsesTrackerAsAuthority:
 
         from htrtdetr.inference import streaming
 
-        src = inspect.getsource(streaming.StreamingInferencer.process_frame)
+        # process_frame / process_prepared は前処理の入口で、1 フレームの本体は _process。
+        src = inspect.getsource(streaming.StreamingInferencer._process)
         assert "id_head.embed(" in src
         assert "id_head.forward_inference(" not in src, (
             "streaming が ID head 側でも ID を採番している (二重 authority)"
